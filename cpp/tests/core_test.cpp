@@ -447,6 +447,52 @@ TEST(PlannerPropertyTest, RandomizedNMinusOneTopologiesRemainIndependentlyFeasib
   }
 }
 
+TEST(VerifierAdversarialTest, RejectsEvacuationThatOverfillsIntermediateDestination) {
+  auto snapshot = Fixture();
+  auto *workload = snapshot.mutable_workloads(0);
+  workload->set_min_replicas(3);
+  workload->set_availability_floor(3);
+  SetResource(workload->mutable_current_resources(), 1'500, 1'024, 100);
+  SetResource(snapshot.mutable_capacity_profiles(0)->mutable_allocation(), 1'500, 1'024, 100);
+  SealSnapshot(&snapshot);
+
+  auto plan = fleetright::Plan(snapshot);
+  ASSERT_TRUE(plan.feasible()) << plan.infeasible_reason();
+  ASSERT_EQ(plan.placements_size(), 3);
+  for (auto &placement : *plan.mutable_placements()) {
+    if (placement.replica_id() == "api-0")
+      placement.set_node_id("node-1");
+    else if (placement.replica_id() == "api-1")
+      placement.set_node_id("node-0");
+  }
+  plan.clear_evacuation_steps();
+  auto *first = plan.add_evacuation_steps();
+  first->set_sequence(0);
+  first->set_workload_id("api");
+  first->set_replica_id("api-0");
+  first->set_source_node_id("node-0");
+  first->set_destination_node_id("node-1");
+  auto *second = plan.add_evacuation_steps();
+  second->set_sequence(1);
+  second->set_workload_id("api");
+  second->set_replica_id("api-1");
+  second->set_source_node_id("node-1");
+  second->set_destination_node_id("node-0");
+  plan.set_action_count(plan.action_count() + 2);
+  plan.set_proposed_movement_cost_micros(plan.proposed_movement_cost_micros() + 200);
+  plan.set_proposed_objective_cost_micros(plan.proposed_objective_cost_micros() + 200);
+  SealPlan(&plan);
+
+  const auto result = fleetright::Verify(snapshot, plan);
+  EXPECT_FALSE(result.accepted());
+  const auto check = std::find_if(
+      result.invariants().begin(), result.invariants().end(), [](const auto &invariant) {
+        return invariant.invariant() == "eviction_recreation_intermediate_states";
+      });
+  ASSERT_NE(check, result.invariants().end());
+  EXPECT_FALSE(check->passed());
+}
+
 TEST(VerifierAdversarialTest, RejectsNMinusOneRecoveryOnADeactivatedNode) {
   auto snapshot = Fixture();
   snapshot.mutable_nodes()->RemoveLast();
