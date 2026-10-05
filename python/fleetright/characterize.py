@@ -56,9 +56,8 @@ CONCURRENCY_STEPS = (1, 2, 4, 8, 16, 32, 64)
 
 class Samples:
     def __init__(self, slo_ms: int) -> None:
-        self.histogram = Histogram(
-            tuple(sorted(set((1, 2, 5, 10, 20, 40, 80, slo_ms, 160, 250, 500, 1_000))))
-        )
+        buckets = tuple(sorted(set((1, 2, 5, 10, 20, 40, 80, slo_ms, 160, 250, 500, 1_000))))
+        self.histogram = Histogram(buckets, (0,) * (len(buckets) + 1))
         self.errors = 0
         self.count = 0
         self.lock = threading.Lock()

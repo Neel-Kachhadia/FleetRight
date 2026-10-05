@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import random
 
+from fleetright.characterize import Samples
 from fleetright.profiles import RunMetrics, characterize_point, wilson_lower_ppm, wilson_upper_ppm
 from fleetright.telemetry import Histogram, pooled_histogram, tail_confidence
 
@@ -39,6 +40,13 @@ def test_slo_threshold_must_be_a_bucket_and_low_traffic_is_marked() -> None:
         raise AssertionError("threshold outside histogram resolution was accepted")
     assert tail_confidence(9_999) == "low"
     assert tail_confidence(10_000) == "adequate"
+
+
+def test_characterization_samples_accept_slo_that_is_already_a_bucket() -> None:
+    samples = Samples(80)
+    samples.add(80, error=False)
+    assert samples.histogram.count_leq(80) == 1
+    assert samples.count == 1
 
 
 def test_wilson_bounds_are_conservative_for_zero_errors_and_sparse_tail() -> None:
