@@ -434,7 +434,7 @@ def run_demo(output: Path, seed: int = 42) -> Path:
         "verifier_deterministic_replay": _sha256(verification_bytes)
         == _sha256(verify_replay_path.read_bytes()),
         "capacity_measurement_kind": "synthetic_benchmark_fixture",
-        "docker_capacity_calibration": "BLOCKED: see dedicated characterization run artifact",
+        "docker_capacity_calibration": "separate timestamped characterization run",
     }
     manifest["manifest_sha256"] = _sha256(
         json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
@@ -501,9 +501,8 @@ def run_demo(output: Path, seed: int = 42) -> Path:
         f"Run: `{run_id}` (seed `{seed}`)",
         "",
         "This reproducible integration run uses explicitly synthetic CapacityProfile fixtures. "
-        "The result does not establish production capacity; Docker calibration is separately "
-        "blocked "
-        "on this host.",
+        "It does not establish production capacity; Docker measurements are retained in separate "
+        "timestamped characterization runs.",
         "",
         f"Planner feasibility: **{plan['feasible']}**; independent verifier: **{accepted}**.",
         f"Plan cost: {plan['current_cost_micros_per_hour']} -> "
