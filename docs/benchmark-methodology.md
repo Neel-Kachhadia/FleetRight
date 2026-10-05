@@ -15,6 +15,13 @@ Every output is checked for deterministic replay and independent verifier accept
 records commit, build IDs, compiler/build type, host/kernel/CPU/RAM, schema, policy/profile/catalog
 hashes, and raw direct/CLI timings. Runs do not overwrite prior run IDs.
 
+The final timeboxed 1,000-workload/500-node run is
+`results/phase2/20261005T140756.643058Z-1000w-500n/` and contains 20 direct API and CLI samples.
+On GNU 13.3.0 Release, planner API p95 was 313.986794 ms against the 250 ms target; verifier API
+p95 was 16.996607 ms against the 25 ms target. Deterministic replay passed and the independent
+verifier accepted the plan. The planner target miss is retained as a performance limitation; the
+CLI p95 values include process start and file I/O and are reported separately.
+
 The exact oracle exhaustively enumerates eligible node subsets for a single workload on at most 12
 nodes. It uses the same compatible profile point, effective capacity, resource shape, headroom,
 catalog price, and anti-affinity rules. Its bounded comparison uses a one-hour horizon and zero
@@ -22,6 +29,14 @@ movement/churn/uncertainty/boundary weights, so the exact and heuristic objectiv
 infrastructure micros/hour. It deliberately rejects N-1 and topology cases it does not model. The
 reported gap is heuristic objective relative to the exact optimum; a heuristic result below the
 oracle is treated as a model mismatch error.
+
+The seeded Phase 1 simulator run covers 27 workload/trace cases per policy. Aggregated latency-SLO
+violations were 4 for static peak plus reserve, 57 for HPA-like, 64 for the naive threshold policy,
+and 1 for offline lookahead; failed requests were 0, 190,571, 199,284, and 0 respectively. These
+are simulated window counts, not production results. Lookahead targets 55% of the profiled QPS and
+concurrency bounds under the current convex latency model. Its remaining miss is the memory-api
+bursty trace, where the simulator adds latency for exogenous memory pressure independent of replica
+count; this case is not an SLO-feasible replica-only reference and is not presented as a win.
 
 Baselines receive identical generated traces and simulator delays. HPA-like behavior includes
 metric-ratio targeting, deadband, scale-up/down velocity, downscale stabilization, startup/readiness

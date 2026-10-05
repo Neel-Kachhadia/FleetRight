@@ -39,5 +39,7 @@ node activation, eviction/restart, and accumulated replica-cost proxies. It is a
 measurement; its cost proxy is not directly comparable to node-hour optimizer cost.
 
 No Kubernetes API, persistent control plane, prediction service, or mutation executor is included.
-Container calibration is emitted as a blocked evidence run when the Docker daemon is inaccessible;
-an unconstrained host process never promotes a resource-shape profile.
+Container calibration emits a blocked evidence run when the Docker daemon is inaccessible. The
+current-host run contains hashed profiles for the three checked-in workloads at one resource
+allocation and one safe concurrency point; it does not calibrate the simulator's startup or
+saturation error. An unconstrained host process never promotes a resource-shape profile.

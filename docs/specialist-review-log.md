@@ -36,4 +36,17 @@
   implementation evaluates a small stable portfolio of single-profile substitutions and documents
   that it does not enumerate profile combinations.
 
+## Runtime measurement findings
+
+- Docker characterization exposed a histogram counter-length mismatch when an SLO bucket duplicated
+  a default boundary, first in sample collection and then in pooled histogram initialization. Both
+  paths now size counters from the deduplicated bucket list; a regression test exercises the full
+  sample-to-profile-statistics path.
+- A one-concurrency measurement rounded to zero after the 10% integer haircut. Profile promotion
+  now rejects zero effective QPS or concurrency, and a regression covers this admission rule.
+- Offline lookahead initially planned to the profiled capacity boundary and violated simulated
+  latency SLOs before that boundary under the convex model. It now targets 55% utilization; one
+  memory-burst window remains infeasible because modeled memory pressure does not fall with replica
+  count, and the limitation is reported.
+
 No model opinion overrides compiler, test, sanitizer, fuzz, or measured benchmark evidence.

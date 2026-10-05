@@ -40,4 +40,16 @@ are included in latency histogram counts.
 `scripts/characterize_capacity.sh` warms each container, steps concurrency through a fixed sequence,
 repeats every point, retains raw run measurements, and emits an immutable profile only for safe
 points. It does not infer Docker resource enforcement from host utilization. Current-host calibration
-status and any blocker are recorded in each run manifest.
+status and any blocker are recorded in each run manifest. A profile point is not promoted if the
+conservative haircut rounds either its QPS or concurrency capacity to zero; the planner would reject
+such a point as unusable.
+
+The bounded current-host Docker run at
+`results/phase1/20261005T144022.947527Z-capacity/` used one concurrency-two point, three 60-second
+repeats, and one resource allocation per service. It emitted hashed Docker profiles for all three
+workloads. The accepted per-replica capacities after the 10% haircut were 172.831, 25.345, and
+217.912 requests/second for `cpu-api`, `memory-api`, and `queued-api`; each retained one concurrent
+request after integer rounding. This is a measured low-load envelope, not a saturation curve or
+evidence for other allocations. The same bounded run is reproducible with
+`scripts/characterize_capacity.sh --output results/phase1 --runs 3 --hold-seconds 60 --steps 2`.
+The earlier short 1/8/32 run is retained as diagnostic raw data but did not promote profiles.
