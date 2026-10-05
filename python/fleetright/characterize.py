@@ -211,6 +211,20 @@ def _host_metadata() -> dict[str, object]:
     }
 
 
+def _profile_point_is_safe(point: dict[str, int | str | bool], slo_ms: int) -> bool:
+    return (
+        int(point["safe_qps_milli"]) > 0
+        and int(point["safe_concurrency"]) > 0
+        and int(point["latency_success_lower_ppm"]) >= 990_000
+        and int(point["error_rate_wilson_upper_ppm"]) <= 1_000
+        and int(point["p99_upper_ms"]) <= slo_ms
+        and int(point["queue_growth_upper_milli"]) <= 0
+        and int(point["memory_pressure_ppm"]) <= 900_000
+        and int(point["cpu_throttling_ppm"]) <= 50_000
+        and bool(point["stable_across_runs"])
+    )
+
+
 def characterize(
     output_root: Path, runs: int, hold_seconds: float, steps: tuple[int, ...] = CONCURRENCY_STEPS
 ) -> Path:
@@ -328,15 +342,7 @@ def characterize(
                         ],
                     }
                 )
-                safe = (
-                    int(point["latency_success_lower_ppm"]) >= 990_000
-                    and int(point["error_rate_wilson_upper_ppm"]) <= 1_000
-                    and int(point["p99_upper_ms"]) <= slo_ms
-                    and int(point["queue_growth_upper_milli"]) <= 0
-                    and int(point["memory_pressure_ppm"]) <= 900_000
-                    and int(point["cpu_throttling_ppm"]) <= 50_000
-                    and bool(point["stable_across_runs"])
-                )
+                safe = _profile_point_is_safe(point, slo_ms)
                 if safe:
                     safe_points.append(
                         {

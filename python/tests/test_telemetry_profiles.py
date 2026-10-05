@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import random
 
-from fleetright.characterize import Samples
+from fleetright.characterize import Samples, _profile_point_is_safe
 from fleetright.profiles import RunMetrics, characterize_point, wilson_lower_ppm, wilson_upper_ppm
 from fleetright.telemetry import Histogram, pooled_histogram, tail_confidence
 
@@ -52,6 +52,23 @@ def test_characterization_samples_accept_slo_that_is_already_a_bucket() -> None:
     )
     assert point["p99_upper_ms"] == 80
     assert point["threshold_trials"] == 1
+
+
+def test_profile_promotion_rejects_zero_effective_concurrency() -> None:
+    point = {
+        "safe_qps_milli": 1_000,
+        "safe_concurrency": 0,
+        "latency_success_lower_ppm": 999_000,
+        "error_rate_wilson_upper_ppm": 500,
+        "p99_upper_ms": 80,
+        "queue_growth_upper_milli": 0,
+        "memory_pressure_ppm": 10_000,
+        "cpu_throttling_ppm": 0,
+        "stable_across_runs": True,
+    }
+    assert not _profile_point_is_safe(point, 80)
+    point["safe_concurrency"] = 1
+    assert _profile_point_is_safe(point, 80)
 
 
 def test_wilson_bounds_are_conservative_for_zero_errors_and_sparse_tail() -> None:
