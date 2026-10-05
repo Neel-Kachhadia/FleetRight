@@ -1,0 +1,17 @@
+{
+  "combinations_examined": 3,
+  "exact_cost_micros_per_hour": 100000,
+  "exact_node_ids": [
+    "node-00",
+    "node-01"
+  ],
+  "exact_solve_seconds": 2.4966000637505203e-05,
+  "heuristic_objective_cost_micros": 100000,
+  "heuristic_solve_seconds": 0.004612597000232199,
+  "optimality_gap": 0.0,
+  "oracle": "enumerate node subsets for one workload; exact infrastructure hourly cost",
+  "replicas": 2,
+  "scenario_nodes": 3,
+  "scenario_size_bound": 12,
+  "scenario_workloads": 1
+}

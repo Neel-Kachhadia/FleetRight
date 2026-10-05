@@ -1,0 +1,161 @@
+{
+  "completed_at_utc": "2026-10-05T14:49:38.097813+00:00",
+  "concurrency_steps": [
+    2
+  ],
+  "docker_daemon": {
+    "available": true,
+    "detail": "29.1.3"
+  },
+  "hold_seconds_per_run": 60.0,
+  "host": {
+    "cpu": "x86_64",
+    "git_commit": "d3d4ce515a8f363be0ce260b92d600894046d7f5",
+    "kernel": "7.0.0-38-generic",
+    "logical_cpu_count": 32,
+    "memory_bytes": 16352088064,
+    "platform": "Linux-7.0.0-38-generic-x86_64-with-glibc2.39",
+    "python": "3.12.3"
+  },
+  "manifest_sha256": "7ce85c4aea3122ee62f7e931117daad9a427788387e01a9fea1240bfcd49f055",
+  "measurement_kind": "docker_runtime",
+  "run_id": "20261005T144022.947527Z-capacity",
+  "runs_per_load_point": 3,
+  "schema_version": 1,
+  "started_at_utc": "2026-10-05T14:40:22.947628+00:00",
+  "status": "COMPLETE",
+  "workload_profiles": {
+    "cpu-api": {
+      "enforceable_resource_limits": true,
+      "image_digest": "sha256:086bd2ad253bb4dc3543075318834fdc3ac95d498f2d562262eb1426e0a2aa0e",
+      "measurement_kind": "docker_runtime",
+      "points": [
+        {
+          "concurrency": 2,
+          "raw_files": [
+            "cpu-api-c2-r0.json",
+            "cpu-api-c2-r1.json",
+            "cpu-api-c2-r2.json"
+          ],
+          "statistics": {
+            "cpu_throttling_ppm": 11473,
+            "error_count": 0,
+            "error_rate_upper_ppm": 0,
+            "error_rate_wilson_upper_ppm": 111,
+            "histogram_config_id": "classic-ms-v1",
+            "latency_success_lower_ppm": 999889,
+            "memory_pressure_ppm": 51194,
+            "p99_upper_ms": 20,
+            "queue_growth_upper_milli": 0,
+            "repeated_run_count": 3,
+            "request_count": 34812,
+            "run_dispersion_ppm": 14987,
+            "safe_concurrency": 1,
+            "safe_qps_milli": 172831,
+            "stable_across_runs": true,
+            "threshold_successes": 34812,
+            "threshold_trials": 34812,
+            "variance_ppm": 39
+          }
+        }
+      ],
+      "profile_sha256": "50f907890eb4cceb459adb99c47e72fa3d82c200f1ddca5c3fd4a2cb1800cf7d",
+      "request_mix_id": "cpu-read-v1",
+      "resource_allocation": {
+        "cpu_millicores": 1000,
+        "memory_mib": 512,
+        "network_mbps": 100
+      },
+      "runtime_config_class": "python-default",
+      "status": "PROFILED"
+    },
+    "memory-api": {
+      "enforceable_resource_limits": true,
+      "image_digest": "sha256:086bd2ad253bb4dc3543075318834fdc3ac95d498f2d562262eb1426e0a2aa0e",
+      "measurement_kind": "docker_runtime",
+      "points": [
+        {
+          "concurrency": 2,
+          "raw_files": [
+            "memory-api-c2-r0.json",
+            "memory-api-c2-r1.json",
+            "memory-api-c2-r2.json"
+          ],
+          "statistics": {
+            "cpu_throttling_ppm": 679,
+            "error_count": 0,
+            "error_rate_upper_ppm": 0,
+            "error_rate_wilson_upper_ppm": 703,
+            "histogram_config_id": "classic-ms-v1",
+            "latency_success_lower_ppm": 999297,
+            "memory_pressure_ppm": 34409,
+            "p99_upper_ms": 150,
+            "queue_growth_upper_milli": 0,
+            "repeated_run_count": 3,
+            "request_count": 5465,
+            "run_dispersion_ppm": 201635,
+            "safe_concurrency": 1,
+            "safe_qps_milli": 25345,
+            "stable_across_runs": true,
+            "threshold_successes": 5465,
+            "threshold_trials": 5465,
+            "variance_ppm": 8349
+          }
+        }
+      ],
+      "profile_sha256": "34ff144550a2d92558b62aee3b7c8abcf2f0b1c4441debfc06943096497295bd",
+      "request_mix_id": "memory-read-v1",
+      "resource_allocation": {
+        "cpu_millicores": 1000,
+        "memory_mib": 768,
+        "network_mbps": 100
+      },
+      "runtime_config_class": "32m-working-set",
+      "status": "PROFILED"
+    },
+    "queued-api": {
+      "enforceable_resource_limits": true,
+      "image_digest": "sha256:086bd2ad253bb4dc3543075318834fdc3ac95d498f2d562262eb1426e0a2aa0e",
+      "measurement_kind": "docker_runtime",
+      "points": [
+        {
+          "concurrency": 2,
+          "raw_files": [
+            "queued-api-c2-r0.json",
+            "queued-api-c2-r1.json",
+            "queued-api-c2-r2.json"
+          ],
+          "statistics": {
+            "cpu_throttling_ppm": 0,
+            "error_count": 0,
+            "error_rate_upper_ppm": 0,
+            "error_rate_wilson_upper_ppm": 88,
+            "histogram_config_id": "classic-ms-v1",
+            "latency_success_lower_ppm": 999912,
+            "memory_pressure_ppm": 51842,
+            "p99_upper_ms": 10,
+            "queue_growth_upper_milli": 0,
+            "repeated_run_count": 3,
+            "request_count": 43694,
+            "run_dispersion_ppm": 7033,
+            "safe_concurrency": 1,
+            "safe_qps_milli": 217912,
+            "stable_across_runs": true,
+            "threshold_successes": 43694,
+            "threshold_trials": 43694,
+            "variance_ppm": 11
+          }
+        }
+      ],
+      "profile_sha256": "c940959fd7dce3e4164f19fb5f037f804169ce0156a2957f870c0b32f3ed00f2",
+      "request_mix_id": "queue-mix-v1",
+      "resource_allocation": {
+        "cpu_millicores": 1000,
+        "memory_mib": 512,
+        "network_mbps": 100
+      },
+      "runtime_config_class": "concurrency-32",
+      "status": "PROFILED"
+    }
+  }
+}

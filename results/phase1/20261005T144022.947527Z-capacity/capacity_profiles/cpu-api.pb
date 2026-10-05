@@ -1,0 +1,2 @@
+cpu-api-1000m-512mib-v11"cpu-api*Gsha256:086bd2ad253bb4dc3543075318834fdc3ac95d498f2d562262eb1426e0a2aa0e2cpu-read-v1:python-defaultBx86_64-linux-dockerJ	Ğ€ÈP£ïˆä4X£ÿƒ¸š4`Ñƒ=h r;ŸÆ
+0ú8ÑY@üHPüXü`Ñƒ=hop‹ux'‚classic-ms-v1ˆzdocker_runtime‚@50f907890eb4cceb459adb99c47e72fa3d82c200f1ddca5c3fd4a2cb1800cf7dˆ

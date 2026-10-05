@@ -1,0 +1,54 @@
+{
+  "cpu_throttling_observable": true,
+  "cpu_throttling_ppm": 11473,
+  "elapsed_seconds": 60.007024991002254,
+  "error_count": 0,
+  "histogram_buckets_ms": [
+    1,
+    2,
+    5,
+    10,
+    20,
+    40,
+    80,
+    120,
+    160,
+    250,
+    500,
+    1000
+  ],
+  "histogram_counts": [
+    0,
+    0,
+    609,
+    4931,
+    6012,
+    38,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+  ],
+  "histogram_sum_ms": 125053,
+  "max_rss_bytes": 27484160,
+  "metrics_after": {
+    "fleetright_cpu_throttled_seconds_total": 1.903423,
+    "fleetright_queue_depth": 0.0,
+    "fleetright_queue_growth_milli_requests_per_second": 0.0,
+    "process_resident_memory_bytes": 27484160.0
+  },
+  "metrics_before": {
+    "fleetright_cpu_throttled_seconds_total": 1.214996,
+    "fleetright_queue_depth": 0.0,
+    "fleetright_queue_growth_milli_requests_per_second": 0.0,
+    "process_resident_memory_bytes": 27480064.0
+  },
+  "offered_concurrency": 2,
+  "queue_growth_observable": true,
+  "queue_growth_upper_milli": 0,
+  "request_count": 11590,
+  "throughput_qps_milli": 193144
+}
