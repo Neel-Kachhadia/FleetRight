@@ -92,7 +92,7 @@ def test_threshold_baseline_honors_separate_up_and_down_windows() -> None:
 
 def test_static_reserve_and_future_lookahead_use_ceiling_capacity() -> None:
     assert static_peak_replicas(1_000_000, 100, 500_000, 50, 1, 200_000) == 3
-    assert lookahead_schedule([100, 900], [10, 90], 500, 50, 1, 8, 1, 0) == [2, 2]
+    assert lookahead_schedule([100, 900], [10, 90], 500, 50, 1, 8, 1, 0) == [4, 4]
 
 
 def test_simulator_models_nonlinear_saturation_and_queue_growth() -> None:

@@ -203,12 +203,16 @@ def lookahead_schedule(
     max_replicas: int,
     action_delay_windows: int,
     startup_delay_windows: int,
+    target_utilization_ppm: int = 550_000,
 ) -> list[int]:
-    """Offline reference: sees future demand, but capacity arrives only after modeled delay."""
+    """Offline forecast with modeled SLO headroom and action/startup delays."""
     if (
         len(qps_series) != len(concurrency_series)
         or action_delay_windows < 0
         or startup_delay_windows < 0
+        or capacity_qps_milli <= 0
+        or capacity_concurrency <= 0
+        or not 0 < target_utilization_ppm <= 1_000_000
     ):
         raise ValueError("invalid lookahead inputs")
     delay = action_delay_windows + startup_delay_windows
@@ -217,8 +221,11 @@ def lookahead_schedule(
         future = min(len(qps_series) - 1, index + delay)
         required = max(
             min_replicas,
-            _ceil_div(qps_series[future], capacity_qps_milli),
-            _ceil_div(concurrency_series[future], capacity_concurrency),
+            _ceil_div(qps_series[future] * 1_000_000, capacity_qps_milli * target_utilization_ppm),
+            _ceil_div(
+                concurrency_series[future] * 1_000_000,
+                capacity_concurrency * target_utilization_ppm,
+            ),
         )
         schedule.append(min(max_replicas, required))
     return schedule

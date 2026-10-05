@@ -457,10 +457,13 @@ def main() -> int:
     parser.add_argument("--output", type=Path, default=ROOT / "results/phase1")
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--hold-seconds", type=float, default=5.0)
+    parser.add_argument("--steps", type=int, nargs="+", default=CONCURRENCY_STEPS)
     args = parser.parse_args()
     if args.runs < 2 or args.hold_seconds <= 0:
         parser.error("--runs must be at least 2 and hold time must be positive")
-    result = characterize(args.output, args.runs, args.hold_seconds)
+    if any(step <= 0 for step in args.steps) or len(set(args.steps)) != len(args.steps):
+        parser.error("--steps must contain unique positive concurrency values")
+    result = characterize(args.output, args.runs, args.hold_seconds, tuple(args.steps))
     print(result)
     manifest = json.loads((result / "manifest.json").read_text())
     return 0 if manifest["status"] in {"COMPLETE", "BLOCKED"} else 1
