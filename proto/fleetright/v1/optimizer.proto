@@ -1,0 +1,92 @@
+syntax = "proto3";
+
+package fleetright.v1;
+
+import "fleetright/v1/model.proto";
+
+enum RejectionCode {
+  REJECTION_CODE_UNSPECIFIED = 0;
+  REJECTION_CODE_MISSING_PROFILE = 1;
+  REJECTION_CODE_STALE_PROFILE = 2;
+  REJECTION_CODE_PROFILE_MISMATCH = 3;
+  REJECTION_CODE_LOW_CONFIDENCE = 4;
+  REJECTION_CODE_NO_SAFE_ENVELOPE = 5;
+  REJECTION_CODE_DEMAND_EXCEEDS_CAPACITY = 6;
+  REJECTION_CODE_INVALID_RESOURCE_SHAPE = 7;
+  REJECTION_CODE_NO_PLACEMENT = 8;
+  REJECTION_CODE_TOPOLOGY = 9;
+  REJECTION_CODE_N_MINUS_1 = 10;
+  REJECTION_CODE_INSUFFICIENT_IMPROVEMENT = 11;
+}
+
+message WorkloadDecision {
+  string workload_id = 1;
+  uint32 current_replicas = 2;
+  uint32 proposed_replicas = 3;
+  ResourceVector proposed_resources = 4;
+  string capacity_profile_id = 5;
+  string capacity_profile_sha256 = 6;
+  uint64 demand_qps_milli = 7;
+  uint64 demand_concurrency = 8;
+  uint64 effective_qps_per_replica_milli = 9;
+  uint64 effective_concurrency_per_replica = 10;
+  uint32 profile_confidence_ppm = 11;
+  repeated string binding_constraints = 12;
+  repeated string rejected_alternatives = 13;
+  int64 expected_cost_delta_micros = 14;
+  bool destructive = 15;
+  uint32 profile_point_index = 16;
+  uint32 uncertainty_exposure_ppm = 17;
+  uint32 boundary_risk_ppm = 18;
+}
+
+message EvacuationStep {
+  uint32 sequence = 1;
+  string workload_id = 2;
+  string replica_id = 3;
+  string source_node_id = 4;
+  string destination_node_id = 5;
+}
+
+message OptimizationPlan {
+  uint32 schema_version = 1;
+  string plan_id = 2;
+  string snapshot_id = 3;
+  uint64 base_generation = 4;
+  uint64 created_at_ms = 5;
+  uint64 expires_at_ms = 6;
+  bool feasible = 7;
+  string infeasible_reason = 8;
+  repeated WorkloadDecision workload_decisions = 9;
+  repeated ReplicaPlacement placements = 10;
+  repeated EvacuationStep evacuation_steps = 11;
+  repeated string deactivated_node_ids = 12;
+  repeated RejectionCode rejection_codes = 13;
+  uint64 current_cost_micros_per_hour = 14;
+  uint64 proposed_cost_micros_per_hour = 15;
+  uint32 action_count = 16;
+  string optimizer_build_id = 17;
+  uint64 current_objective_cost_micros = 18;
+  uint64 proposed_objective_cost_micros = 19;
+  uint64 proposed_movement_cost_micros = 20;
+  uint64 proposed_churn_cost_micros = 21;
+  uint64 proposed_uncertainty_cost_micros = 22;
+  uint64 proposed_boundary_cost_micros = 23;
+  uint64 current_uncertainty_cost_micros = 24;
+  uint64 current_boundary_cost_micros = 25;
+}
+
+message InvariantResult {
+  string invariant = 1;
+  bool passed = 2;
+  string detail = 3;
+  int64 margin = 4;
+}
+
+message VerificationResult {
+  string plan_id = 1;
+  bool accepted = 2;
+  repeated InvariantResult invariants = 3;
+  string verifier_build_id = 4;
+  string canonical_result_sha256 = 5;
+}

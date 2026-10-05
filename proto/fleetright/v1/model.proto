@@ -1,0 +1,173 @@
+syntax = "proto3";
+
+package fleetright.v1;
+
+option optimize_for = SPEED;
+
+message ResourceVector {
+  sint64 cpu_millicores = 1;
+  sint64 memory_mib = 2;
+  sint64 network_mbps = 3;
+}
+
+message Label {
+  string key = 1;
+  string value = 2;
+}
+
+enum FailureTolerance {
+  FAILURE_TOLERANCE_UNSPECIFIED = 0;
+  FAILURE_TOLERANCE_NONE = 1;
+  FAILURE_TOLERANCE_N_MINUS_1 = 2;
+}
+
+enum NodeHealth {
+  NODE_HEALTH_UNSPECIFIED = 0;
+  NODE_HEALTH_HEALTHY = 1;
+  NODE_HEALTH_CORDONED = 2;
+  NODE_HEALTH_UNHEALTHY = 3;
+}
+
+message WorkloadSpec {
+  string workload_id = 1;
+  uint32 priority = 2;
+  uint32 min_replicas = 3;
+  uint32 max_replicas = 4;
+  uint32 availability_floor = 5;
+  uint64 demand_qps_milli = 6;
+  uint64 concurrency_bound = 7;
+  uint64 latency_slo_ms = 8;
+  uint32 error_slo_ppm = 9;
+  uint64 startup_ms = 10;
+  uint64 readiness_stabilization_ms = 11;
+  FailureTolerance failure_tolerance = 12;
+  uint32 min_topology_domains = 13;
+  uint32 max_topology_skew = 14;
+  string topology_key = 15;
+  ResourceVector current_resources = 16;
+  string image_digest = 17;
+  string request_mix_id = 18;
+  string runtime_config_class = 19;
+  string platform_class = 20;
+  uint32 profile_confidence_factor_ppm = 21;
+  uint32 model_accuracy_factor_ppm = 22;
+  uint32 degraded_cluster_factor_ppm = 23;
+  uint32 max_throttle_ppm = 24;
+  uint32 max_memory_pressure_ppm = 25;
+  uint32 max_scale_down_fraction_ppm = 26;
+  uint32 max_moves = 27;
+  bool recent_oom_or_reclaim = 28;
+  repeated string tolerated_taint_keys = 29;
+}
+
+message CapacityPoint {
+  // QPS and concurrency limits describe one jointly tested operating point.
+  uint64 safe_qps_milli = 1;
+  uint64 safe_concurrency = 2;
+  uint64 p99_upper_ms = 3;
+  uint32 error_rate_upper_ppm = 4;
+  sint64 queue_growth_upper_milli = 5;
+  uint32 memory_pressure_ppm = 6;
+  uint32 cpu_throttling_ppm = 7;
+  uint64 request_count = 8;
+  uint64 repeated_run_count = 9;
+  uint64 threshold_successes = 10;
+  uint64 threshold_trials = 11;
+  uint32 latency_success_lower_ppm = 12;
+  uint32 error_rate_wilson_upper_ppm = 13;
+  uint32 run_dispersion_ppm = 14;
+  uint32 variance_ppm = 15;
+  string histogram_config_id = 16;
+  bool stable_across_runs = 17;
+  uint64 error_count = 18;
+}
+
+message CapacityProfile {
+  uint32 schema_version = 1;
+  string profile_id = 2;
+  string profile_version = 3;
+  string workload_id = 4;
+  string image_digest = 5;
+  string request_mix_id = 6;
+  string runtime_config_class = 7;
+  string platform_class = 8;
+  ResourceVector allocation = 9;
+  uint64 generated_at_ms = 10;
+  uint64 valid_until_ms = 11;
+  uint32 confidence_ppm = 12;
+  uint32 conservative_haircut_ppm = 13;
+  repeated CapacityPoint safe_points = 14;
+  string measurement_kind = 15;
+  string profile_sha256 = 16;
+  bool enforceable_resource_limits = 17;
+}
+
+message NodeState {
+  string node_id = 1;
+  string machine_type = 2;
+  ResourceVector allocatable = 3;
+  ResourceVector reserved = 4;
+  uint64 hourly_cost_micros = 5;
+  repeated Label labels = 6;
+  repeated Label taints = 7;
+  NodeHealth health = 8;
+  bool active = 9;
+  uint64 generation = 10;
+}
+
+message ReplicaPlacement {
+  string workload_id = 1;
+  string replica_id = 2;
+  string node_id = 3;
+}
+
+message MachineType {
+  string machine_type = 1;
+  ResourceVector allocatable = 2;
+  uint64 hourly_cost_micros = 3;
+}
+
+message MachineCatalog {
+  uint32 schema_version = 1;
+  string catalog_version = 2;
+  repeated MachineType machines = 3;
+  string catalog_sha256 = 4;
+}
+
+message PlanningPolicy {
+  uint32 schema_version = 1;
+  uint32 headroom_ppm = 2;
+  uint32 minimum_profile_confidence_ppm = 3;
+  uint64 maximum_profile_age_ms = 4;
+  uint64 maximum_snapshot_age_ms = 5;
+  uint32 maximum_plan_actions = 6;
+  // One-time cost to stage/recreate one moved replica.
+  uint64 movement_cost_micros = 7;
+  uint32 minimum_improvement_ppm = 8;
+  uint32 maximum_local_search_iterations = 9;
+  bool allow_synthetic_profiles = 10;
+  // Optimizer objective horizon; infrastructure cost is prorated over this interval.
+  uint64 planning_horizon_seconds = 11;
+  // One-time cost per planned action (replica, resize, move, or node action).
+  uint64 action_churn_cost_micros = 12;
+  // Cost for a full (1,000,000 ppm) uncertainty exposure per replica.
+  uint64 uncertainty_cost_micros_per_replica = 13;
+  // Cost for a full (1,000,000 ppm) capacity-boundary risk per workload.
+  uint64 boundary_cost_micros_per_workload = 14;
+}
+
+message OptimizationSnapshot {
+  uint32 schema_version = 1;
+  string snapshot_id = 2;
+  uint64 generation = 3;
+  uint64 observed_at_ms = 4;
+  uint64 expires_at_ms = 5;
+  uint64 evaluation_time_ms = 6;
+  repeated WorkloadSpec workloads = 7;
+  repeated NodeState nodes = 8;
+  repeated ReplicaPlacement current_placements = 9;
+  repeated CapacityProfile capacity_profiles = 10;
+  MachineCatalog machine_catalog = 11;
+  PlanningPolicy policy = 12;
+  string content_sha256 = 13;
+}

@@ -4,3 +4,15 @@
 .env
 .env.*
 !.env.example
+/build/
+/build-*/
+/.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+results/**
+!results/.gitkeep
+*.profraw
+*.pb
