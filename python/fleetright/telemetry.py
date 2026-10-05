@@ -91,7 +91,8 @@ class Histogram:
 def pooled_histogram(histograms: list[Histogram]) -> Histogram:
     if not histograms:
         return Histogram()
-    result = Histogram(histograms[0].buckets_ms)
+    buckets = histograms[0].buckets_ms
+    result = Histogram(buckets, (0,) * (len(buckets) + 1))
     for histogram in histograms:
         result = result.merge(histogram)
     return result

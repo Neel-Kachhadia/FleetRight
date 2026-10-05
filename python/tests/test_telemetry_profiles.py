@@ -45,8 +45,13 @@ def test_slo_threshold_must_be_a_bucket_and_low_traffic_is_marked() -> None:
 def test_characterization_samples_accept_slo_that_is_already_a_bucket() -> None:
     samples = Samples(80)
     samples.add(80, error=False)
-    assert samples.histogram.count_leq(80) == 1
-    assert samples.count == 1
+    point = characterize_point(
+        [RunMetrics(samples.histogram, samples.count, samples.errors, 1_000, 1, 0, 0, 0)],
+        80,
+        1_000,
+    )
+    assert point["p99_upper_ms"] == 80
+    assert point["threshold_trials"] == 1
 
 
 def test_wilson_bounds_are_conservative_for_zero_errors_and_sparse_tail() -> None:
