@@ -48,6 +48,7 @@ struct Replica {
   std::uint32_t priority = 0;
   ProtoResourceVector resources;
   std::string current_node;
+  std::uint64_t dominant_score = 0;
 };
 
 struct NodeUse {
@@ -1359,28 +1360,27 @@ static v1::OptimizationPlan PlanWithProfileOverride(const OptimizationSnapshot &
     }
     uses.emplace(node.node_id(), NodeUse{&node, *capacity, ProtoResourceVector(), {}, {}});
   }
-  const auto dominant = [&](const Replica &replica) {
-    std::uint64_t maximum_cpu = 1;
-    std::uint64_t maximum_memory = 1;
-    std::uint64_t maximum_network = 1;
-    for (const auto &node : snapshot.nodes()) {
-      maximum_cpu =
-          std::max(maximum_cpu, static_cast<std::uint64_t>(node.allocatable().cpu_millicores()));
-      maximum_memory =
-          std::max(maximum_memory, static_cast<std::uint64_t>(node.allocatable().memory_mib()));
-      maximum_network =
-          std::max(maximum_network, static_cast<std::uint64_t>(node.allocatable().network_mbps()));
-    }
-    const auto &r = replica.resources;
-    return std::max({ScaledRatio(static_cast<std::uint64_t>(r.cpu_millicores()), maximum_cpu),
-                     ScaledRatio(static_cast<std::uint64_t>(r.memory_mib()), maximum_memory),
-                     ScaledRatio(static_cast<std::uint64_t>(r.network_mbps()), maximum_network)});
-  };
+  std::uint64_t maximum_cpu = 1;
+  std::uint64_t maximum_memory = 1;
+  std::uint64_t maximum_network = 1;
+  for (const auto &node : snapshot.nodes()) {
+    maximum_cpu =
+        std::max(maximum_cpu, static_cast<std::uint64_t>(node.allocatable().cpu_millicores()));
+    maximum_memory =
+        std::max(maximum_memory, static_cast<std::uint64_t>(node.allocatable().memory_mib()));
+    maximum_network =
+        std::max(maximum_network, static_cast<std::uint64_t>(node.allocatable().network_mbps()));
+  }
+  for (auto &replica : replicas) {
+    const auto &resource = replica.resources;
+    replica.dominant_score = std::max(
+        {ScaledRatio(static_cast<std::uint64_t>(resource.cpu_millicores()), maximum_cpu),
+         ScaledRatio(static_cast<std::uint64_t>(resource.memory_mib()), maximum_memory),
+         ScaledRatio(static_cast<std::uint64_t>(resource.network_mbps()), maximum_network)});
+  }
   std::sort(replicas.begin(), replicas.end(), [&](const Replica &left, const Replica &right) {
-    const auto left_dominant = dominant(left);
-    const auto right_dominant = dominant(right);
-    if (left_dominant != right_dominant)
-      return left_dominant > right_dominant;
+    if (left.dominant_score != right.dominant_score)
+      return left.dominant_score > right.dominant_score;
     if (left.priority != right.priority)
       return left.priority > right.priority;
     return std::tie(left.workload_id, left.replica_id) <
@@ -1731,10 +1731,13 @@ v1::OptimizationPlan Plan(const OptimizationSnapshot &snapshot) {
                                                                    : 1;
   const auto trial_count = std::min<std::size_t>(
       {trials.size(), max_trials, snapshot.policy().maximum_local_search_iterations()});
+  // ponytail: large profile trials score the deterministic feasible placement only; keep the
+  // configured local-search budget for the incumbent plan unless measurements justify more.
+  const auto trial_local_search_budget =
+      snapshot.workloads_size() <= 64 ? snapshot.policy().maximum_local_search_iterations() : 0U;
   for (std::size_t index = 0; index < trial_count; ++index) {
-    auto candidate =
-        PlanWithProfileOverride(snapshot, trials[index].workload_id, trials[index].profile_id,
-                                snapshot.policy().maximum_local_search_iterations());
+    auto candidate = PlanWithProfileOverride(snapshot, trials[index].workload_id,
+                                             trials[index].profile_id, trial_local_search_budget);
     if (candidate.feasible() && (!best.feasible() || candidate.proposed_objective_cost_micros() <
                                                          best.proposed_objective_cost_micros()))
       best = std::move(candidate);
