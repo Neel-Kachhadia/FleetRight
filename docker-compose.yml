@@ -1,4 +1,19 @@
 services:
+  control-postgres:
+    image: postgres:16-alpine
+    profiles: [control-plane]
+    environment:
+      POSTGRES_DB: fleetright
+      POSTGRES_USER: fleetright
+      POSTGRES_PASSWORD: ${FLEETRIGHT_POSTGRES_PASSWORD:?Set FLEETRIGHT_POSTGRES_PASSWORD for local control-plane DB}
+    ports: ["127.0.0.1:${FLEETRIGHT_POSTGRES_PORT:-55432}:5432"]
+    volumes: [fleetright-postgres:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fleetright -d fleetright"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
   cpu-service:
     build:
       context: .
@@ -66,3 +81,6 @@ services:
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     restart: "no"
+
+volumes:
+  fleetright-postgres:
