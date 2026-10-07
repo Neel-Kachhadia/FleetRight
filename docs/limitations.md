@@ -26,7 +26,16 @@
   corpus. Ruff lint is in CI. Ruff format is not a CI gate; repository-wide formatting still flags
   pre-existing unformatted lines in `python/fleetright/experiment.py`, outside the current change.
   Mypy was evaluated locally but reports unresolved dynamic JSON and
-  protobuf-contract typing in seven modules, so it is not represented as a passing CI check.
+  protobuf-contract typing in existing modules; the focused Prompt 2A check also reports dynamic
+  JSONB/dict-row typing in control-plane paths. No `mypy`/`pyright` CI gate is configured, so this
+  is recorded as a limitation rather than a passing type check.
 
-Prompt 2 forecasting, PostgreSQL control state, Kubernetes reconciliation, live mutation, and
-production deployment remain deferred.
+Prompt 2A adds baseline forecasting, a PostgreSQL-backed plan lifecycle, and a local authenticated
+control API. Forecast coverage is evaluated on historical test windows only; no production workload
+history has been supplied for model calibration. The control API uses a single cluster-wide
+workload/node lease set, so parallel planning for independent workloads is not supported yet.
+
+Live Docker execution and live Kubernetes execution are intentionally not enabled in Prompt 2A.
+PDB handling, node drain behavior, external ambiguous-side-effect recovery, and real compensation
+remain deferred to Prompt 2B or later. The PostgreSQL control-plane profile manages the local DB;
+the API runs as a loopback-bound local process and uses the checked-out planner/verifier binaries.
