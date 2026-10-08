@@ -15,14 +15,17 @@ set(FLEETRIGHT_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 set(PROTO_INPUTS
   "${PROJECT_SOURCE_DIR}/proto/fleetright/v1/model.proto"
   "${PROJECT_SOURCE_DIR}/proto/fleetright/v1/optimizer.proto"
+  "${PROJECT_SOURCE_DIR}/proto/fleetright/v2/evacuation.proto"
 )
 set(PROTO_SOURCES
   "${FLEETRIGHT_GENERATED_DIR}/fleetright/v1/model.pb.cc"
   "${FLEETRIGHT_GENERATED_DIR}/fleetright/v1/optimizer.pb.cc"
+  "${FLEETRIGHT_GENERATED_DIR}/fleetright/v2/evacuation.pb.cc"
 )
 set(PROTO_HEADERS
   "${FLEETRIGHT_GENERATED_DIR}/fleetright/v1/model.pb.h"
   "${FLEETRIGHT_GENERATED_DIR}/fleetright/v1/optimizer.pb.h"
+  "${FLEETRIGHT_GENERATED_DIR}/fleetright/v2/evacuation.pb.h"
 )
 add_custom_command(
   OUTPUT ${PROTO_SOURCES} ${PROTO_HEADERS}
@@ -32,6 +35,7 @@ add_custom_command(
           --cpp_out=${FLEETRIGHT_GENERATED_DIR}
           "${PROJECT_SOURCE_DIR}/proto/fleetright/v1/model.proto"
           "${PROJECT_SOURCE_DIR}/proto/fleetright/v1/optimizer.proto"
+          "${PROJECT_SOURCE_DIR}/proto/fleetright/v2/evacuation.proto"
   DEPENDS ${PROTO_INPUTS}
   VERBATIM
 )
@@ -42,6 +46,8 @@ target_link_libraries(fleetright_proto PUBLIC protobuf::libprotobuf)
 add_library(fleetright_core
   cpp/src/planner.cpp
   cpp/src/verifier.cpp
+  cpp/src/planner_v2.cpp
+  cpp/src/verifier_v2.cpp
 )
 target_include_directories(fleetright_core PUBLIC cpp/include)
 target_link_libraries(fleetright_core PUBLIC fleetright_proto OpenSSL::Crypto)

@@ -1,3 +1,4 @@
+#include "fleetright/evacuation_v2.hpp"
 #include "fleetright/verifier.hpp"
 
 #include <fstream>
@@ -34,9 +35,29 @@ template <typename Message> bool WriteMessage(const std::string &path, const Mes
 } // namespace
 
 int main(int argc, char **argv) {
-  if (argc != 4) {
-    std::cerr << "usage: fleetright-verify SNAPSHOT.pb PLAN.pb RESULT.pb\n";
+  if ((argc != 4 && argc != 5) || (argc == 5 && std::string(argv[4]) != "--protocol-version=2")) {
+    std::cerr << "usage: fleetright-verify SNAPSHOT.pb PLAN.pb RESULT.pb [--protocol-version=2]\n";
     return 64;
+  }
+  if (argc == 5) {
+    fleetright::v2::EvacuationSnapshot snapshot;
+    fleetright::v2::EvacuationPlan plan;
+    if (!ReadMessage(argv[1], &snapshot) || !ReadMessage(argv[2], &plan)) {
+      std::cerr << "invalid or oversized v2 verifier protobuf input\n";
+      return 65;
+    }
+    const auto result = fleetright::VerifyEvacuationV2(snapshot, plan);
+    if (!WriteMessage(argv[3], result)) {
+      std::cerr << "could not write v2 VerificationResult protobuf\n";
+      return 74;
+    }
+    for (const auto &invariant : result.invariants())
+      if (!invariant.passed())
+        std::cerr << invariant.invariant() << ": " << invariant.detail() << '\n';
+    std::cout << "plan_id=" << result.plan_id()
+              << " accepted=" << (result.accepted() ? "true" : "false")
+              << " result_sha256=" << result.canonical_result_sha256() << " protocol=v2\n";
+    return 0;
   }
   fleetright::v1::OptimizationSnapshot snapshot;
   fleetright::v1::OptimizationPlan plan;

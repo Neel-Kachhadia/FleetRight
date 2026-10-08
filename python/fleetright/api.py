@@ -22,7 +22,7 @@ from psycopg.types.json import Jsonb
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from fleetright.contracts import decode_text, encode_snapshot
+from fleetright.contracts import decode_text, encode_evacuation_snapshot, encode_snapshot
 from fleetright.control import (
     ArtifactIntegrityError,
     ControlError,
@@ -379,6 +379,7 @@ def _plan_summary(plan_text: str) -> dict[str, object]:
             }
         )
     return {
+        "schema_version": _proto_scalar(plan_text, "schema_version", 1),
         "plan_id": _proto_scalar(plan_text, "plan_id", ""),
         "created_at_ms": _proto_scalar(plan_text, "created_at_ms", 0),
         "expires_at_ms": _proto_scalar(plan_text, "expires_at_ms", 0),
@@ -393,7 +394,46 @@ def _plan_summary(plan_text: str) -> dict[str, object]:
     }
 
 
-def _run_planner(snapshot_bytes: bytes) -> tuple[bytes, bytes, str, str, dict[str, object]]:
+def _evacuation_plan_summary(plan_text: str) -> dict[str, object]:
+    evacuations: list[dict[str, object]] = []
+    deactivated: list[str] = []
+    for block in _proto_blocks(plan_text, "operations"):
+        destination_blocks = _proto_blocks(block, "destinations")
+        destination_ids = (
+            _proto_scalars(destination_blocks[0], "allowed_node_ids") if destination_blocks else []
+        )
+        evacuation = {
+            "sequence": _proto_scalar(block, "sequence", 0),
+            "workload_id": _proto_scalar(block, "workload_id", ""),
+            "replica_id": _proto_scalar(block, "replica_id", ""),
+            "source_node_id": _proto_scalar(block, "source_node_id", ""),
+            "destination_node_ids": destination_ids,
+        }
+        evacuations.append(evacuation)
+        if _proto_scalar(block, "deactivate_source_node_after_empty", False):
+            deactivated.append(str(evacuation["source_node_id"]))
+    return {
+        "schema_version": _proto_scalar(plan_text, "schema_version", 0),
+        "plan_id": _proto_scalar(plan_text, "plan_id", ""),
+        "created_at_ms": _proto_scalar(plan_text, "created_at_ms", 0),
+        "expires_at_ms": _proto_scalar(plan_text, "expires_at_ms", 0),
+        "snapshot_id": _proto_scalar(plan_text, "snapshot_id", ""),
+        "base_generation": _proto_scalar(plan_text, "base_generation", 0),
+        "feasible": _proto_scalar(plan_text, "feasible", False),
+        "infeasible_reason": _proto_scalar(plan_text, "infeasible_reason", ""),
+        "planner_build_id": _proto_scalar(plan_text, "optimizer_build_id", "unknown"),
+        "decisions": [],
+        "deactivated_node_ids": deactivated,
+        "evacuation_count": len(evacuations),
+        "evacuations": evacuations,
+    }
+
+
+def _run_planner(
+    snapshot_bytes: bytes, plan_schema_version: int = 1
+) -> tuple[bytes, bytes, str, str, dict[str, object]]:
+    if isinstance(plan_schema_version, bool) or plan_schema_version not in {1, 2}:
+        raise HTTPException(status_code=422, detail="unsupported-plan-schema-version")
     planner = Path(os.getenv("FLEETRIGHT_PLANNER", ROOT / "build/fleetright-plan"))
     verifier = Path(os.getenv("FLEETRIGHT_VERIFIER", ROOT / "build/fleetright-verify"))
     if not planner.is_file() or not verifier.is_file():
@@ -407,8 +447,11 @@ def _run_planner(snapshot_bytes: bytes) -> tuple[bytes, bytes, str, str, dict[st
         )
         snapshot_path.write_bytes(snapshot_bytes)
         try:
+            command = [str(planner), str(snapshot_path), str(plan_path)]
+            if plan_schema_version == 2:
+                command.append("--protocol-version=2")
             plan_run = subprocess.run(
-                [str(planner), str(snapshot_path), str(plan_path)],
+                command,
                 capture_output=True,
                 timeout=PLANNER_TIMEOUT_SECONDS,
                 check=False,
@@ -418,8 +461,11 @@ def _run_planner(snapshot_bytes: bytes) -> tuple[bytes, bytes, str, str, dict[st
             plan_bytes = plan_path.read_bytes()
             if len(plan_bytes) > MAX_ARTIFACT_BYTES:
                 raise HTTPException(status_code=413, detail="planner-output-too-large")
+            verify_command = [str(verifier), str(snapshot_path), str(plan_path), str(result_path)]
+            if plan_schema_version == 2:
+                verify_command.append("--protocol-version=2")
             verify_run = subprocess.run(
-                [str(verifier), str(snapshot_path), str(plan_path), str(result_path)],
+                verify_command,
                 capture_output=True,
                 timeout=PLANNER_TIMEOUT_SECONDS,
                 check=False,
@@ -431,13 +477,24 @@ def _run_planner(snapshot_bytes: bytes) -> tuple[bytes, bytes, str, str, dict[st
                 raise HTTPException(status_code=413, detail="verifier-output-too-large")
         except subprocess.TimeoutExpired as error:
             raise HTTPException(status_code=503, detail="planner-or-verifier-timeout") from error
-    plan_text = decode_text(
-        "fleetright.v1.OptimizationPlan", "fleetright/v1/optimizer.proto", plan_bytes
-    )
-    result_text = decode_text(
-        "fleetright.v1.VerificationResult", "fleetright/v1/optimizer.proto", result_bytes
-    )
-    summary = _plan_summary(plan_text)
+    if plan_schema_version == 2:
+        plan_text = decode_text(
+            "fleetright.v2.EvacuationPlan", "fleetright/v2/evacuation.proto", plan_bytes
+        )
+        result_text = decode_text(
+            "fleetright.v2.VerificationResult", "fleetright/v2/evacuation.proto", result_bytes
+        )
+        summary = _evacuation_plan_summary(plan_text)
+    elif plan_schema_version == 1:
+        plan_text = decode_text(
+            "fleetright.v1.OptimizationPlan", "fleetright/v1/optimizer.proto", plan_bytes
+        )
+        result_text = decode_text(
+            "fleetright.v1.VerificationResult", "fleetright/v1/optimizer.proto", result_bytes
+        )
+        summary = _plan_summary(plan_text)
+    else:
+        raise HTTPException(status_code=422, detail="unsupported-plan-schema-version")
     if not summary["plan_id"]:
         raise HTTPException(status_code=503, detail="planner-returned-malformed-plan")
     accepted = _proto_scalar(result_text, "accepted", False)
@@ -677,6 +734,42 @@ _NODE_KEYS = {
     "generation",
 }
 _RESOURCE_KEYS = {"cpu_millicores", "memory_mib", "network_mbps"}
+_EVACUATION_V2_KEYS = {
+    "cluster_uid",
+    "namespace",
+    "inventory_observed_at_ms",
+    "controllers",
+    "pods",
+    "nodes",
+}
+_CONTROLLER_IDENTITY_KEYS = {
+    "workload_id",
+    "namespace",
+    "deployment_name",
+    "deployment_uid",
+    "deployment_resource_version",
+    "deployment_generation",
+    "replicaset_name",
+    "replicaset_uid",
+    "replicaset_resource_version",
+    "pod_template_sha256",
+    "desired_replicas",
+    "active_replicaset_count",
+    "pdb_allowed_disruptions",
+    "pdb_resource_version",
+    "observed_at_ms",
+}
+_POD_IDENTITY_KEYS = {
+    "workload_id",
+    "replica_id",
+    "node_id",
+    "pod_name",
+    "pod_uid",
+    "controller_uid",
+    "ready",
+    "terminating",
+}
+_NODE_IDENTITY_KEYS = {"node_id", "node_uid", "resource_version"}
 
 
 def _check_keys(value: object, allowed: set[str], name: str) -> dict[str, Any]:
@@ -706,10 +799,179 @@ def _check_label_pairs(value: object, name: str) -> None:
             raise HTTPException(status_code=422, detail=f"{name}-contains-invalid-pair")
 
 
+def _validate_evacuation_inventory(
+    value: object, fields: dict[str, Any], now_ms: int
+) -> dict[str, object]:
+    inventory = _check_keys(value, _EVACUATION_V2_KEYS, "evacuation-v2-inventory")
+
+    def text(item: object, name: str) -> str:
+        if not isinstance(item, str) or not item or len(item) > 512:
+            raise HTTPException(status_code=422, detail=f"invalid-v2-{name}")
+        return item
+
+    def integer(item: object, name: str, minimum: int = 0) -> int:
+        if isinstance(item, bool) or not isinstance(item, int) or item < minimum:
+            raise HTTPException(status_code=422, detail=f"invalid-v2-{name}")
+        return item
+
+    cluster_uid = text(inventory.get("cluster_uid"), "cluster-uid")
+    namespace = text(inventory.get("namespace"), "namespace")
+    observed_at_ms = integer(inventory.get("inventory_observed_at_ms"), "inventory-time")
+    maximum_age_ms = int(fields["policy"]["maximum_snapshot_age_ms"])
+    if observed_at_ms > now_ms or now_ms - observed_at_ms > maximum_age_ms:
+        raise HTTPException(status_code=409, detail="evacuation-v2-inventory-stale")
+    controllers_value = inventory.get("controllers")
+    pods_value = inventory.get("pods")
+    nodes_value = inventory.get("nodes")
+    if not all(isinstance(item, list) for item in (controllers_value, pods_value, nodes_value)):
+        raise HTTPException(status_code=422, detail="invalid-evacuation-v2-inventory-lists")
+    if any(len(item) > 10000 for item in (controllers_value, pods_value, nodes_value)):
+        raise HTTPException(status_code=413, detail="evacuation-v2-inventory-too-large")
+
+    workload_counts: dict[str, int] = {}
+    placement_keys: set[tuple[str, str, str]] = set()
+    for placement in fields["current_placements"]:
+        key = (placement["workload_id"], placement["replica_id"], placement["node_id"])
+        placement_keys.add(key)
+        workload_id = placement["workload_id"]
+        workload_counts[workload_id] = workload_counts.get(workload_id, 0) + 1
+
+    controllers: list[dict[str, object]] = []
+    controller_by_workload: dict[str, dict[str, object]] = {}
+    for raw in controllers_value:
+        item = _check_keys(raw, _CONTROLLER_IDENTITY_KEYS, "v2-controller-identity")
+        controller = {key: item.get(key) for key in _CONTROLLER_IDENTITY_KEYS}
+        workload_id = text(controller["workload_id"], "controller-workload-id")
+        if workload_id not in workload_counts or workload_id in controller_by_workload:
+            raise HTTPException(status_code=422, detail="invalid-v2-controller-workload")
+        if text(controller["namespace"], "controller-namespace") != namespace:
+            raise HTTPException(status_code=422, detail="v2-controller-namespace-mismatch")
+        for name in (
+            "deployment_name",
+            "deployment_uid",
+            "deployment_resource_version",
+            "replicaset_name",
+            "replicaset_uid",
+            "replicaset_resource_version",
+            "pod_template_sha256",
+            "pdb_resource_version",
+        ):
+            text(controller[name], f"controller-{name}")
+        for name in (
+            "deployment_generation",
+            "desired_replicas",
+            "active_replicaset_count",
+            "pdb_allowed_disruptions",
+            "observed_at_ms",
+        ):
+            integer(
+                controller[name],
+                f"controller-{name}",
+                1
+                if name in {"deployment_generation", "desired_replicas", "active_replicaset_count"}
+                else 0,
+            )
+        if controller["active_replicaset_count"] != 1 or controller["observed_at_ms"] > now_ms:
+            raise HTTPException(status_code=422, detail="unsupported-v2-controller-state")
+        if controller["desired_replicas"] != workload_counts[workload_id]:
+            raise HTTPException(status_code=422, detail="v2-controller-replica-count-mismatch")
+        controller_by_workload[workload_id] = controller
+        controllers.append(controller)
+    if set(controller_by_workload) != set(workload_counts):
+        raise HTTPException(status_code=422, detail="v2-controller-inventory-incomplete")
+
+    pods: list[dict[str, object]] = []
+    pod_uids: set[str] = set()
+    pod_names: set[str] = set()
+    pod_keys: set[tuple[str, str, str]] = set()
+    for raw in pods_value:
+        item = _check_keys(raw, _POD_IDENTITY_KEYS, "v2-pod-identity")
+        pod = {key: item.get(key) for key in _POD_IDENTITY_KEYS}
+        for name in (
+            "workload_id",
+            "replica_id",
+            "node_id",
+            "pod_name",
+            "pod_uid",
+            "controller_uid",
+        ):
+            text(pod[name], f"pod-{name}")
+        if not isinstance(pod["ready"], bool) or not isinstance(pod["terminating"], bool):
+            raise HTTPException(status_code=422, detail="invalid-v2-pod-readiness")
+        key = (pod["workload_id"], pod["replica_id"], pod["node_id"])
+        controller = controller_by_workload.get(str(pod["workload_id"]))
+        if (
+            key not in placement_keys
+            or key in pod_keys
+            or pod["pod_uid"] in pod_uids
+            or pod["pod_name"] in pod_names
+            or controller is None
+            or pod["controller_uid"] != controller["replicaset_uid"]
+            or not pod["ready"]
+            or pod["terminating"]
+        ):
+            raise HTTPException(status_code=422, detail="v2-pod-inventory-mismatch")
+        pod_keys.add(key)
+        pod_uids.add(str(pod["pod_uid"]))
+        pod_names.add(str(pod["pod_name"]))
+        pods.append(pod)
+    if pod_keys != placement_keys:
+        raise HTTPException(status_code=422, detail="v2-pod-inventory-incomplete")
+
+    model_node_ids = {node["node_id"] for node in fields["nodes"]}
+    nodes: list[dict[str, object]] = []
+    seen_nodes: set[str] = set()
+    node_uids: set[str] = set()
+    for raw in nodes_value:
+        item = _check_keys(raw, _NODE_IDENTITY_KEYS, "v2-node-identity")
+        node = {key: item.get(key) for key in _NODE_IDENTITY_KEYS}
+        for name in ("node_id", "node_uid", "resource_version"):
+            text(node[name], f"node-{name}")
+        if (
+            node["node_id"] not in model_node_ids
+            or node["node_id"] in seen_nodes
+            or node["node_uid"] in node_uids
+        ):
+            raise HTTPException(status_code=422, detail="v2-node-inventory-mismatch")
+        seen_nodes.add(str(node["node_id"]))
+        node_uids.add(str(node["node_uid"]))
+        nodes.append(node)
+    if seen_nodes != model_node_ids:
+        raise HTTPException(status_code=422, detail="v2-node-inventory-incomplete")
+
+    controllers.sort(key=lambda item: str(item["workload_id"]))
+    pods.sort(key=lambda item: (str(item["workload_id"]), str(item["replica_id"])))
+    nodes.sort(key=lambda item: str(item["node_id"]))
+    return {
+        "cluster_uid": cluster_uid,
+        "namespace": namespace,
+        "inventory_observed_at_ms": observed_at_ms,
+        "controllers": controllers,
+        "pods": pods,
+        "nodes": nodes,
+    }
+
+
 def _validate_snapshot(
     snapshot: dict[str, Any], now_ms: int
 ) -> tuple[dict[str, Any], bytes, dict[str, Any]]:
-    fields = _check_keys(snapshot, _SNAPSHOT_KEYS, "snapshot")
+    fields = _check_keys(
+        snapshot, _SNAPSHOT_KEYS | {"plan_schema_version", "evacuation_v2"}, "snapshot"
+    )
+    plan_schema_version = fields.get("plan_schema_version", 1)
+    if (
+        isinstance(plan_schema_version, bool)
+        or not isinstance(plan_schema_version, int)
+        or plan_schema_version not in {1, 2}
+    ):
+        raise HTTPException(status_code=422, detail="unsupported-plan-schema-version")
+    inventory = None
+    if plan_schema_version == 2:
+        inventory = fields.get("evacuation_v2")
+        if inventory is None:
+            raise HTTPException(status_code=422, detail="missing-evacuation-v2-inventory")
+    elif "evacuation_v2" in fields:
+        raise HTTPException(status_code=422, detail="v2-inventory-requires-plan-schema-version-2")
     if fields.get("schema_version", 1) != 1:
         raise HTTPException(status_code=422, detail="unsupported-snapshot-schema-version")
     required = _SNAPSHOT_KEYS - {"schema_version", "content_sha256"}
@@ -774,13 +1036,27 @@ def _validate_snapshot(
         raise HTTPException(status_code=422, detail="unsupported-or-malformed-machine-catalog")
     for machine in catalog["machines"]:
         _check_keys(machine, {"machine_type", "allocatable", "hourly_cost_micros"}, "machine")
+    normalized_inventory = (
+        _validate_evacuation_inventory(inventory, fields, now_ms) if inventory is not None else None
+    )
     result = deepcopy(fields)
     result.pop("schema_version", None)
     result.pop("content_sha256", None)
+    result.pop("plan_schema_version", None)
+    result.pop("evacuation_v2", None)
     result["evaluation_time_ms"] = now_ms
     try:
         canonical_json(fields)
         encoded, normalized = encode_snapshot(result)
+        if plan_schema_version == 2 and normalized_inventory is not None:
+            encoded, normalized = encode_evacuation_snapshot(result, normalized_inventory)
+            result["plan_schema_version"] = 2
+            result["evacuation_v2"] = normalized_inventory
+            normalized = {
+                **normalized,
+                "plan_schema_version": 2,
+                "evacuation_v2": normalized_inventory,
+            }
     except (
         KeyError,
         TypeError,
@@ -839,7 +1115,9 @@ def _verify_lease_tokens(conn: psycopg.Connection, owner: str, leases: dict[str,
     return True
 
 
-def _run_verifier(snapshot_bytes: bytes, plan_bytes: bytes) -> tuple[bool, str, str]:
+def _run_verifier(
+    snapshot_bytes: bytes, plan_bytes: bytes, plan_schema_version: int = 1
+) -> tuple[bool, str, str]:
     verifier = Path(os.getenv("FLEETRIGHT_VERIFIER", ROOT / "build/fleetright-verify"))
     if not verifier.is_file():
         raise HTTPException(status_code=503, detail="verifier-unavailable")
@@ -853,8 +1131,13 @@ def _run_verifier(snapshot_bytes: bytes, plan_bytes: bytes) -> tuple[bool, str, 
         snapshot_path.write_bytes(snapshot_bytes)
         plan_path.write_bytes(plan_bytes)
         try:
+            command = [str(verifier), str(snapshot_path), str(plan_path), str(result_path)]
+            if plan_schema_version == 2:
+                command.append("--protocol-version=2")
+            elif plan_schema_version != 1:
+                return False, "", "unknown"
             result = subprocess.run(
-                [str(verifier), str(snapshot_path), str(plan_path), str(result_path)],
+                command,
                 capture_output=True,
                 timeout=PLANNER_TIMEOUT_SECONDS,
                 check=False,
@@ -863,11 +1146,20 @@ def _run_verifier(snapshot_bytes: bytes, plan_bytes: bytes) -> tuple[bool, str, 
             raise HTTPException(status_code=503, detail="verifier-timeout") from error
         if result.returncode or not result_path.is_file():
             return False, "", "unknown"
-        text = decode_text(
-            "fleetright.v1.VerificationResult",
-            "fleetright/v1/optimizer.proto",
-            result_path.read_bytes(),
-        )
+        if plan_schema_version == 2:
+            text = decode_text(
+                "fleetright.v2.VerificationResult",
+                "fleetright/v2/evacuation.proto",
+                result_path.read_bytes(),
+            )
+        elif plan_schema_version == 1:
+            text = decode_text(
+                "fleetright.v1.VerificationResult",
+                "fleetright/v1/optimizer.proto",
+                result_path.read_bytes(),
+            )
+        else:
+            return False, "", "unknown"
     return (
         _proto_scalar(text, "accepted", False) is True,
         str(_proto_scalar(text, "canonical_result_sha256", "")),
@@ -889,6 +1181,13 @@ def _execution_admission_reasons(
     summary: dict[str, object], source_workloads: list[dict[str, Any]], target: str | None
 ) -> list[str]:
     reasons: list[str] = []
+    schema_version = summary.get("schema_version", 1)
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int):
+        reasons.append("UNSUPPORTED_EXECUTION_PROTOCOL_VERSION")
+    elif schema_version == 2:
+        reasons.append("UNSUPPORTED_EXECUTION_PROTOCOL_V2")
+    elif schema_version != 1:
+        reasons.append("UNSUPPORTED_EXECUTION_PROTOCOL_VERSION")
     if summary["deactivated_node_ids"]:
         reasons.append("UNSUPPORTED_EXECUTION_ACTION_DEACTIVATE_NODE")
     if summary["evacuation_count"]:
@@ -1090,6 +1389,7 @@ def create_app(
                     return JSONResponse(status_code=prior[0], content=prior[1])
                 now_ms = _database_now_ms(conn)
                 source_fields, source_pb, normalized = _validate_snapshot(body.snapshot, now_ms)
+                plan_schema_version = int(normalized.get("plan_schema_version", 1))
                 source_snapshot = body.snapshot
                 source_content = canonical_json(source_snapshot)
                 source_digest = Repository.store_artifact(
@@ -1232,11 +1532,16 @@ def create_app(
                 effective["snapshot_id"] = (
                     f"{source_fields['snapshot_id']}:effective:{effective_id_suffix}"
                 )
-                effective_pb, normalized_effective = encode_snapshot(effective)
+                if plan_schema_version == 2:
+                    effective_pb, normalized_effective = encode_evacuation_snapshot(
+                        effective, normalized["evacuation_v2"]
+                    )
+                else:
+                    effective_pb, normalized_effective = encode_snapshot(effective)
                 if len(effective_pb) > MAX_ARTIFACT_BYTES:
                     raise HTTPException(status_code=413, detail="effective-snapshot-too-large")
                 plan_bytes, verification_bytes, plan_text, verification_text, summary = (
-                    _run_planner(effective_pb)
+                    _run_planner(effective_pb, plan_schema_version)
                 )
                 if summary["snapshot_id"] != effective["snapshot_id"]:
                     raise HTTPException(status_code=503, detail="planner-snapshot-binding-mismatch")
@@ -1288,7 +1593,12 @@ def create_app(
                 plan_binding = {
                     "source": source_binding,
                     "effective_snapshot_id": effective["snapshot_id"],
-                    "effective_snapshot_sha256": normalized_effective["content_sha256"],
+                    "effective_snapshot_sha256": (
+                        normalized_effective["evacuation_snapshot_sha256"]
+                        if plan_schema_version == 2
+                        else normalized_effective["content_sha256"]
+                    ),
+                    "plan_schema_version": plan_schema_version,
                     "forecast_hash": _sha256(forecast_metadata),
                     "workload_ids": source_binding["workload_ids"],
                     "conflict_keys": source_binding["conflict_keys"],
@@ -1403,33 +1713,36 @@ def create_app(
                                 "payload": payload,
                             }
                         )
-                for index, node_id in enumerate(summary["deactivated_node_ids"]):
-                    intents.append(
-                        {
-                            "intent_id": hashlib.sha256(
-                                f"{native_id}:node:{index}".encode()
-                            ).hexdigest(),
-                            "action_type": "DEACTIVATE_NODE",
-                            "payload": {"node_id": node_id},
-                        }
-                    )
-                for evacuation in summary["evacuations"]:
-                    sequence = int(evacuation["sequence"])
-                    intents.append(
-                        {
-                            "intent_id": hashlib.sha256(
-                                f"{native_id}:move:{sequence}".encode()
-                            ).hexdigest(),
-                            "action_type": "MOVE_REPLICA",
-                            "workload_id": evacuation["workload_id"],
-                            "payload": {
-                                "sequence": sequence,
-                                "replica_id": evacuation["replica_id"],
-                                "source_node_id": evacuation["source_node_id"],
-                                "destination_node_id": evacuation["destination_node_id"],
-                            },
-                        }
-                    )
+                if plan_schema_version == 1:
+                    for index, node_id in enumerate(summary["deactivated_node_ids"]):
+                        intents.append(
+                            {
+                                "intent_id": hashlib.sha256(
+                                    f"{native_id}:node:{index}".encode()
+                                ).hexdigest(),
+                                "action_type": "DEACTIVATE_NODE",
+                                "payload": {"node_id": node_id},
+                            }
+                        )
+                    for evacuation in summary["evacuations"]:
+                        sequence = int(evacuation["sequence"])
+                        intents.append(
+                            {
+                                "intent_id": hashlib.sha256(
+                                    f"{native_id}:move:{sequence}".encode()
+                                ).hexdigest(),
+                                "action_type": "MOVE_REPLICA",
+                                "workload_id": evacuation["workload_id"],
+                                "payload": {
+                                    "sequence": sequence,
+                                    "replica_id": evacuation["replica_id"],
+                                    "source_node_id": evacuation["source_node_id"],
+                                    "destination_node_id": evacuation.get(
+                                        "destination_node_id", ""
+                                    ),
+                                },
+                            }
+                        )
                 if not _verify_lease_tokens(conn, app.state.controller_id, leases):
                     raise LeaseConflict("planning lease expired or lost its fencing token")
                 repo.create_plan(
@@ -1587,7 +1900,9 @@ def create_app(
                 if not {"effective_snapshot.pb", "plan.pb", "verification.pb"}.issubset(artifacts):
                     raise ArtifactIntegrityError("replay artifacts missing")
                 verifier_ok, verification_hash, verifier_build_id = _run_verifier(
-                    artifacts["effective_snapshot.pb"], artifacts["plan.pb"]
+                    artifacts["effective_snapshot.pb"],
+                    artifacts["plan.pb"],
+                    int(row["binding"].get("plan_schema_version", 1)),
                 )
                 if (
                     not verifier_ok
@@ -1867,7 +2182,9 @@ def _mutate_plan(
                     Repository.finish_idempotent(conn, principal.name, op_key, key, 409, response)
                     return JSONResponse(status_code=409, content=response)
                 verifier_ok, verification_hash, verifier_build_id = _run_verifier(
-                    artifacts["effective_snapshot.pb"], artifacts["plan.pb"]
+                    artifacts["effective_snapshot.pb"],
+                    artifacts["plan.pb"],
+                    int(row["binding"].get("plan_schema_version", 1)),
                 )
                 if (
                     not verifier_ok

@@ -74,12 +74,11 @@ replacement, durable PDB eviction, and node-drain orchestration remain blocked
 until the canonical contract and target-side fencing semantics can be proven
 and tested together.
 
-## 2026-10-08 execution-contract audit
+## 2026-10-08 preimplementation audit (historical)
 
-The repository still implements only schema-v1 exact placements. No
-constraint-based evacuation schema or independent verifier was added in this
-audit: accepting such a plan before its Kubernetes effects can be fenced and
-reconciled would create another verified-but-unexecutable plan type. The
+At the time of this audit, the repository implemented only schema-v1 exact
+placements. No constraint-based evacuation schema or independent verifier was
+added in that audit. The
 planning admission now rejects candidate plans containing `MOVE_REPLICA`,
 `DEACTIVATE_NODE`, `RESIZE_WORKLOAD`, or a scale action outside the configured
 target's workload set. The mathematical verifier result remains separately
@@ -126,8 +125,50 @@ not make a Pod Eviction atomic with PostgreSQL takeover. These gaps preclude
 claiming durable restart recovery for evacuation.
 
 The dedicated safety-lab cluster and isolated `fleetright_test` database were
-healthy during preflight. This does not qualify as live evacuation evidence.
-The action remains disabled pending a separately versioned contract, an
+healthy during preflight. This did not qualify as live evacuation evidence.
+The action remained disabled pending a separately versioned contract, an
 independent proof for its complete allowed-outcome set, and a target-side
 fencing mechanism whose final mutation semantics are demonstrated against the
 pinned Kubernetes release.
+
+## 2026-10-08 V2 contract and verifier foundation
+
+Status remains **Blocked for execution**. Schema `fleetright.v2` now defines a
+separate `EvacuationSnapshot`, `EvacuationPlan`, and `VerificationResult`; the
+v1 exact-placement messages and behavior are unchanged.
+
+V2 currently supports one source Pod UID per plan. It records the source
+workload, Deployment and active ReplicaSet identities, Pod name/UID, node UID,
+request shape (mCPU, MiB, Mbps), profile binding, PDB budget, availability
+floor, readiness durations (milliseconds), topology, failure tolerance,
+the explicit N-1 failure-domain label key, intermediate replica counts, action
+dependencies, postconditions, and
+fail-closed behavior. The placement promise is a constraint set of two to
+eight eligible nodes. It does not name an exact destination. The verifier
+enumerates every ordered first/second destination pair allowed by the node set
+and hard pod anti-affinity, including N+2 termination overlap. It checks
+capacity, topology, availability, profile-derived SLO replicas, and N-1
+recovery reserve at each modeled stage. Profile Wilson bounds are recomputed
+from the recorded trial counts, and recovery destinations are checked in every
+permitted insertion order. Plans needing more destinations,
+more than one N-1 workload, an unsupported field, or any unsafe outcome return
+`NO FEASIBLE PLAN` or fail verification.
+
+The six ordered stages apply destination constraints, request one permanent
+extra replica, wait for stable readiness, evict the named source UID through
+the observed PDB, wait for source absence and the final N+1 state, then
+deactivate the source node after the modeled workload placements are gone.
+Runtime postcondition observation and owner/fence rechecks are required before
+each dependent destructive action. Any stage failure keeps the surge and
+blocks later actions. This is a proof contract, not an implementation of those
+mutations.
+
+The independent C++ verifier recomputes resource, topology, profile, stage,
+and recovery checks from the sealed snapshot and serialized plan. It reports
+mathematical acceptance separately and always sets
+`execution_admitted=false`. Python rejects V2 for execution with
+`UNSUPPORTED_EXECUTION_PROTOCOL_V2` and creates no `MOVE_REPLICA` or
+`DEACTIVATE_NODE` intents. The existing target adapter still cannot enforce a
+bounded destination set and anti-affinity, bind eviction atomically to the
+durable fencing token, recheck Deployment/ReplicaSet ownership, or resume the
+staged protocol after restart. No live drain or eviction was attempted.

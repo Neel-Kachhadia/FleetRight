@@ -1,3 +1,4 @@
+#include "fleetright/evacuation_v2.hpp"
 #include "fleetright/planner.hpp"
 
 #include <fstream>
@@ -35,9 +36,25 @@ template <typename Message> bool WriteMessage(const std::string &path, const Mes
 } // namespace
 
 int main(int argc, char **argv) {
-  if (argc != 3) {
-    std::cerr << "usage: fleetright-plan SNAPSHOT.pb PLAN.pb\n";
+  if ((argc != 3 && argc != 4) || (argc == 4 && std::string(argv[3]) != "--protocol-version=2")) {
+    std::cerr << "usage: fleetright-plan SNAPSHOT.pb PLAN.pb [--protocol-version=2]\n";
     return 64;
+  }
+  if (argc == 4) {
+    fleetright::v2::EvacuationSnapshot snapshot;
+    if (!ReadMessage(argv[1], &snapshot)) {
+      std::cerr << "invalid or oversized v2 EvacuationSnapshot protobuf\n";
+      return 65;
+    }
+    const auto plan = fleetright::PlanEvacuationV2(snapshot);
+    if (!WriteMessage(argv[2], plan)) {
+      std::cerr << "could not write v2 EvacuationPlan protobuf\n";
+      return 74;
+    }
+    std::cout << "plan_id=" << plan.plan_id()
+              << " feasible=" << (plan.feasible() ? "true" : "false")
+              << " evacuations=" << plan.operations_size() << " protocol=v2\n";
+    return 0;
   }
   fleetright::v1::OptimizationSnapshot snapshot;
   if (!ReadMessage(argv[1], &snapshot)) {

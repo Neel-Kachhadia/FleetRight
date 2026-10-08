@@ -333,3 +333,115 @@ def encode_snapshot(fields: dict[str, object]) -> tuple[bytes, dict[str, object]
         snapshot_text(result, True),
     )
     return final, result
+
+
+def encode_evacuation_snapshot(
+    model_fields: dict[str, object], inventory: dict[str, object]
+) -> tuple[bytes, dict[str, object]]:
+    model_payload, normalized_model = encode_snapshot(model_fields)
+    model_text = decode_text(
+        "fleetright.v1.OptimizationSnapshot", "fleetright/v1/model.proto", model_payload
+    )
+    lines = [
+        "schema_version: 2",
+        f"cluster_uid: {_quote(str(inventory['cluster_uid']))}",
+        f"namespace: {_quote(str(inventory['namespace']))}",
+        f"inventory_observed_at_ms: {int(inventory['inventory_observed_at_ms'])}",
+        "model_snapshot {",
+        *(f"  {line}" for line in model_text.rstrip().splitlines()),
+        "}",
+    ]
+    for controller in inventory["controllers"]:
+        lines.extend(
+            _render(
+                (
+                    (
+                        "controllers",
+                        Block(
+                            tuple(
+                                (name, controller[name])
+                                for name in (
+                                    "workload_id",
+                                    "namespace",
+                                    "deployment_name",
+                                    "deployment_uid",
+                                    "deployment_resource_version",
+                                    "deployment_generation",
+                                    "replicaset_name",
+                                    "replicaset_uid",
+                                    "replicaset_resource_version",
+                                    "pod_template_sha256",
+                                    "desired_replicas",
+                                    "active_replicaset_count",
+                                    "pdb_allowed_disruptions",
+                                    "pdb_resource_version",
+                                    "observed_at_ms",
+                                )
+                            )
+                        ),
+                    ),
+                )
+            )
+            .rstrip()
+            .splitlines()
+        )
+    for pod in inventory["pods"]:
+        lines.extend(
+            _render(
+                (
+                    (
+                        "pods",
+                        Block(
+                            (
+                                ("workload_id", pod["workload_id"]),
+                                ("replica_id", pod["replica_id"]),
+                                ("node_id", pod["node_id"]),
+                                ("pod_name", pod["pod_name"]),
+                                ("pod_uid", pod["pod_uid"]),
+                                ("controller_uid", pod["controller_uid"]),
+                                ("ready", pod["ready"]),
+                                ("terminating", pod["terminating"]),
+                            )
+                        ),
+                    ),
+                )
+            )
+            .rstrip()
+            .splitlines()
+        )
+    for node in inventory["nodes"]:
+        lines.extend(
+            _render(
+                (
+                    (
+                        "nodes",
+                        Block(
+                            (
+                                ("node_id", node["node_id"]),
+                                ("node_uid", node["node_uid"]),
+                                ("resource_version", node["resource_version"]),
+                            )
+                        ),
+                    ),
+                )
+            )
+            .rstrip()
+            .splitlines()
+        )
+    base = encode_text(
+        "fleetright.v2.EvacuationSnapshot",
+        "fleetright/v2/evacuation.proto",
+        "\n".join(lines) + "\n",
+    )
+    digest = hashlib.sha256(b"fleetright.v2.EvacuationSnapshot:2:" + base).hexdigest()
+    final = encode_text(
+        "fleetright.v2.EvacuationSnapshot",
+        "fleetright/v2/evacuation.proto",
+        "\n".join([*lines, f"content_sha256: {_quote(digest)}"]) + "\n",
+    )
+    return final, {
+        **normalized_model,
+        "plan_schema_version": 2,
+        "evacuation_v2": inventory,
+        "evacuation_snapshot_sha256": digest,
+    }

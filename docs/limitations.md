@@ -57,6 +57,19 @@ approval before execution-journal creation. Although the Kubernetes target code 
 eviction helpers, eviction and node drain are not wired to the durable reconciler, so PDB-blocked
 retry and partial-drain recovery are not supported. SHADOW produces recommendations without a
 separate simulated reconciliation pass. The exact-destination evacuation proof cannot be faithfully
-carried out through the current Deployment scaling interface; see
-[ADR-008](adr/008-staged-evacuation-execution.md). The API runs as a loopback-bound local process
-and invokes the checked-out planner/verifier binaries.
+carried out through the current Deployment scaling interface. See
+[ADR-008](adr/008-staged-evacuation-execution.md).
+
+The separate V2 contract and independent C++ verifier prove a bounded
+constraint-based evacuation for one source Pod UID. A verified V2 plan remains
+inadmissible for execution: the current adapter does not enforce the approved
+node set and hard anti-affinity, provide an atomic UID/PDB eviction fence,
+recheck owner identities, or reconcile the staged protocol durably. No live
+evacuation is supported. V2 enumerates up to eight approved nodes and rejects
+larger outcome sets rather than sampling them. Its bounded N-1 proof supports
+one N-1 workload per plan and checks serving availability at each modeled
+stage plus every recovery insertion order using an explicit node-label failure
+domain. See
+[ADR-008](adr/008-staged-evacuation-execution.md) for the stage protocol and
+adapter requirements. The API runs as a loopback-bound local process and
+invokes the checked-out planner/verifier binaries.

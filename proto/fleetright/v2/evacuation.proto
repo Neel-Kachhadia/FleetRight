@@ -1,0 +1,209 @@
+syntax = "proto3";
+
+package fleetright.v2;
+
+import "fleetright/v1/model.proto";
+
+enum DestinationMode {
+  DESTINATION_MODE_UNSPECIFIED = 0;
+  DESTINATION_MODE_CONSTRAINT_NODE_SET = 1;
+  DESTINATION_MODE_EXACT_NODE = 2;
+}
+
+enum RuntimeCapability {
+  RUNTIME_CAPABILITY_UNSPECIFIED = 0;
+  RUNTIME_CAPABILITY_ENFORCED_NODE_SET = 1;
+  RUNTIME_CAPABILITY_ENFORCED_RESOURCE_REQUESTS = 2;
+  RUNTIME_CAPABILITY_NETWORK_BANDWIDTH_ADMISSION = 3;
+  RUNTIME_CAPABILITY_POD_UID_EVICTION = 4;
+  RUNTIME_CAPABILITY_PDB_ADMISSION = 5;
+  RUNTIME_CAPABILITY_ATOMIC_MUTATION_FENCING = 6;
+  RUNTIME_CAPABILITY_OWNER_IDENTITY_RECHECK = 7;
+  RUNTIME_CAPABILITY_READINESS_OBSERVATION = 8;
+  RUNTIME_CAPABILITY_HARD_POD_ANTI_AFFINITY = 9;
+}
+
+enum EvacuationStage {
+  EVACUATION_STAGE_UNSPECIFIED = 0;
+  EVACUATION_STAGE_APPLY_DESTINATION_CONSTRAINT = 1;
+  EVACUATION_STAGE_SET_SURGE_REPLICAS = 2;
+  EVACUATION_STAGE_WAIT_REPLACEMENT_READY = 3;
+  EVACUATION_STAGE_EVICT_SOURCE_UID = 4;
+  EVACUATION_STAGE_WAIT_SOURCE_ABSENT = 5;
+  EVACUATION_STAGE_DEACTIVATE_SOURCE_NODE = 6;
+}
+
+enum FailureBehavior {
+  FAILURE_BEHAVIOR_UNSPECIFIED = 0;
+  FAILURE_BEHAVIOR_FAIL_CLOSED_KEEP_SURGE = 1;
+}
+
+enum IntermediateStateKind {
+  INTERMEDIATE_STATE_UNSPECIFIED = 0;
+  INTERMEDIATE_STATE_BASELINE = 1;
+  INTERMEDIATE_STATE_FIRST_REPLACEMENT_PENDING = 2;
+  INTERMEDIATE_STATE_FIRST_REPLACEMENT_READY = 3;
+  INTERMEDIATE_STATE_SOURCE_TERMINATING_OVERLAP = 4;
+  INTERMEDIATE_STATE_FINAL = 5;
+}
+
+message ControllerIdentity {
+  string workload_id = 1;
+  string namespace = 2;
+  string deployment_name = 3;
+  string deployment_uid = 4;
+  string deployment_resource_version = 5;
+  uint64 deployment_generation = 6;
+  string replicaset_name = 7;
+  string replicaset_uid = 8;
+  string replicaset_resource_version = 9;
+  string pod_template_sha256 = 10;
+  uint32 desired_replicas = 11;
+  uint32 active_replicaset_count = 12;
+  uint32 pdb_allowed_disruptions = 13;
+  string pdb_resource_version = 14;
+  uint64 observed_at_ms = 15;
+}
+
+message PodIdentity {
+  string workload_id = 1;
+  string replica_id = 2;
+  string node_id = 3;
+  string pod_name = 4;
+  string pod_uid = 5;
+  string controller_uid = 6;
+  bool ready = 7;
+  bool terminating = 8;
+}
+
+message NodeIdentity {
+  string node_id = 1;
+  string node_uid = 2;
+  string resource_version = 3;
+}
+
+message EvacuationSnapshot {
+  uint32 schema_version = 1;
+  string cluster_uid = 2;
+  string namespace = 3;
+  // Unix timestamp in milliseconds for the identity inventory observation.
+  uint64 inventory_observed_at_ms = 4;
+  fleetright.v1.OptimizationSnapshot model_snapshot = 5;
+  repeated ControllerIdentity controllers = 6;
+  repeated PodIdentity pods = 7;
+  repeated NodeIdentity nodes = 8;
+  string content_sha256 = 9;
+}
+
+message CapacityProfileBinding {
+  string workload_id = 1;
+  string profile_id = 2;
+  string profile_sha256 = 3;
+  uint32 safe_point_index = 4;
+}
+
+message DestinationConstraint {
+  // A node set means the scheduler may choose any listed node; an exact node
+  // is valid only when the runtime can enforce it.
+  DestinationMode mode = 1;
+  repeated string allowed_node_ids = 2;
+  string exact_destination_node_id = 3;
+  bool require_hard_pod_anti_affinity = 4;
+  bool exclude_source_node = 5;
+}
+
+message PermittedIntermediateState {
+  IntermediateStateKind kind = 1;
+  // Replica counts; live includes pending and terminating Pods.
+  uint32 minimum_ready_replicas = 2;
+  uint32 maximum_live_replicas = 3;
+  bool source_pod_consumes_resources = 4;
+  bool source_pod_counts_as_available = 5;
+}
+
+message EvacuationAction {
+  uint32 sequence = 1;
+  string action_id = 2;
+  EvacuationStage stage = 3;
+  repeated uint32 depends_on_sequences = 4;
+  // Runtime must observe this condition before the next dependent action.
+  string expected_postcondition = 5;
+  FailureBehavior on_failure = 6;
+}
+
+message EvacuationOperation {
+  uint32 sequence = 1;
+  string workload_id = 2;
+  string replica_id = 3;
+  string source_pod_name = 4;
+  string source_pod_uid = 5;
+  string source_controller_uid = 6;
+  string source_node_id = 7;
+  string source_node_uid = 8;
+  DestinationConstraint destinations = 9;
+  // ResourceVector units are millicores, MiB, and Mbps per replica.
+  fleetright.v1.ResourceVector replica_requests = 10;
+  // All replica fields below are counts, not percentages.
+  uint32 baseline_replicas = 11;
+  uint32 surge_desired_replicas = 12;
+  uint32 final_desired_replicas = 13;
+  uint32 maximum_live_replicas = 14;
+  uint32 maximum_temporary_surge_replicas = 15;
+  uint32 required_pdb_disruptions = 16;
+  uint32 maximum_concurrent_disruptions = 17;
+  uint32 availability_floor_replicas = 18;
+  uint32 profile_required_replicas = 19;
+  // Durations are milliseconds.
+  uint64 readiness_stabilization_ms = 20;
+  uint64 readiness_timeout_ms = 21;
+  string topology_key = 22;
+  uint32 minimum_topology_domains = 23;
+  uint32 maximum_topology_skew = 24;
+  fleetright.v1.FailureTolerance failure_tolerance = 25;
+  uint32 n_minus_1_recovery_target_replicas = 26;
+  repeated string recovery_destination_node_ids = 27;
+  bool deactivate_source_node_after_empty = 28;
+  repeated PermittedIntermediateState permitted_intermediate_states = 29;
+  repeated EvacuationAction actions = 30;
+  FailureBehavior on_failure = 31;
+  // N-1 means one node-label value is unavailable as a single failure domain.
+  string n_minus_1_failure_domain_key = 32;
+}
+
+message EvacuationPlan {
+  uint32 schema_version = 1;
+  string plan_id = 2;
+  string snapshot_id = 3;
+  uint64 base_generation = 4;
+  // Plan timestamps are Unix milliseconds.
+  uint64 created_at_ms = 5;
+  uint64 expires_at_ms = 6;
+  string snapshot_sha256 = 7;
+  string policy_sha256 = 8;
+  string machine_catalog_sha256 = 9;
+  repeated CapacityProfileBinding profile_bindings = 10;
+  string optimizer_build_id = 11;
+  string verifier_build_id = 12;
+  bool feasible = 13;
+  string infeasible_reason = 14;
+  repeated RuntimeCapability required_runtime_capabilities = 15;
+  repeated EvacuationOperation operations = 16;
+}
+
+message InvariantResult {
+  string invariant = 1;
+  bool passed = 2;
+  string detail = 3;
+  int64 margin = 4;
+}
+
+message VerificationResult {
+  uint32 schema_version = 1;
+  string plan_id = 2;
+  bool accepted = 3;
+  repeated InvariantResult invariants = 4;
+  string verifier_build_id = 5;
+  string canonical_result_sha256 = 6;
+  bool execution_admitted = 7;
+  repeated RuntimeCapability required_runtime_capabilities = 8;
+}

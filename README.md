@@ -24,4 +24,6 @@ The planner consumes a sealed, versioned snapshot and emits a protobuf plan. The
 
 The local simulator is a declared model, not a replacement for workload measurements. Its near-saturation queue and latency behavior is nonlinear. No forecasting, live Kubernetes controller, or destructive executor is included in this milestone.
 
+Evacuation schema V2 is a separate, constraint-based planning protocol. Its independent C++ verifier evaluates every supported scheduler placement outcome and keeps mathematical verification separate from execution admission. The Python API rejects V2 execution until a durable Kubernetes adapter enforces the recorded placement, identity, PDB, readiness, and fencing requirements. V1 behavior remains unchanged; see [ADR-008](docs/adr/008-staged-evacuation-execution.md).
+
 See [`docs/implementation.md`](docs/implementation.md), [`docs/capacity-model.md`](docs/capacity-model.md), and [`docs/benchmark-methodology.md`](docs/benchmark-methodology.md) for contracts, assumptions, and evidence limits.
