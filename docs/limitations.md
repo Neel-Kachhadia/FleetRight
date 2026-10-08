@@ -38,15 +38,25 @@ workload/node lease set, so parallel planning for independent workloads is not s
 Prompt 2B adds live Docker Compose and Kubernetes Deployment replica scaling behind explicit
 `EXECUTE` configuration. The Docker fence is host-local and Docker Compose's fixed published ports
 limit the checked-in service harness to one replica per service. Kubernetes execution must use an
-explicit namespace-scoped kubeconfig; kind/k3d, kubectl, and a local Kubernetes image were not
-available for this run, so Kubernetes runtime, readiness, topology, PDB, and RBAC behavior were not
-validated against a cluster. The documented optimize-to-approve-to-execute API runbook was not
-exercised end-to-end; API idempotency was tested with a fake target, and the real Docker adapter
-was exercised separately.
+explicit namespace-scoped kubeconfig. The dedicated `fleetright-safety-lab` kind cluster and its
+three nodes were healthy at preflight, but no evacuation action was run: the v1.37.0 Eviction API
+does not preserve the supplied Pod resourceVersion precondition on every applicable unhealthy-Pod
+PDB branch, so a stale controller is not fenced at the final mutation. The safety-lab has no
+`fleetright` namespace or installed workload/RBAC; Kubernetes readiness, topology, PDB admission,
+ServiceAccount identity, and RBAC were not exercised against this cluster during this focused
+session. The earlier Prompt 2B cluster and adapter checks recorded below in
+[the specialist review log](specialist-review-log.md) were run on a different disposable cluster
+and did not validate durable evacuation. The documented optimize-to-approve-to-execute API runbook
+was not exercised end-to-end; API idempotency was tested with a fake target, and the real Docker
+adapter was exercised separately.
 
-Only immutable replica-count actions are executable. `MOVE_REPLICA`, node deactivation/drain, and
-resource resizing are rejected before journal creation. Although the Kubernetes target code has
-PDB-aware eviction helpers, eviction and node drain are not wired to the durable reconciler, so
-PDB-blocked retry and partial-drain recovery are not supported. SHADOW produces recommendations
-without a separate simulated reconciliation pass. The API runs as a loopback-bound local process
+Only immutable replica-count actions are executable. A Deployment scale action does not identify a
+Pod or use the Eviction API; it cannot implement a verified per-Pod move. `MOVE_REPLICA`, node
+deactivation/drain, and resource resizing are rejected during planning admission and rechecked at
+approval before execution-journal creation. Although the Kubernetes target code has PDB-aware
+eviction helpers, eviction and node drain are not wired to the durable reconciler, so PDB-blocked
+retry and partial-drain recovery are not supported. SHADOW produces recommendations without a
+separate simulated reconciliation pass. The exact-destination evacuation proof cannot be faithfully
+carried out through the current Deployment scaling interface; see
+[ADR-008](adr/008-staged-evacuation-execution.md). The API runs as a loopback-bound local process
 and invokes the checked-out planner/verifier binaries.

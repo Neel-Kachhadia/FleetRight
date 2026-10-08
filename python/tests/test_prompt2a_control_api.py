@@ -12,6 +12,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import fleetright.api as api_module
 import psycopg
 import pytest
 from fastapi.testclient import TestClient
@@ -289,6 +290,19 @@ def _tokens() -> tuple[dict[str, Principal], dict[str, str]]:
     return {token: Principal(role, role) for role, token in raw.items()}, raw
 
 
+def _supported_scale_out_request(now_ms: int) -> dict[str, object]:
+    snapshot = _snapshot(now_ms, predictive_scale_out=True)
+    snapshot["nodes"] = snapshot["nodes"][:4]
+    snapshot["nodes"][3]["labels"] = [("zone", "zone-3"), ("rack", "rack-3")]
+    snapshot["workloads"][0]["demand_qps_milli"] = 1_400_000
+    snapshot["workloads"][0]["min_topology_domains"] = 3
+    snapshot["workloads"][0]["max_topology_skew"] = 0
+    return {
+        "snapshot": snapshot,
+        "scale_in_evidence": _observed_scale_in_evidence(now_ms),
+    }
+
+
 def _create_verified_plan(client: TestClient, raw_tokens: dict[str, str]) -> dict[str, object]:
     now_ms = time.time_ns() // 1_000_000
     response = client.post(
@@ -297,10 +311,7 @@ def _create_verified_plan(client: TestClient, raw_tokens: dict[str, str]) -> dic
             "Authorization": f"Bearer {raw_tokens['recommender']}",
             "Idempotency-Key": secrets.token_hex(16),
         },
-        json={
-            "snapshot": _snapshot(now_ms),
-            "scale_in_evidence": _observed_scale_in_evidence(now_ms),
-        },
+        json=_supported_scale_out_request(now_ms),
     )
     assert response.status_code == 201, response.text
     assert response.json()["state"] == "VERIFIED", response.json()
@@ -314,10 +325,7 @@ def test_authenticated_api_idempotency_approval_restart_and_fail_closed_execute(
     tokens, raw_tokens = _tokens()
     app = create_app(repo, tokens=tokens)
     now_ms = time.time_ns() // 1_000_000
-    payload = {
-        "snapshot": _snapshot(now_ms),
-        "scale_in_evidence": _observed_scale_in_evidence(now_ms),
-    }
+    payload = _supported_scale_out_request(now_ms)
     with TestClient(app) as client:
         assert client.get("/healthz").json()["execution_enabled"] is False
         assert client.get("/readyz").status_code == 200
@@ -446,6 +454,119 @@ def test_authenticated_api_idempotency_approval_restart_and_fail_closed_execute(
         assert conn.execute("SELECT count(*) AS n FROM idempotency_keys").fetchone()["n"] >= 2
 
 
+def test_execution_admission_allows_only_supported_plan_actions() -> None:
+    resources = {"cpu_millicores": 250, "memory_mib": 256, "network_mbps": 100}
+    source_workloads = [
+        {"workload_id": "cpu-api", "current_resources": resources},
+        {"workload_id": "memory-api", "current_resources": resources},
+    ]
+    summary = {
+        "deactivated_node_ids": [],
+        "evacuation_count": 0,
+        "decisions": [
+            {
+                "workload_id": "cpu-api",
+                "current_replicas": 3,
+                "proposed_replicas": 4,
+                "proposed_resources": resources,
+            }
+        ],
+    }
+    assert api_module._execution_admission_reasons(summary, source_workloads, "kubernetes") == []
+
+    move = {**summary, "evacuation_count": 1}
+    assert api_module._execution_admission_reasons(move, source_workloads, "kubernetes") == [
+        "UNSUPPORTED_EXECUTION_ACTION_MOVE_REPLICA"
+    ]
+    deactivate = {**summary, "deactivated_node_ids": ["node-a"]}
+    assert api_module._execution_admission_reasons(deactivate, source_workloads, "kubernetes") == [
+        "UNSUPPORTED_EXECUTION_ACTION_DEACTIVATE_NODE"
+    ]
+
+    resize = {
+        **summary,
+        "decisions": [
+            {
+                **summary["decisions"][0],
+                "proposed_resources": {**resources, "cpu_millicores": 500},
+            }
+        ],
+    }
+    assert api_module._execution_admission_reasons(resize, source_workloads, "kubernetes") == [
+        "UNSUPPORTED_EXECUTION_ACTION_RESIZE_WORKLOAD"
+    ]
+
+    unsupported_workload = {
+        **summary,
+        "decisions": [{**summary["decisions"][0], "workload_id": "memory-api"}],
+    }
+    assert api_module._execution_admission_reasons(
+        unsupported_workload, source_workloads, "kubernetes"
+    ) == ["UNSUPPORTED_EXECUTION_WORKLOAD:memory-api"]
+
+
+@pytest.mark.parametrize("unsupported_action", ["MOVE_REPLICA", "DEACTIVATE_NODE"])
+@pytest.mark.parametrize("mode", ["RECOMMEND", "EXECUTE"])
+def test_approval_keeps_unsupported_actions_out_of_execution_journal(
+    clean_database: Database, unsupported_action: str, mode: str
+) -> None:
+    tokens, raw_tokens = _tokens()
+
+    class UnusedTarget:
+        def observe_scale(self, _workload_id: str) -> dict[str, object]:
+            raise AssertionError("unsupported action reached target observation")
+
+    app = create_app(
+        clean_database.repository,
+        tokens=tokens,
+        mode=mode,
+        execution_target="docker",
+        target_adapter=UnusedTarget(),
+        health_observer=object(),
+        start_execution_worker=False,
+    )
+    with TestClient(app) as client:
+        plan = _create_verified_plan(client, raw_tokens)
+        with clean_database.repository.transaction() as conn:
+            action = conn.execute(
+                "SELECT intent_id FROM action_intents WHERE plan_id=%s "
+                "ORDER BY action_sequence LIMIT 1",
+                (plan["plan_id"],),
+            ).fetchone()
+            assert action is not None
+            conn.execute(
+                "UPDATE action_intents SET action_type=%s WHERE plan_id=%s AND intent_id=%s",
+                (unsupported_action, plan["plan_id"], action["intent_id"]),
+            )
+
+        rejected = client.post(
+            f"/v1/plans/{plan['plan_id']}/approve",
+            headers={
+                "Authorization": f"Bearer {raw_tokens['operator']}",
+                "Idempotency-Key": f"reject-{unsupported_action.lower()}",
+            },
+            json={},
+        )
+        assert rejected.status_code == 409
+        assert rejected.json()["detail"] == "plan contains an unsupported execution action"
+        assert clean_database.repository.get_plan(plan["plan_id"])["state"] == "VERIFIED"
+        with clean_database.repository.transaction() as conn:
+            assert (
+                conn.execute(
+                    "SELECT count(*) AS n FROM plan_executions WHERE plan_id=%s",
+                    (plan["plan_id"],),
+                ).fetchone()["n"]
+                == 0
+            )
+            assert (
+                conn.execute(
+                    "SELECT execution_state FROM action_intents WHERE plan_id=%s AND intent_id=%s",
+                    (plan["plan_id"], action["intent_id"]),
+                ).fetchone()["execution_state"]
+                == "NOT_STARTED"
+            )
+
+
 def test_execute_mode_is_authenticated_async_and_idempotent(clean_database: Database) -> None:
     tokens, raw_tokens = _tokens()
 
@@ -472,30 +593,14 @@ def test_execute_mode_is_authenticated_async_and_idempotent(clean_database: Data
     )
     with TestClient(app) as client:
         now_ms = time.time_ns() // 1_000_000
-        samples = [
-            {
-                "observed_at_ms": now_ms - (120 - index) * 60_000,
-                "qps_milli": 1_500_000,
-                "concurrency": 210,
-            }
-            for index in range(120)
-        ]
-        snapshot = _snapshot(now_ms, predictive_scale_out=True)
-        for node in snapshot["nodes"][4:]:
-            node["active"] = False
+        payload = _supported_scale_out_request(now_ms)
         optimized = client.post(
             "/v1/optimize",
             headers={
                 "Authorization": f"Bearer {raw_tokens['recommender']}",
                 "Idempotency-Key": "execute-plan-optimize",
             },
-            json={
-                "snapshot": snapshot,
-                "history": {"cpu-api": samples},
-                "model": "ewma_trend",
-                "scheduling_buffer_ms": 30_000,
-                "scale_in_evidence": _observed_scale_in_evidence(now_ms),
-            },
+            json=payload,
         )
         assert optimized.status_code == 201, optimized.text
         plan = optimized.json()
@@ -627,11 +732,12 @@ def test_predictive_upper_bound_feeds_planner_and_persists_forecast(
                 "scale_in_evidence": _observed_scale_in_evidence(now_ms),
             },
         )
-        assert response.status_code == 201, response.text
+        assert response.status_code == 200, response.text
         plan = response.json()
         forecast = plan["forecast_metadata"]["cpu-api"]
-        assert plan["state"] == "VERIFIED"
-        assert plan["verification_accepted"] is True and plan["admission_accepted"] is True
+        assert plan["state"] == "REJECTED"
+        assert plan["verification_accepted"] is True and plan["admission_accepted"] is False
+        assert "UNSUPPORTED_EXECUTION_ACTION_DEACTIVATE_NODE" in plan["reason_codes"]
         assert forecast["forecast_status"] == "PREDICTIVE"
         assert forecast["horizon_ms"] == 140_000
         assert len(forecast["forecast_sha256"]) == 64
@@ -781,8 +887,9 @@ def test_durable_plan_expiry_is_bounded_by_profile_validity(clean_database: Data
     tokens, raw_tokens = _tokens()
     app = create_app(clean_database.repository, tokens=tokens)
     now_ms = time.time_ns() // 1_000_000
-    snapshot = _snapshot(now_ms)
-    profile_deadline = now_ms + 300_000
+    payload = _supported_scale_out_request(now_ms)
+    snapshot = payload["snapshot"]
+    profile_deadline = now_ms + 60_000
     snapshot["capacity_profiles"][0]["valid_until_ms"] = profile_deadline
     with TestClient(app) as client:
         response = client.post(
@@ -791,10 +898,7 @@ def test_durable_plan_expiry_is_bounded_by_profile_validity(clean_database: Data
                 "Authorization": f"Bearer {raw_tokens['recommender']}",
                 "Idempotency-Key": "profile-expiry",
             },
-            json={
-                "snapshot": snapshot,
-                "scale_in_evidence": _observed_scale_in_evidence(now_ms),
-            },
+            json=payload,
         )
     assert response.status_code == 201, response.text
     assert response.json()["expires_at_ms"] == profile_deadline

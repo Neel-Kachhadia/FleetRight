@@ -117,3 +117,44 @@ No model opinion overrides compiler, test, sanitizer, fuzz, or measured benchmar
   `git diff --check`, and a secret scan over all seven changed files passed (zero findings). C++
   source is unchanged and prior 23/23 evidence is reused. The prior full Python suite was 81 passed;
   no unrelated tests were rerun.
+
+## 2026-10-08 evacuation contract review
+
+- GPT-6.1 Sol High confirmed that schema-v1 `EvacuationStep` encodes exact source and destination
+  placements that an ordinary Deployment cannot enforce. A distinct constraint-based contract
+  would need to enumerate controller-selected outcomes and prove capacity, availability, topology,
+  recovery reserve, and Pod/controller identity. No v2 plan was introduced because the available
+  target cannot yet safely execute and reconcile it.
+- GPT-6.1 Sol Max confirmed that a future narrower promise could permanently grow N to N+1 while
+  retiring one named source Pod UID; this is not a temporary surge or node drain. The contract must
+  account for N+2 physical overlap, all permitted destination pairs, cordon/recovery effects, and
+  exact conditional uncordon. More critically, the pinned Kubernetes v1.37.0 Eviction handler may
+  replace a supplied resourceVersion precondition for an unready Pod under `AlwaysAllow`, or under
+  `IfHealthyBudget` when `CurrentHealthy >= DesiredHealthy > 0`, so a lease check cannot fence an old
+  same-UID eviction request after takeover. The reviewer also found that current observation accepts
+  a Ready destination Pod without binding it to the approved ReplicaSet and that the journal has no
+  evacuation-stage/proof binding. No mutation path in this repository closes the
+  check-to-final-mutation race. Evacuation remains disabled; no live eviction test was attempted.
+- Claude Sonnet 5.5 High independently agreed that exact-placement evacuation cannot run safely and
+  found an additional contract gap: `/v1/optimize` could mark a verifier-accepted plan `VERIFIED`
+  even when its candidate actions were unsupported. Planning admission now rejects exact moves,
+  node deactivation, resource resizing, and target-incompatible replica scaling. The approval-time
+  action gate now runs in every API mode; the live target observation remains limited to EXECUTE.
+  Regression checks cover this admission classifier and unsupported action approval in RECOMMEND
+  and EXECUTE modes.
+- Sonnet had no upstream-source evidence in its review packet and marked the Eviction precondition
+  behavior uncertain. Direct inspection of the pinned v1.37.0 source resolves that disagreement:
+  the unhealthy-Pod branch overwrites the caller's resourceVersion at lines 267-274, while its
+  special conflict-to-429 handling at lines 278-284 is conditional on the caller omitting one. The
+  same review found `observe_move` does not catch the helper's `TargetNotFound` when the source has
+  disappeared and does not bind replacement identity; that unused helper remains unwired. Prior
+  adapter checks on `fleetright-prompt2b-e2e` tested an eviction helper, not durable evacuation on
+  the empty `fleetright-safety-lab` cluster.
+- The Prompt 2A approval test was an existing uncommitted user change at session start; it was
+  preserved and extended to check both RECOMMEND and EXECUTE approval gates. Final focused Python
+  suite: 96 passed, including PostgreSQL-backed tests. C++ build and CTest: 23/23 passed. The
+  AddressSanitizer test binary passed 23/23 with `ASAN_OPTIONS=detect_leaks=0`; default
+  LeakSanitizer aborts in this environment after each test. Ruff check and changed-file format check
+  passed. Whole-repository format check still reports only the pre-existing
+  `python/fleetright/experiment.py` formatting difference. `gitleaks` was unavailable, so no
+  dedicated secret-scanner result is claimed. No evacuation or live kind mutation test ran.

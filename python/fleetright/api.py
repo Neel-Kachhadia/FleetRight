@@ -885,6 +885,33 @@ def _supported_execution_workloads(target: str | None) -> set[str]:
     return {"cpu-api"} if target == "kubernetes" else EXECUTION_WORKLOADS
 
 
+def _execution_admission_reasons(
+    summary: dict[str, object], source_workloads: list[dict[str, Any]], target: str | None
+) -> list[str]:
+    reasons: list[str] = []
+    if summary["deactivated_node_ids"]:
+        reasons.append("UNSUPPORTED_EXECUTION_ACTION_DEACTIVATE_NODE")
+    if summary["evacuation_count"]:
+        reasons.append("UNSUPPORTED_EXECUTION_ACTION_MOVE_REPLICA")
+
+    current = {workload["workload_id"]: workload for workload in source_workloads}
+    supported = _supported_execution_workloads(target)
+    for decision in summary["decisions"]:
+        workload_id = decision["workload_id"]
+        source = current.get(workload_id)
+        if source is None:
+            reasons.append("UNSUPPORTED_EXECUTION_ACTION_INVALID")
+            continue
+        if decision["proposed_resources"] != source["current_resources"]:
+            reasons.append("UNSUPPORTED_EXECUTION_ACTION_RESIZE_WORKLOAD")
+        if (
+            decision["proposed_replicas"] != decision["current_replicas"]
+            and workload_id not in supported
+        ):
+            reasons.append(f"UNSUPPORTED_EXECUTION_WORKLOAD:{workload_id}")
+    return list(dict.fromkeys(reasons))
+
+
 def create_app(
     repository: Repository | None = None,
     *,
@@ -1221,6 +1248,10 @@ def create_app(
                 for workload_id, (_, reasons) in eligibility.items():
                     if reasons:
                         reason_codes.extend(f"{reason}:{workload_id}" for reason in reasons)
+                execution_rejections = _execution_admission_reasons(
+                    summary, source_fields["workloads"], app.state.execution_target
+                )
+                reason_codes.extend(execution_rejections)
                 reductions = _reduction_workloads(summary, source_fields)
                 disallowed = sorted(
                     workload_id
@@ -1244,7 +1275,9 @@ def create_app(
                     ):
                         reason_codes.append("PREDICTION_SUGGESTS_LOWER_DEMAND")
                 verifier_ok = bool(summary["verification_accepted"])
-                admission_ok = bool(summary["feasible"]) and not disallowed
+                admission_ok = (
+                    bool(summary["feasible"]) and not disallowed and not execution_rejections
+                )
                 if not verifier_ok:
                     reason_codes.append("INDEPENDENT_VERIFIER_REJECTED")
                 if not summary["feasible"]:
@@ -1871,25 +1904,27 @@ def _mutate_plan(
                     )
                     Repository.finish_idempotent(conn, principal.name, op_key, key, 409, response)
                     return JSONResponse(status_code=409, content=response)
+                supported_workloads = _supported_execution_workloads(app.state.execution_target)
+                approval_actions = conn.execute(
+                    "SELECT intent_id, action_type, workload_id, payload FROM action_intents "
+                    "WHERE plan_id = %s ORDER BY action_sequence",
+                    (plan_id,),
+                ).fetchall()
+                for action in approval_actions:
+                    payload = action["payload"]
+                    if (
+                        action["action_type"] != "SET_REPLICA_COUNT"
+                        or action["workload_id"] not in supported_workloads
+                        or not isinstance(payload, dict)
+                        or not valid_execution_health_policy(
+                            action["workload_id"], payload.get("health")
+                        )
+                        or payload.get("current_resources") != payload.get("proposed_resources")
+                    ):
+                        raise ControlError("plan contains an unsupported execution action")
                 if app.state.execution_enabled:
-                    supported_workloads = _supported_execution_workloads(app.state.execution_target)
-                    approval_actions = conn.execute(
-                        "SELECT intent_id, action_type, workload_id, payload FROM action_intents "
-                        "WHERE plan_id = %s ORDER BY action_sequence",
-                        (plan_id,),
-                    ).fetchall()
                     for action in approval_actions:
                         payload = action["payload"]
-                        if (
-                            action["action_type"] != "SET_REPLICA_COUNT"
-                            or action["workload_id"] not in supported_workloads
-                            or not isinstance(payload, dict)
-                            or not valid_execution_health_policy(
-                                action["workload_id"], payload.get("health")
-                            )
-                            or payload.get("current_resources") != payload.get("proposed_resources")
-                        ):
-                            raise ControlError("plan contains an unsupported execution action")
                         try:
                             observed = app.state.execution_controller.target.observe_scale(
                                 action["workload_id"]
