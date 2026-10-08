@@ -36,7 +36,7 @@ from fleetright.control import (
 )
 from fleetright.execution import (
     DockerComposeTarget,
-    KubernetesTarget,
+    FleetRightWorkloadTarget,
     TargetError,
     TargetNotFound,
     WorkloadHealthObserver,
@@ -1174,7 +1174,9 @@ def _public_plan(row: dict[str, object]) -> dict[str, object]:
 
 
 def _supported_execution_workloads(target: str | None) -> set[str]:
-    return {"cpu-api"} if target == "kubernetes" else EXECUTION_WORKLOADS
+    if target == "kubernetes-workload":
+        return {"cpu-api"}
+    return EXECUTION_WORKLOADS if target in {None, "", "docker"} else set()
 
 
 def _execution_admission_reasons(
@@ -1203,6 +1205,11 @@ def _execution_admission_reasons(
             continue
         if decision["proposed_resources"] != source["current_resources"]:
             reasons.append("UNSUPPORTED_EXECUTION_ACTION_RESIZE_WORKLOAD")
+        if (
+            target == "kubernetes-workload"
+            and decision["proposed_replicas"] < decision["current_replicas"]
+        ):
+            reasons.append("UNSUPPORTED_EXECUTION_ACTION_SCALE_DOWN")
         if (
             decision["proposed_replicas"] != decision["current_replicas"]
             and workload_id not in supported
@@ -1236,10 +1243,12 @@ def create_app(
         and target_name
         not in {
             "docker",
-            "kubernetes",
+            "kubernetes-workload",
         }
     ):
-        raise RuntimeError("EXECUTE mode requires FLEETRIGHT_EXECUTION_TARGET=docker or kubernetes")
+        raise RuntimeError(
+            "EXECUTE mode requires FLEETRIGHT_EXECUTION_TARGET=docker or kubernetes-workload"
+        )
     instance_id = controller_id or f"controller-{uuid.uuid4()}"
     app = FastAPI(title="FleetRight Control API", version="2.0b")
     app.state.repository = repository
@@ -1260,9 +1269,12 @@ def create_app(
                 raise RuntimeError(
                     "Kubernetes EXECUTE requires an explicit least-privilege kubeconfig"
                 )
-            if namespace != "fleetright":
-                raise RuntimeError("Kubernetes EXECUTE requires namespace fleetright")
-            target = KubernetesTarget(kubeconfig=kubeconfig, namespace=namespace)
+            if target_name == "kubernetes-workload":
+                if namespace != "fleetright-v2":
+                    raise RuntimeError("workload execution requires namespace fleetright-v2")
+                target = FleetRightWorkloadTarget(kubeconfig=kubeconfig, namespace=namespace)
+            else:
+                raise RuntimeError("direct Kubernetes Deployment execution is disabled")
         health = health_observer or WorkloadHealthObserver()
         app.state.execution_controller = ExecutionController(
             repository,

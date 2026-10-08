@@ -472,16 +472,27 @@ def test_execution_admission_allows_only_supported_plan_actions() -> None:
             }
         ],
     }
-    assert api_module._execution_admission_reasons(summary, source_workloads, "kubernetes") == []
+    assert (
+        api_module._execution_admission_reasons(summary, source_workloads, "kubernetes-workload")
+        == []
+    )
+
+    scale_down = {
+        **summary,
+        "decisions": [{**summary["decisions"][0], "proposed_replicas": 2}],
+    }
+    assert api_module._execution_admission_reasons(
+        scale_down, source_workloads, "kubernetes-workload"
+    ) == ["UNSUPPORTED_EXECUTION_ACTION_SCALE_DOWN"]
 
     move = {**summary, "evacuation_count": 1}
-    assert api_module._execution_admission_reasons(move, source_workloads, "kubernetes") == [
-        "UNSUPPORTED_EXECUTION_ACTION_MOVE_REPLICA"
-    ]
+    assert api_module._execution_admission_reasons(
+        move, source_workloads, "kubernetes-workload"
+    ) == ["UNSUPPORTED_EXECUTION_ACTION_MOVE_REPLICA"]
     deactivate = {**summary, "deactivated_node_ids": ["node-a"]}
-    assert api_module._execution_admission_reasons(deactivate, source_workloads, "kubernetes") == [
-        "UNSUPPORTED_EXECUTION_ACTION_DEACTIVATE_NODE"
-    ]
+    assert api_module._execution_admission_reasons(
+        deactivate, source_workloads, "kubernetes-workload"
+    ) == ["UNSUPPORTED_EXECUTION_ACTION_DEACTIVATE_NODE"]
 
     resize = {
         **summary,
@@ -492,16 +503,16 @@ def test_execution_admission_allows_only_supported_plan_actions() -> None:
             }
         ],
     }
-    assert api_module._execution_admission_reasons(resize, source_workloads, "kubernetes") == [
-        "UNSUPPORTED_EXECUTION_ACTION_RESIZE_WORKLOAD"
-    ]
+    assert api_module._execution_admission_reasons(
+        resize, source_workloads, "kubernetes-workload"
+    ) == ["UNSUPPORTED_EXECUTION_ACTION_RESIZE_WORKLOAD"]
 
     unsupported_workload = {
         **summary,
         "decisions": [{**summary["decisions"][0], "workload_id": "memory-api"}],
     }
     assert api_module._execution_admission_reasons(
-        unsupported_workload, source_workloads, "kubernetes"
+        unsupported_workload, source_workloads, "kubernetes-workload"
     ) == ["UNSUPPORTED_EXECUTION_WORKLOAD:memory-api"]
 
 
@@ -522,7 +533,7 @@ def test_verified_v2_plan_stays_out_of_the_execution_journal(clean_database: Dat
         clean_database.repository,
         tokens=tokens,
         mode="EXECUTE",
-        execution_target="kubernetes",
+        execution_target="kubernetes-workload",
         target_adapter=UnusedTarget(),
         health_observer=object(),
         start_execution_worker=False,

@@ -126,7 +126,12 @@ def _run(command: list[str], *, timeout: float = 10, stdin: str | None = None) -
             raise ActionBlocked("PDB_BLOCKED")
         if "too many requests" in message or "toomanyrequests" in message:
             raise TargetUnavailable("Kubernetes API throttled the request")
-        if "conflict" in message or "the object has been modified" in message:
+        if (
+            "conflict" in message
+            or "the object has been modified" in message
+            or "testing value" in message
+            or "test failed" in message
+        ):
             raise TargetPreconditionFailed("target resource version changed")
         if "not found" in message:
             raise TargetNotFound("target resource no longer exists")
@@ -135,7 +140,7 @@ def _run(command: list[str], *, timeout: float = 10, stdin: str | None = None) -
 
 
 class KubernetesTarget:
-    """Narrow kubectl adapter: Deployment scale, one PDB-aware Pod eviction, and cordon."""
+    """Deployment replica-scale adapter; V2 Pod and Node mutations are unsupported."""
 
     def __init__(
         self,
@@ -369,32 +374,6 @@ class KubernetesTarget:
             "applied": True,
         }
 
-    def observe_node(self, node_id: str) -> dict[str, Any]:
-        name = _checked_name(node_id, "node identifier")
-        node = self._json("get", "node", name, "-o", "json")
-        metadata, spec, status = (
-            node.get("metadata", {}),
-            node.get("spec", {}),
-            node.get("status", {}),
-        )
-        if not all(isinstance(item, dict) for item in (metadata, spec, status)):
-            raise TargetError("Node response is incomplete")
-        annotations = metadata.get("annotations", {})
-        if not isinstance(annotations, dict):
-            raise TargetError("Node annotations are invalid")
-        raw_fence = annotations.get("fleetright.io/fencing-token", "0")
-        if not isinstance(raw_fence, str) or not raw_fence.isdecimal():
-            raise TargetError("Node fencing token is invalid")
-        return {
-            "uid": metadata.get("uid"),
-            "resource_version": metadata.get("resourceVersion"),
-            "unschedulable": spec.get("unschedulable", False),
-            "conditions": status.get("conditions", []),
-            "labels": metadata.get("labels", {}),
-            "fencing_token": int(raw_fence),
-            "annotations_present": "annotations" in metadata,
-        }
-
     @staticmethod
     def _fence_annotation_op(observed: dict[str, Any], fencing_token: int) -> dict[str, Any]:
         if fencing_token <= 0:
@@ -411,294 +390,227 @@ class KubernetesTarget:
             "value": {"fleetright.io/fencing-token": str(fencing_token)},
         }
 
+
+class FleetRightWorkloadTarget(KubernetesTarget):
+    """Publish monotonic requests; the workload controller alone creates Pods."""
+
+    supports_workload_execution = True
+
+    def observe_scale(self, workload_id: str) -> dict[str, Any]:
+        name = _checked_name(workload_id, "workload identifier")
+        value = self._json("get", "fleetrightworkload", name, "-n", self.namespace, "-o", "json")
+        return self._observe(value, name)
+
     @staticmethod
-    def _selector_matches(labels: dict[str, str], selector: dict[str, Any]) -> bool:
-        if not all(
-            labels.get(key) == value for key, value in selector.get("matchLabels", {}).items()
-        ):
-            return False
-        for item in selector.get("matchExpressions", []):
-            key, operator, values = item.get("key"), item.get("operator"), item.get("values", [])
-            if operator == "In" and labels.get(key) not in values:
-                return False
-            if operator == "NotIn" and labels.get(key) in values:
-                return False
-            if operator == "Exists" and key not in labels:
-                return False
-            if operator == "DoesNotExist" and key in labels:
-                return False
-        return True
-
-    def observe_pod(self, workload_id: str, node_id: str) -> dict[str, Any]:
-        workload = _checked_name(workload_id, "workload identifier")
-        node = _checked_name(node_id, "node identifier")
-        items = self._json(
-            "get",
-            "pods",
-            "-n",
-            self.namespace,
-            "-l",
-            f"fleetright.io/workload={workload}",
-            "-o",
-            "json",
-        ).get("items", [])
-        candidates = []
-        for pod in items:
-            metadata, spec, status = (
-                pod.get("metadata", {}),
-                pod.get("spec", {}),
-                pod.get("status", {}),
-            )
-            owners = metadata.get("ownerReferences", [])
-            if (
-                isinstance(metadata, dict)
-                and isinstance(spec, dict)
-                and isinstance(status, dict)
-                and spec.get("nodeName") == node
-                and metadata.get("deletionTimestamp") is None
-                and any(owner.get("kind") == "ReplicaSet" for owner in owners)
-            ):
-                candidates.append(
-                    {
-                        "name": metadata.get("name"),
-                        "uid": metadata.get("uid"),
-                        "resource_version": metadata.get("resourceVersion"),
-                        "node": node,
-                        "labels": metadata.get("labels", {}),
-                        "ready": any(
-                            condition.get("type") == "Ready" and condition.get("status") == "True"
-                            for condition in status.get("conditions", [])
-                        ),
-                    }
-                )
-        candidates.sort(key=lambda item: str(item["name"]))
-        if not candidates:
-            raise TargetPreconditionFailed("no supported movable Pod remains on the source Node")
-        return candidates[0]
-
-    def _pdb_allows(self, labels: dict[str, str]) -> None:
-        items = self._json("get", "poddisruptionbudgets", "-n", self.namespace, "-o", "json").get(
-            "items", []
+    def _observe(value: dict[str, Any], name: str) -> dict[str, Any]:
+        metadata, spec, status = (
+            value.get("metadata", {}),
+            value.get("spec", {}),
+            value.get("status", {}),
         )
-        for item in items:
-            spec, status = item.get("spec", {}), item.get("status", {})
-            selector = spec.get("selector", {})
-            if not isinstance(selector, dict) or not self._selector_matches(labels, selector):
-                continue
-            allowed = status.get("disruptionsAllowed")
-            if not isinstance(allowed, int) or allowed < 1:
-                raise ActionBlocked("PDB_BLOCKED")
-
-    def fence_pod(self, pod_name: str, pod_uid: str, fencing_token: int) -> dict[str, Any]:
-        name = _checked_name(pod_name, "Pod identifier")
-        if fencing_token <= 0:
-            raise TargetPreconditionFailed("fencing token must be positive")
-        pod = self._json("get", "pod", name, "-n", self.namespace, "-o", "json")
-        metadata = pod.get("metadata", {})
+        request = spec.get("executionRequest")
+        execution = status.get("execution")
+        replicas, ready, available = (
+            spec.get("replicas"),
+            status.get("readyReplicas", 0),
+            status.get("availableReplicas", 0),
+        )
+        observed_replicas = status.get("replicas", 0)
+        conditions = status.get("conditions", [])
+        generation = metadata.get("generation")
         if (
-            not isinstance(metadata, dict)
-            or metadata.get("uid") != pod_uid
+            spec.get("workloadID") != name
+            or not isinstance(metadata.get("uid"), str)
+            or type(generation) is not int
             or not isinstance(metadata.get("resourceVersion"), str)
+            or not all(
+                type(item) is int and item >= 0
+                for item in (replicas, ready, available, observed_replicas)
+            )
+            or type(spec.get("availabilityFloor")) is not int
+            or type(status.get("observedGeneration", 0)) is not int
+            or not isinstance(conditions, list)
+            or (request is not None and not isinstance(request, dict))
+            or (execution is not None and not isinstance(execution, dict))
         ):
-            raise TargetPreconditionFailed("Pod identity changed before fencing")
-        annotations = metadata.get("annotations", {})
-        if not isinstance(annotations, dict):
-            raise TargetError("Pod annotations are invalid")
-        raw_fence = annotations.get("fleetright.io/fencing-token", "0")
-        if not isinstance(raw_fence, str) or not raw_fence.isdecimal():
-            raise TargetError("Pod fencing token is invalid")
-        current_token = int(raw_fence)
-        if current_token > fencing_token:
-            raise TargetPreconditionFailed("a newer controller fenced this Pod")
-        if current_token < fencing_token:
-            annotation_op = (
-                {
-                    "op": "add",
-                    "path": "/metadata/annotations/fleetright.io~1fencing-token",
-                    "value": str(fencing_token),
-                }
-                if isinstance(metadata.get("annotations"), dict)
-                else {
-                    "op": "add",
-                    "path": "/metadata/annotations",
-                    "value": {"fleetright.io/fencing-token": str(fencing_token)},
-                }
+            raise TargetError("FleetRightWorkload identity or status is invalid")
+        if metadata.get("name") != name:
+            raise TargetPreconditionFailed("FleetRightWorkload name changed")
+        if spec.get("executionProtocol") != "monotonic-scale-up-v1":
+            raise TargetPreconditionFailed(
+                "existing FleetRightWorkload was not created for monotonic scale-up"
             )
-            patch = json.dumps(
-                [
-                    {
-                        "op": "test",
-                        "path": "/metadata/resourceVersion",
-                        "value": metadata["resourceVersion"],
-                    },
-                    {"op": "test", "path": "/metadata/uid", "value": pod_uid},
-                    annotation_op,
-                ],
-                separators=(",", ":"),
+        token = request.get("generation", 0) if isinstance(request, dict) else 0
+        if type(token) is not int or token < 0:
+            raise TargetError("FleetRightWorkload execution generation is invalid")
+        if isinstance(request, dict) and (
+            not all(
+                isinstance(request.get(key), str) and request[key]
+                for key in ("planID", "operationID")
             )
-            pod = self._json(
-                "patch", "pod", name, "-n", self.namespace, "-o", "json", "--type=json", "-p", patch
-            )
-            metadata = pod.get("metadata", {})
-        if not isinstance(metadata, dict) or not isinstance(metadata.get("resourceVersion"), str):
-            raise TargetError("Pod resource version is missing")
+            or token < 1
+            or type(request.get("expectedReplicas")) is not int
+            or type(request.get("targetReplicas")) is not int
+            or request["targetReplicas"] != replicas
+            or request["expectedReplicas"] > request["targetReplicas"]
+        ):
+            raise TargetError("FleetRightWorkload durable operation identity is invalid")
         return {
-            "uid": pod_uid,
+            "uid": metadata["uid"],
+            "generation": generation,
             "resource_version": metadata["resourceVersion"],
-            "fencing_token": fencing_token,
+            "replicas": replicas,
+            "observed_replicas": observed_replicas,
+            "ready_replicas": ready,
+            "available_replicas": available,
+            "reconciled": any(
+                isinstance(condition, dict)
+                and condition.get("type") == "Reconciled"
+                and condition.get("status") == "True"
+                for condition in conditions
+            ),
+            "availability_floor": spec["availabilityFloor"],
+            "observed_generation": status.get("observedGeneration", 0),
+            "fencing_token": token,
+            "generation_tracks_spec": True,
+            "workload_execution": True,
+            "execution_request": request,
+            "execution": execution,
         }
 
-    def _require_schedulable_node(
-        self, node_id: str, *, topology_key: str | None = None, topology_domain: str | None = None
-    ) -> None:
-        node = self.observe_node(node_id)
-        ready = any(
-            isinstance(condition, dict)
-            and condition.get("type") == "Ready"
-            and condition.get("status") == "True"
-            for condition in node["conditions"]
-        )
-        if not ready or node["unschedulable"]:
-            raise ActionBlocked("TOPOLOGY_BLOCKED")
-        if topology_key:
-            _checked_name(topology_key, "topology key")
-            value = node["labels"].get(topology_key)
-            if not isinstance(value, str) or (topology_domain and value != topology_domain):
-                raise ActionBlocked("TOPOLOGY_BLOCKED")
-
-    def observe_move(
+    def authorize_scale(
         self,
         workload_id: str,
-        pod_name: str,
-        pod_uid: str,
-        destination_node: str,
-    ) -> dict[str, Any]:
-        workload = _checked_name(workload_id, "workload identifier")
-        name = _checked_name(pod_name, "Pod identifier")
-        try:
-            current = self._json("get", "pod", name, "-n", self.namespace, "-o", "json")
-        except TargetPreconditionFailed:
-            current = {}
-        old_present = current.get("metadata", {}).get("uid") == pod_uid
-        items = self._json(
-            "get",
-            "pods",
-            "-n",
-            self.namespace,
-            "-l",
-            f"fleetright.io/workload={workload}",
-            "-o",
-            "json",
-        ).get("items", [])
-        ready_on_destination = any(
-            isinstance(pod, dict)
-            and pod.get("metadata", {}).get("uid") != pod_uid
-            and pod.get("spec", {}).get("nodeName") == destination_node
-            and any(
-                condition.get("type") == "Ready" and condition.get("status") == "True"
-                for condition in pod.get("status", {}).get("conditions", [])
-            )
-            for pod in items
-        )
-        return {
-            "old_pod_present": old_present,
-            "replacement_ready_on_destination": ready_on_destination,
-            "complete": not old_present and ready_on_destination,
-        }
-
-    def cordon(self, node_id: str, fencing_token: int) -> dict[str, Any]:
-        before = self.observe_node(node_id)
-        if before["fencing_token"] > fencing_token:
-            raise TargetPreconditionFailed("a newer controller fenced this Node")
-        if before["unschedulable"] and before["fencing_token"] == fencing_token:
-            return {**before, "already_applied": True}
-        node = self._json("get", "node", _checked_name(node_id, "node identifier"), "-o", "json")
-        metadata = node.get("metadata", {})
-        spec = node.get("spec", {})
-        before["annotations_present"] = isinstance(metadata, dict) and isinstance(
-            metadata.get("annotations"), dict
-        )
-        patch = json.dumps(
-            [
-                {
-                    "op": "test",
-                    "path": "/metadata/resourceVersion",
-                    "value": before["resource_version"],
-                },
-                {"op": "test", "path": "/metadata/uid", "value": before["uid"]},
-                self._fence_annotation_op(before, fencing_token),
-                *(
-                    []
-                    if spec.get("unschedulable", False)
-                    else [{"op": "add", "path": "/spec/unschedulable", "value": True}]
-                ),
-            ],
-            separators=(",", ":"),
-        )
-        self._json(
-            "patch",
-            "node",
-            _checked_name(node_id, "node identifier"),
-            "-o",
-            "json",
-            "--type=json",
-            "-p",
-            patch,
-        )
-        return self.observe_node(node_id)
-
-    def evict_one(
-        self,
-        pod_name: str,
-        pod_uid: str,
         fencing_token: int,
         *,
-        destination_node: str,
-        topology_key: str | None = None,
-        topology_domain: str | None = None,
+        expected: dict[str, Any],
+        plan_id: str,
+        operation_id: str,
+        target_replicas: int,
     ) -> dict[str, Any]:
-        name = _checked_name(pod_name, "Pod identifier")
-        if not isinstance(pod_uid, str) or not re.fullmatch(r"[0-9a-fA-F-]{16,64}", pod_uid):
-            raise TargetPreconditionFailed("invalid Pod UID")
-        pod = self._json("get", "pod", name, "-n", self.namespace, "-o", "json")
-        metadata = pod.get("metadata", {})
         if (
-            not isinstance(metadata, dict)
-            or metadata.get("uid") != pod_uid
-            or not isinstance(metadata.get("resourceVersion"), str)
+            type(fencing_token) is not int
+            or fencing_token <= 0
+            or not plan_id
+            or not operation_id
+            or type(target_replicas) is not int
+            or not 0 <= target_replicas <= 1000
         ):
-            raise TargetPreconditionFailed("Pod identity changed before eviction")
-        labels = metadata.get("labels", {})
-        workload_id = labels.get("fleetright.io/workload") if isinstance(labels, dict) else None
-        owners = metadata.get("ownerReferences", [])
-        if workload_id not in _WORKLOAD_SERVICES or not any(
-            owner.get("kind") == "ReplicaSet" for owner in owners
+            raise TargetPreconditionFailed("invalid durable workload authorization")
+        current = self.observe_scale(workload_id)
+        request = current["execution_request"]
+        same = (
+            isinstance(request, dict)
+            and request.get("planID") == plan_id
+            and request.get("operationID") == operation_id
+            and request.get("targetReplicas") == target_replicas
+        )
+        recovered = (
+            same
+            and current["fencing_token"] == fencing_token
+            and current["uid"] == expected.get("uid")
+            and current["generation"] == expected.get("generation", -2) + 1
+            and current["replicas"] == target_replicas
+        )
+        if current["uid"] != expected.get("uid"):
+            raise TargetPreconditionFailed("FleetRightWorkload identity changed")
+        if not recovered and (
+            current["generation"] != expected.get("generation")
+            or current["replicas"] != expected.get("replicas")
         ):
-            raise TargetPreconditionFailed("unsupported Pod cannot be evicted")
-        self._require_schedulable_node(
-            _checked_name(destination_node, "destination node"),
-            topology_key=topology_key,
-            topology_domain=topology_domain,
+            raise TargetPreconditionFailed("FleetRightWorkload precondition changed")
+        if same and current["fencing_token"] == fencing_token:
+            return {**current, "fence_precondition": expected, "already_authorized": True}
+        if current["fencing_token"] >= fencing_token:
+            raise TargetPreconditionFailed("a newer workload execution generation exists")
+        if target_replicas < current["replicas"]:
+            raise ActionBlocked("WORKLOAD_SCALE_DOWN_DISABLED")
+        if current["observed_generation"] != current["generation"] and not same:
+            raise ActionBlocked("WORKLOAD_RECONCILIATION_PENDING")
+        if (
+            min(current["ready_replicas"], current["available_replicas"])
+            < current["availability_floor"]
+        ):
+            raise ActionBlocked("AVAILABILITY_FLOOR_NOT_MET")
+        if isinstance(request, dict) and not same:
+            status = current["execution"]
+            if not (
+                isinstance(status, dict)
+                and status.get("planID") == request.get("planID")
+                and status.get("operationID") == request.get("operationID")
+                and status.get("generation") == request.get("generation")
+                and status.get("phase") == "APPLIED"
+            ):
+                raise ActionBlocked("PRIOR_WORKLOAD_OPERATION_UNRESOLVED")
+        elif (
+            request is None
+            and current["replicas"]
+            and current["ready_replicas"] < current["replicas"]
+        ):
+            raise ActionBlocked("WORKLOAD_NOT_READY")
+        if not same and not current["reconciled"]:
+            raise ActionBlocked("WORKLOAD_NOT_RECONCILED")
+        new_request = {
+            "planID": plan_id,
+            "operationID": operation_id,
+            "generation": fencing_token,
+            "expectedReplicas": current["replicas"],
+            "targetReplicas": target_replicas,
+        }
+        patch: dict[str, Any] = {
+            "metadata": {"resourceVersion": current["resource_version"]},
+            "spec": {"executionRequest": new_request},
+        }
+        if target_replicas != current["replicas"]:
+            patch["spec"]["replicas"] = target_replicas
+        value = self._json(
+            "patch",
+            "fleetrightworkload",
+            _checked_name(workload_id, "workload identifier"),
+            "-n",
+            self.namespace,
+            "--type=merge",
+            "-p",
+            json.dumps(patch, separators=(",", ":")),
+            "-o",
+            "json",
         )
-        self._pdb_allows(labels)
-        fenced = self.fence_pod(name, pod_uid, fencing_token)
-        eviction = json.dumps(
-            {
-                "apiVersion": "policy/v1",
-                "kind": "Eviction",
-                "metadata": {"name": name, "namespace": self.namespace},
-                "deleteOptions": {
-                    "preconditions": {
-                        "uid": pod_uid,
-                        "resourceVersion": fenced["resource_version"],
-                    }
-                },
-            },
-            separators=(",", ":"),
-        )
-        path = f"/api/v1/namespaces/{self.namespace}/pods/{name}/eviction"
-        self._kubectl("create", f"--raw={path}", "-f", "-", stdin=eviction)
-        return {"pod": name, "uid": pod_uid, "eviction_requested": True}
+        published = self._observe(value, workload_id)
+        if (
+            published["uid"] != current["uid"]
+            or published["replicas"] != target_replicas
+            or published["fencing_token"] != fencing_token
+            or published["execution_request"].get("planID") != plan_id
+            or published["execution_request"].get("operationID") != operation_id
+        ):
+            raise OutcomeUnknown("Kubernetes did not confirm the durable workload authorization")
+        return {**published, "fence_precondition": expected, "authorized": True}
+
+    def set_replicas(
+        self,
+        workload_id: str,
+        replicas: int,
+        observed: dict[str, Any],
+        *,
+        expected_replicas: int,
+        fencing_token: int,
+        plan_id: str,
+        operation_id: str,
+    ) -> dict[str, Any]:
+        current = self.observe_scale(workload_id)
+        request = current["execution_request"]
+        if (
+            not isinstance(request, dict)
+            or current["uid"] != observed["uid"]
+            or current["replicas"] != replicas
+            or current["replicas"] < expected_replicas
+            or current["fencing_token"] != fencing_token
+            or request.get("planID") != plan_id
+            or request.get("operationID") != operation_id
+            or request.get("targetReplicas") != replicas
+        ):
+            raise TargetPreconditionFailed("durable workload authorization changed")
+        return {**current, "applied": True}
 
 
 class DockerComposeTarget:

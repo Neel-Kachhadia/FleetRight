@@ -1,0 +1,181 @@
+Prompt 2B, Checkpoint A — execution-authority evidence
+Captured: 2026-10-08 13:51 UTC
+Branch: phase4/safe-execution-reconciliation
+Starting HEAD: 2aabc871fb6aee31a5ea974089a2b14f6cd772d2
+
+Focused regression command:
+  .venv/bin/python -m pytest -q python/tests/test_workload_controller.py \
+    python/tests/test_prompt2b_execution_targets.py python/tests/test_evacuation_v2.py
+Result: 46 passed in 0.31s, including a deterministic fake-API conflict when a
+newer PDB write lands after a stale PDB GET.
+
+Static checks:
+  /home/neel/.local/bin/ruff check <four changed Python files>
+  /home/neel/.local/bin/ruff format --check <four changed Python files>
+  .venv/bin/python -m compileall -q <four changed Python files>
+  git diff --check
+  Python YAML parse of deploy/kubernetes/fleetrightworkload-crd.yaml
+Result: all passed after the final code/test changes.
+
+## Deployment scale CAS race
+
+Context: `kind-fleetright-safety-lab`; Kubernetes server v1.37.0, client v1.37.1.
+The explicit context, cluster, and Node UIDs were inspected before mutation.
+The isolated namespace and Deployment carried
+`fleetright.io/test-owner=prompt-2b-execution-authority`.
+
+Deployment `scale-target`, UID `ba50e678-29cd-4d38-bb52-aa247b2095a9`, started
+with replicas 0. Initial resourceVersion was 29989. Controller token 100 was
+published at resourceVersion 30033. The old controller built a JSON Patch that
+tested resourceVersion 30035 and attempted replicas 0→1, then paused before
+sending it. A second target instance published token 101 at resourceVersion
+30036. After resumption, the old request was rejected; the adapter surfaced
+sanitized `TargetError: target rejected the operation`. Final state was
+replicas=0, fencing token=101, generation=3. No Pod was created.
+
+This proves the existing `SET_REPLICA_COUNT` same-object CAS race only. It does
+not prove fencing for Pod eviction or enable V2 execution.
+
+## Kubernetes Eviction resourceVersion controls
+
+Context: `kind-fleetright-safety-lab`; server v1.37.0. The two cases used
+separate PDB selectors in the isolated namespace
+`fleetright-fr-eviction-rv-control2`, with the test-owner label.
+
+**Healthy control.** Pod UID `fff37686-32fd-43f8-bd44-65cd027b0dc6` was Ready.
+Its PDB had `observedGeneration=1`, `currentHealthy=2`, `desiredHealthy=1`, and
+`disruptionsAllowed=1`. After annotation advanced resourceVersion 29756→29804,
+a policy/v1 Eviction with the old version and same UID returned a conflict:
+“The ResourceVersion in the precondition (29756) does not match the
+ResourceVersion in record (29804).” The Pod remained active with that UID.
+
+**Unready control.** Pod UID `bc9be930-aa87-4846-9286-448126cef43c` had Ready=False
+immediately before its request. Its separate PDB had
+`unhealthyPodEvictionPolicy=IfHealthyBudget`, `observedGeneration=1`,
+`currentHealthy=1`, `desiredHealthy=1`, and `disruptionsAllowed=0` immediately
+before the request. Annotation advanced resourceVersion 29765→29808. The
+policy/v1 Eviction carrying old resourceVersion 29765 and the same UID returned
+Status Success code 201; the source UID became absent. The matching healthy peer
+remained.
+
+This directly demonstrates that the v1.37.0 unready-Pod Eviction path can
+replace a caller resourceVersion precondition even when the budget reports zero
+disruptions, provided the `IfHealthyBudget` health condition is met. It is a
+negative safety control, not durable V2 execution evidence.
+
+All four temporary namespaces were re-inventoried by the exact context and
+owner label, deleted, and confirmed absent: `fleetright-fr-fence-race`,
+`fleetright-fr-eviction-rv-race`, `fleetright-fr-eviction-rv-control2`, and
+`fleetright-fr-scale-fence-cas2`. No unrelated cluster, host setting, or
+production workload was touched.
+
+## Safe behavior change
+
+FleetRightWorkload reconciliation now retains nonterminal Pods whenever live
+count exceeds desired count and reports `Reconciled=False` with
+`ScaleDownRequiresStagedExecution`. `Ready` and `Available` report observed Pod
+readiness and floor status; the new kubectl `Reconciled` column exposes the
+blocked controller state. Availability-floor violations retain their specific
+reason. Terminal Pod cleanup remains UID-preconditioned and has a direct API
+request unit test.
+
+New managed PDBs record a workload-generation high-water annotation. Unit tests
+cover a lower-generation snapshot, a newer generation update, and the API
+patch's resourceVersion and generation marker. An existing unmarked PDB now
+fails closed without changing its budget: review showed that bootstrapping its
+marker from a possibly stale workload snapshot could later loosen the budget.
+These are local tests; older controller binaries ignore the marker, and no
+trusted migration or mixed-version rollout is qualified.
+
+V2 `MOVE_REPLICA` and `DEACTIVATE_NODE` remain rejected. `evict_one` and `cordon`
+have no production call sites and are not execution-admitted. No V2 target-side
+authority, durable eviction, node drain, or compensation was enabled.
+
+PostgreSQL and Docker tests were not run. The recorded isolated DB credential
+is unrotated, and the Docker socket is unavailable in this session.
+
+## Checkpoint A continuation: FleetRightWorkload authority (2026-10-08)
+
+The supplied isolated PostgreSQL environment passed `pg_isready`; the full
+repository Python suite then passed 139 tests with the DB enabled. The supplied
+`kind-fleetright-safety-lab` context was checked before changes: Kubernetes
+server v1.37.0, three Ready Nodes, and no FleetRightWorkload CRD or FleetRight
+namespaces.
+
+The repository CRD was applied and accepted by v1.37.0. The changed controller
+was built as image ID
+`sha256:91d5e43498b7c1faceca9e5853910880f5df59ae64a1088bf69b4c3bc563c1de` and
+loaded only into the kind nodes. Worker kube-proxy Pods were already Error and
+the first controller Pod timed out reaching the API Service. For this test only,
+the controller was temporarily pinned to the healthy control-plane Node; the
+checked-in manifest and host settings were unchanged.
+
+One fresh `cpu-api` FleetRightWorkload was created in `fleetright-v2` with
+`monotonic-scale-up-v1`, one Ready replica, availability floor 1, zero
+disruptions, and the verified worker identity
+`fleetright-safety-lab-worker` / UID
+`e7c814bb-ef80-4b47-9e3d-2cb0066ecb3d`. The object UID was
+`c6661b03-b306-43ba-9d5a-abcffbb27e24`.
+
+The repository `FleetRightWorkloadTarget` authorized scale 1→2 with plan
+`prompt2b-live-plan`, operation `prompt2b-live-scale-2`, and execution
+generation 100. The controller created/adopted deterministic slots and reported
+`APPLIED`. Two synchronized takeover requests for the same operation then used
+the same observed resourceVersion: token 103 succeeded and token 104 received a
+409 conflict. The controller reconciled the winning generation. A distinct
+compatible operation, `prompt2b-live-scale-3`, then authorized 2→3 with token
+104 and reached `APPLIED`.
+
+For a delayed authorization control, token 107 was prepared against
+resourceVersion 39755. Token 108 committed first, advancing object generation
+to 7 and resourceVersion to 39760. Sending the prepared token-107 Merge Patch
+afterward returned a classified 409 conflict; the durable target remained 3
+replicas with token 108. This establishes CAS for authorization writes to this
+one FleetRightWorkload object, not a fence for independent Pod POST requests.
+
+Final observed object: generation 7, desired=3, ready=3, available=3,
+observedGeneration=7, reconciliation condition True, execution phase APPLIED.
+The three deterministic replica IDs were `cpu-api-0`, `cpu-api-1`, and
+`cpu-api-2`; each Pod was Ready, owned by the exact FleetRightWorkload UID
+above, and scheduled to the approved worker name. The matching PDB had the same
+owner UID, `maxUnavailable=0`, `currentHealthy=3`, and
+`disruptionsAllowed=0`.
+
+Actual server admission rejected all of these attempts without changing the
+three-Pod state: scale-subresource downscale to 2, replica growth to 4 without
+a new durable request, and promotion of a zero-replica legacy object into the
+protocol. The legacy test CR was deleted immediately after the check.
+
+Live RBAC impersonation checks passed: the API executor can GET/PATCH only the
+named `cpu-api` FleetRightWorkload and cannot create Pods or Evictions or patch
+Deployments. The workload controller can create Pods, read Nodes, patch status,
+and manage PDBs; it cannot delete Pods, create Evictions, patch workload spec,
+or patch Nodes. No live Eviction mutation was attempted.
+
+Cleanup completed: both test namespaces, the FleetRightWorkload CRD, and the
+controller ClusterRole/Binding are absent; no test Pod remains. The test image
+was removed from all three kind nodes and its temporary local tags were
+removed. The pre-existing image tag `fleetright-workload-controller:ee29b96`
+was preserved.
+
+This continuation supersedes the earlier note above that terminal Pod cleanup
+remained UID-preconditioned: the current controller has no Pod DELETE path,
+including for terminal Pods. The PDB and Eviction race evidence above remains
+current and is the reason all retirement operations stay disabled.
+
+The final CRD CEL refinements were then reapplied to the same v1.37 server in a
+zero-Pod test namespace. A fresh marked object and a higher-generation request
+identity update were admitted. Same-generation changes to operation ID, plan
+ID, or request preconditions were rejected; a request target differing from
+`.spec.replicas` was rejected; replica growth without an updated authorization
+and scale-subresource downscale were rejected. The temporary namespace and CRD
+were deleted and confirmed absent again.
+
+The PostgreSQL journal suite also injects a lost response after the durable
+FleetRightWorkload request is accepted but before the controller reports Pod
+creation complete. On cancel/takeover, the action remains `OUTCOME_UNKNOWN`
+while status is not `APPLIED`; it becomes terminal only after matching
+operation identity, observed generation, replica count, and Ready/Available
+state are present. The strict completion check is marked specifically for
+FleetRightWorkload observations, preserving the existing Deployment adapter's
+takeover recovery behavior.

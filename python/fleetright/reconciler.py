@@ -96,7 +96,12 @@ class ExecutionController:
         for action in unresolved:
             if action["action_type"] != "SET_REPLICA_COUNT" or not action["workload_id"]:
                 return None
-            target_ref = f"deployment:{action['workload_id']}"
+            prefix = (
+                "fleetrightworkload"
+                if getattr(self.target, "supports_workload_execution", False)
+                else "deployment"
+            )
+            target_ref = f"{prefix}:{action['workload_id']}"
             with self.repository.transaction() as conn:
                 saved_fence = Repository.execution_fence_receipt(
                     conn, plan_id, action["intent_id"], pending_token
@@ -132,9 +137,8 @@ class ExecutionController:
                     )
             recovered_fence = False
             try:
-                receipt = self.target.fence_scale(
-                    action["workload_id"], pending_token, expected=precondition
-                )
+                target = self._authorize_target(action, plan_id, pending_token, precondition)
+                receipt = target
             except TargetPreconditionFailed:
                 try:
                     live = self.target.observe_scale(action["workload_id"])
@@ -161,8 +165,8 @@ class ExecutionController:
                             {"state": "PENDING", "precondition": precondition},
                         )
                     try:
-                        receipt = self.target.fence_scale(
-                            action["workload_id"], pending_token, expected=precondition
+                        receipt = self._authorize_target(
+                            action, plan_id, pending_token, precondition
                         )
                     except TargetError:
                         return None
@@ -215,7 +219,31 @@ class ExecutionController:
                 pending_token,
                 self.lease_ttl_ms,
             )
-            return token
+        return token
+
+    def _authorize_target(
+        self,
+        action: dict[str, Any],
+        plan_id: str,
+        fencing_token: int,
+        expected: dict[str, Any],
+    ) -> dict[str, Any]:
+        if getattr(self.target, "supports_workload_execution", False):
+            payload = action.get("payload", {})
+            desired = payload.get("proposed_replicas") if isinstance(payload, dict) else None
+            if not isinstance(desired, int):
+                raise TargetPreconditionFailed(
+                    "workload execution target is missing replica intent"
+                )
+            return self.target.authorize_scale(
+                action["workload_id"],
+                fencing_token,
+                expected=expected,
+                plan_id=plan_id,
+                operation_id=action["intent_id"],
+                target_replicas=desired,
+            )
+        return self.target.fence_scale(action["workload_id"], fencing_token, expected=expected)
 
     def _reconcile(self, plan_id: str, token: int, stop: threading.Event | None) -> None:
         with self.repository.transaction() as conn:
@@ -618,13 +646,48 @@ class ExecutionController:
                 if isinstance(dispatch_observation, dict)
                 else None
             )
-            if current == dispatch_target and isinstance(expected_generation, int):
-                expected_generation += 1
-            if isinstance(expected_generation, int) and current in {
+            takeover_receipt = self._takeover_fence_receipt(plan_id, action["intent_id"], token)
+            if getattr(self.target, "supports_workload_execution", False):
+                request = observed.get("execution_request")
+                if current == dispatch_target:
+                    expected_token = (
+                        takeover_receipt.get("token")
+                        if takeover_receipt is not None
+                        else last_dispatch.get("target_fencing_token")
+                        if isinstance(last_dispatch, dict)
+                        else None
+                    )
+                    expected_target_generation = (
+                        takeover_receipt.get("generation")
+                        if takeover_receipt is not None
+                        else expected_generation + 1
+                        if isinstance(expected_generation, int)
+                        else None
+                    )
+                    generation_matches = (
+                        isinstance(request, dict)
+                        and request.get("planID") == plan_id
+                        and request.get("operationID") == action["intent_id"]
+                        and request.get("targetReplicas") == dispatch_target
+                        and request.get("generation") == expected_token
+                        and observed.get("generation") == expected_target_generation
+                    )
+                    if not generation_matches:
+                        self._fail_safe(
+                            plan_id, token, "target-generation-changed-during-unknown-action"
+                        )
+                        return
+                elif current != dispatch_expected or takeover_receipt is not None:
+                    self._fail_safe(
+                        plan_id, token, "target-generation-changed-during-unknown-action"
+                    )
+                    return
+            elif isinstance(expected_generation, int) and current in {
                 dispatch_expected,
                 dispatch_target,
             }:
-                takeover_receipt = self._takeover_fence_receipt(plan_id, action["intent_id"], token)
+                if current == dispatch_target:
+                    expected_generation += 1
                 if takeover_receipt is None:
                     generation_matches = observed.get("generation") == expected_generation
                 else:
@@ -681,6 +744,10 @@ class ExecutionController:
                 )
                 return
             if current == dispatch_target and not allow_dispatch:
+                if getattr(
+                    self.target, "supports_workload_execution", False
+                ) and not self._capacity_ready(observed):
+                    return
                 applied_final_target = current == desired
                 self._finish_action(
                     plan_id,
@@ -889,6 +956,23 @@ class ExecutionController:
         observed_generation = observed.get("observed_generation", generation)
         available = observed.get("available_replicas", observed.get("ready_replicas", 0))
         ready = observed.get("ready_replicas", 0)
+        if observed.get("workload_execution") is True:
+            request = observed.get("execution_request")
+            execution = observed.get("execution")
+            if not (
+                observed.get("reconciled") is True
+                and observed_generation == generation
+                and observed.get("observed_replicas") == replicas
+                and isinstance(request, dict)
+                and isinstance(execution, dict)
+                and request.get("targetReplicas") == replicas
+                and execution.get("phase") == "APPLIED"
+                and all(
+                    execution.get(key) == request.get(key)
+                    for key in ("planID", "operationID", "generation", "targetReplicas")
+                )
+            ):
+                return False
         return (
             isinstance(replicas, int)
             and isinstance(generation, int)
@@ -938,18 +1022,22 @@ class ExecutionController:
                         "SELECT nextval('execution_controller_fence_seq') AS token"
                     ).fetchone()["token"]
                 )
-                fenced = self.target.fence_scale(workload, target_token, expected=live)
-                fence_precondition = fenced.get("fence_precondition", {})
-                if (
-                    fenced.get("uid") != live["uid"]
-                    or fence_precondition.get("uid") != live["uid"]
-                    or fence_precondition.get("generation") != live["generation"]
-                    or fence_precondition.get("replicas") != expected
-                    or fenced.get("replicas") != expected
-                ):
-                    raise TargetPreconditionFailed("target changed while publishing fence")
-                live = fenced
-                observed = fenced
+                workload_target = getattr(self.target, "supports_workload_execution", False)
+                if workload_target:
+                    observed = live
+                else:
+                    fenced = self.target.fence_scale(workload, target_token, expected=live)
+                    fence_precondition = fenced.get("fence_precondition", {})
+                    if (
+                        fenced.get("uid") != live["uid"]
+                        or fence_precondition.get("uid") != live["uid"]
+                        or fence_precondition.get("generation") != live["generation"]
+                        or fence_precondition.get("replicas") != expected
+                        or fenced.get("replicas") != expected
+                    ):
+                        raise TargetPreconditionFailed("target changed while publishing fence")
+                    live = fenced
+                    observed = fenced
                 Repository.record_action_progress(
                     conn,
                     plan_id,
@@ -993,13 +1081,30 @@ class ExecutionController:
                         "desired_replicas": target_replicas,
                     },
                 )
-                result = self.target.set_replicas(
-                    workload,
-                    target_replicas,
-                    live,
-                    expected_replicas=expected,
-                    fencing_token=target_token,
-                )
+                if getattr(self.target, "supports_workload_execution", False):
+                    live = self._authorize_target(
+                        action,
+                        plan_id,
+                        target_token,
+                        live,
+                    )
+                    result = self.target.set_replicas(
+                        workload,
+                        target_replicas,
+                        live,
+                        expected_replicas=expected,
+                        fencing_token=target_token,
+                        plan_id=plan_id,
+                        operation_id=action["intent_id"],
+                    )
+                else:
+                    result = self.target.set_replicas(
+                        workload,
+                        target_replicas,
+                        live,
+                        expected_replicas=expected,
+                        fencing_token=target_token,
+                    )
                 progress = Repository.record_action_progress(
                     conn,
                     plan_id,

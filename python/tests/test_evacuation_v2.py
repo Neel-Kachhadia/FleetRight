@@ -100,7 +100,9 @@ def test_v2_snapshot_hash_round_trip_and_cpp_planner_verifier() -> None:
     assert api_module._proto_scalar(verification_text, "execution_admitted", False) is False
     assert summary["snapshot_id"] == source["snapshot_id"]
 
-    admission = api_module._execution_admission_reasons(summary, source["workloads"], "kubernetes")
+    admission = api_module._execution_admission_reasons(
+        summary, source["workloads"], "kubernetes-workload"
+    )
     assert "UNSUPPORTED_EXECUTION_PROTOCOL_V2" in admission
     assert "UNSUPPORTED_EXECUTION_ACTION_MOVE_REPLICA" in admission
     assert "UNSUPPORTED_EXECUTION_ACTION_DEACTIVATE_NODE" in admission
@@ -121,9 +123,9 @@ def test_unknown_execution_protocol_is_not_admitted() -> None:
         "evacuation_count": 0,
         "decisions": [],
     }
-    assert api_module._execution_admission_reasons(summary, [], "kubernetes") == [
+    assert api_module._execution_admission_reasons(summary, [], "kubernetes-workload") == [
         "UNSUPPORTED_EXECUTION_PROTOCOL_VERSION"
     ]
     assert api_module._execution_admission_reasons(
-        {**summary, "schema_version": True}, [], "kubernetes"
+        {**summary, "schema_version": True}, [], "kubernetes-workload"
     ) == ["UNSUPPORTED_EXECUTION_PROTOCOL_VERSION"]

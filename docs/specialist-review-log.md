@@ -158,3 +158,103 @@ No model opinion overrides compiler, test, sanitizer, fuzz, or measured benchmar
   passed. Whole-repository format check still reports only the pre-existing
   `python/fleetright/experiment.py` formatting difference. `gitleaks` was unavailable, so no
   dedicated secret-scanner result is claimed. No evacuation or live kind mutation test ran.
+
+## 2026-10-08 target-side execution authority review
+
+- GPT-6.1 Sol Max reviewed the execution and FleetRightWorkload paths, Kubernetes
+  RBAC, and stale-controller failure model. It confirmed the Deployment
+  resourceVersion JSON Patch is a same-object CAS only; it does not fence a
+  separate Pod Eviction. It also found that FleetRightWorkload ordinary
+  scale-down directly deleted a nonterminal Pod after a local readiness check.
+  That path now fails closed with `ScaleDownRequiresStagedExecution`, with
+  regressions for ready, pending, below-floor, and zero-disruption cases.
+- Claude Opus 5.5 Medium reviewed the source, diff, tests, and API-server
+  evidence through the first-party Pro subscription; the provider reported
+  requested effort Medium and did not report effective effort. It agreed not
+  to add an authority claim resource disconnected from final mutation, and to
+  keep V2 Eviction/cordon disabled. It also found that `_ensure_pdb` can patch
+  an older PDB spec from a stale workload snapshot after reading the PDB's
+  current resourceVersion. A workload-generation high-water annotation blocks
+  lower-generation snapshots only when already present. The first attempted
+  bootstrap from an unmarked PDB was rejected after Sol Max identified that a
+  stale snapshot could stamp a low generation and then loosen the budget. The
+  controller now fails closed on unmarked PDBs; a trusted migration and
+  mixed-version takeover remain unresolved blockers before drain or staged
+  eviction.
+- The live v1.37.0 test resolved the Eviction precondition question: the healthy
+  stale-resourceVersion control was rejected, but an unready Pod under
+  `IfHealthyBudget` was evicted with the same UID after its resourceVersion
+  changed. The isolated test namespace was deleted. See
+  `docs/evidence/execution-authority-race-2026-10-08.txt`.
+- These reviews and API evidence do not establish V2 target-side mutation
+  authority. No V2 destructive operation was enabled.
+- Claude Sonnet 5.5 High reviewed the actual diff, tests, ADR, and live evidence
+  through the first-party Pro subscription. It found that the new blocked
+  scale-down status incorrectly set `Available=False`, and requested a direct
+  UID-precondition test for terminal Pod cleanup plus clearer evidence of the
+  unready-Pod state and PDB at request time. The controller now reports Ready
+  and Available from observed Pod counts on the staged-scale-down block, adds a
+  `Reconciled=False` condition/printer column, and has the UID request test. An
+  isolated repeat with separate PDBs recorded Ready=False, PDB
+  `currentHealthy=desiredHealthy=1`, `disruptionsAllowed=0`, stale RV change,
+  API response code 201, and source UID absence. The focused 45-test suite,
+  Ruff, formatting, compileall, CRD YAML parse, and diff check pass afterward.
+- Sonnet also confirmed the ordinary scale-down change closes nonterminal Pod
+  DELETE. The same-version `_ensure_pdb` stale-generation issue is guarded only
+  for PDBs with a trusted marker; unmarked PDBs fail closed. The mixed-version
+  caveat and lack of a final-mutation Eviction fence remain. `evict_one` and
+  `cordon` have no production call sites; V2 action admission rejects them.
+- GPT-6.1 Sol Max reviewed the new PDB high-water change. It confirmed whether
+  marked-PDB stale writes are blocked by the marker/CAS protocol and confirmed
+  that bootstrapping an unmarked PDB from a workload snapshot is unsafe. The
+  code now fails closed for unmarked PDBs. Sol also noted that stale snapshots
+  can still create Pods after the PDB write is skipped, older binaries can
+  still patch stale budgets and delete nonterminal Pods, and the fake API did
+  not model the resourceVersion conflict race. A deterministic stale-read/newer
+  write conflict regression was added; all listed target-side mutation gaps
+  remain blockers.
+
+## 2026-10-08 Prompt 2B execution-authority continuation
+
+- GPT-6.1 Sol Max reviewed the FleetRightWorkload authority and request-ordering
+  model. The implementation keeps only monotonic scale-up enabled: one
+  resourceVersion-guarded write stores the operation identity, execution
+  generation, expected/target counts, and new replica high-water mark; the
+  existing controller is the only Pod creator. Delayed Pod CREATE is not
+  atomically fenced; deterministic ordinal names, immutable workload shape,
+  owner UID checks, and the nondecreasing count make those creates compatible.
+  Scale-down, terminal replacement, Eviction, and drain remain disabled.
+- The first actual v1.37 JSON Patch race exposed that `kubectl` reduces a
+  failed JSON Patch `test` to a generic invalid-request message. Although it
+  failed closed, it obscured the concurrency result. Authorization now uses a
+  Merge Patch with Kubernetes `metadata.resourceVersion` precondition, which
+  the API server reports as a 409 Conflict. The actual concurrent race then
+  yielded one winner and one classified conflict. Delayed stale authorization
+  after a newer write also returned 409 and preserved the newer generation.
+- Added a fail-closed executor precondition requiring a current `Reconciled=True`
+  status for new operation identities, in addition to exact observed generation,
+  prior `APPLIED` status, readiness, availability floor, object UID, and current
+  replica preconditions. Same-operation takeover may advance its generation
+  while reconciling that durable operation.
+- Live v1.37 tests rejected scale-subresource downscale, replica growth without
+  a durable request, and in-place promotion of a legacy workload. Three real
+  Ready Pods had the expected owner UID, deterministic logical IDs, approved
+  Node name/UID, and matching zero-disruption PDB. Impersonation verified the
+  executor cannot create Pods/Evictions or patch Deployments, while the
+  workload controller cannot delete Pods, create Evictions, patch workload
+  spec, or mutate Nodes.
+- The test controller initially timed out through the broken worker kube-proxy
+  Service path. It was temporarily pinned to the healthy control-plane Node in
+  the test cluster only, then all test namespaces, CRD, RBAC, and temporary
+  image tags were removed. No host security settings were changed.
+- An attempted Claude Opus read-only review was rejected by automatic review
+  before any provider request because it would transmit repository source and
+  the diff externally. No external review output was received; internal review
+  and local/API-server evidence were used.
+- PostgreSQL-backed full Python suite passed 142 tests after the fail-closed
+  status assertion and ambiguous-workload completion test. The latter keeps
+  `OUTCOME_UNKNOWN` until controller `APPLIED` status; the gate is scoped to
+  FleetRightWorkload observations so existing Deployment takeover recovery is
+  unchanged. CTest passed 36/36, Ruff format/check and `git diff
+  --check` passed, and `detect-secrets` reported zero findings over all changed
+  files. `gitleaks` is unavailable.

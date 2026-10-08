@@ -28,7 +28,7 @@ rules:
     verbs: ["patch"]
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list", "create", "delete"]
+    verbs: ["get", "list", "create"]
   - apiGroups: ["policy"]
     resources: ["poddisruptionbudgets"]
     verbs: ["get", "create", "patch"]
@@ -76,6 +76,8 @@ metadata:
   namespace: fleetright-v2
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: fleetright-workload-controller

@@ -130,7 +130,8 @@ recommendations. Prompt 2B adds the explicitly configured live execution path be
 ## Prompt 2B safe execution
 
 Fresh installs still default to `RECOMMEND`. Live execution requires both
-`FLEETRIGHT_MODE=EXECUTE` and `FLEETRIGHT_EXECUTION_TARGET=docker` or `kubernetes`. The
+`FLEETRIGHT_MODE=EXECUTE` and `FLEETRIGHT_EXECUTION_TARGET=docker` or
+`kubernetes-workload`. The
 authenticated operator-only `POST /v1/plans/{id}/execute` replays the approved artifacts through
 the independent verifier, checks the current plan binding and expiry, checks supported action
 types, records a PostgreSQL execution claim and returns `202`. An identical principal/key/body
@@ -230,17 +231,15 @@ The controller canonicalizes only order-insensitive map lists (`allowedNodes`,
 atomic and the fingerprint preserves its order because environment expansion
 can depend on earlier entries.
 
-Ordinary reconciliation targets the count of live owned Pods. A missing
-ordinal does not cause a high-ordinal Pod to be deleted when the desired count
-is already met. Scale-down removes at most one Pod per pass, preferring the
-highest ordinal whose removal preserves the availability floor; a higher Ready
-Pod at the floor may be skipped in favor of a lower non-Ready Pod. Scale-down
-only runs when the live count exceeds desired. A terminating Pod keeps its
-logical identity reserved until it is absent.
-`surgeBudget` is an upper cap reserved for a future explicit staged-replacement
-protocol; Phase 1 ordinary reconciliation does not use it and does not create
-over-desired Pods. A workload with `deletionTimestamp` is ignored so its owner
-deletion can remove dependents without the controller recreating them.
+Ordinary reconciliation creates missing deterministic ordinals up to the
+desired replica high-water mark. It does not delete Pods. If live count exceeds
+desired, it keeps the Pods and reports `Reconciled=False` with
+`ScaleDownRequiresStagedExecution`. A terminal Pod keeps its logical identity
+reserved and reports `TerminalPodRequiresStagedExecution`; terminal replacement
+also needs a staged protocol. A workload with `deletionTimestamp` is ignored so
+its owner deletion can remove dependents without the controller recreating
+them. `surgeBudget` is reserved for a future staged-replacement protocol and
+ordinary reconciliation never creates over-desired Pods.
 
 The workload records allowed Node `{name, uid}` identities. Pods use required
 node affinity on `metadata.name` so the Kubernetes scheduler enforces the allowed
@@ -248,8 +247,11 @@ name set. Each reconcile fetches one Node inventory and requires every allowed
 name to retain its recorded UID before creating Pods; later reconciles check
 scheduled Pod nodes against a fresh inventory. A same-name Node replacement
 between an inventory read and scheduler binding can race detection until the next
-reconcile. Kubernetes cannot match Node UID in native Pod affinity, so Phase 1
-does not claim exact UID placement, and V2 execution remains disabled. Optional
+reconcile. Kubernetes cannot match Node UID in native Pod affinity, so the
+controller detects a same-name Node replacement when it next observes the
+scheduled Pod but cannot claim atomic Node UID placement. The monotonic
+scale-up protocol enforces allowed Node names and checks the current Node UID
+before and after scheduling; exact UID placement remains unsupported. Optional
 topology spread uses `DoNotSchedule`; optional Pod anti-affinity
 uses `requiredDuringSchedulingIgnoredDuringExecution`. No soft affinity or
 custom scheduler is used.
@@ -265,19 +267,23 @@ including the configured container readiness probe; it is not a separate
 application health check.
 
 The controller runs only in the isolated `fleetright-v2` namespace. Its namespaced
-Role can manage Pods and PDBs there; a separate cluster role grants read-only
-access to Nodes. The existing `fleetright` namespace and Deployment executor
-Role are not shared with this controller. The controller keeps an owner-matched
-PodDisruptionBudget whose selector matches
-the serialized scale selector and whose integer `maxUnavailable` is capped by
-both the availability floor and maximum concurrent disruptions. Status reports
-observed, ready, available, and surge replicas plus the selector and operation references.
+Role can get/list/create Pods and manage PDBs there; a separate cluster role
+grants read-only access to Nodes. The `fleetright` API executor account can
+only get/patch the named `cpu-api` FleetRightWorkload and cannot mutate Pods,
+Evictions, Deployments, PDBs, or Nodes. The controller keeps an owner-matched
+PodDisruptionBudget whose selector matches the serialized scale selector and
+whose integer `maxUnavailable` is capped by both the availability floor and
+maximum concurrent disruptions. Status reports observed, ready, available,
+and surge replicas plus the selector, reconciliation condition, and execution
+identity/phase.
 CPU and memory requests are sent to the scheduler. `networkMbps` accepts only
 zero because this cluster has no network-bandwidth scheduling resource; no
 network headroom is inferred. The controller's service account is separate from
-the Deployment execution account and has no Deployment, Node mutation, or Pod
-eviction permission. This controller is workload plumbing only; the API,
-independent verifier, and V1 Deployment scale adapter are unchanged.
+the API executor and has no Deployment, Node mutation, Pod deletion, or Pod
+Eviction permission. It is the only FleetRight principal that creates workload
+Pods. Kubernetes EXECUTE uses `kubernetes-workload` and only newly created
+objects marked `monotonic-scale-up-v1`; direct Kubernetes Deployment execution
+is disabled. The independent verifier is unchanged.
 An API 400, 403, or 422 while creating a generated Pod sets a sanitized
 workload condition; transient request errors and failed status writes still
 surface as controller errors.
@@ -355,7 +361,7 @@ contexts:
 - name: fleetright-controller
   context:
     cluster: fleetright-kind
-    namespace: fleetright
+    namespace: fleetright-v2
     user: fleetright-controller
 current-context: fleetright-controller
 users:
@@ -365,13 +371,15 @@ users:
 EOF
 unset FLEETRIGHT_KUBE_SERVER FLEETRIGHT_KUBE_CA_DATA FLEETRIGHT_SA_TOKEN
 export FLEETRIGHT_KUBERNETES_KUBECONFIG=/tmp/fleetright-kubeconfig
-export FLEETRIGHT_KUBERNETES_NAMESPACE=fleetright
+export FLEETRIGHT_KUBERNETES_NAMESPACE=fleetright-v2
 export FLEETRIGHT_HEALTH_TARGETS_JSON='{"cpu-api":"http://127.0.0.1:8081"}'
 export FLEETRIGHT_MODE=EXECUTE
-export FLEETRIGHT_EXECUTION_TARGET=kubernetes
+export FLEETRIGHT_EXECUTION_TARGET=kubernetes-workload
 PYTHONPATH=python .venv/bin/uvicorn fleetright.api:app --host 127.0.0.1 --port 8080
 ```
 
-Never point Kubernetes EXECUTE at the kind administrator kubeconfig. The Role grants only the
-named Deployment reads and patches used by the live scale adapter; delete the temporary kubeconfig
-when finished. Pod eviction and Node cordoning remain disabled by the checked-in RBAC.
+Never point Kubernetes EXECUTE at the kind administrator kubeconfig. The Role grants only GET/PATCH
+on the named `cpu-api` FleetRightWorkload; the controller Role grants Pod CREATE but no Pod DELETE
+or Eviction. Existing unmarked FleetRightWorkload objects cannot be promoted in place. Pod
+Eviction, Deployment mutation, scale-down, and Node cordoning remain disabled by the checked-in
+RBAC and application configuration. Delete the temporary kubeconfig when finished.

@@ -1,15 +1,22 @@
 from __future__ import annotations
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from pathlib import Path
+from threading import Event
 from typing import Any
 
+import pytest
 from fleetright.workload_controller import (
     REPLICA_ID_LABEL,
     TEMPLATE_HASH_ANNOTATION,
+    WORKLOAD_GENERATION_ANNOTATION,
     WORKLOAD_UID_LABEL,
     ApiError,
     KubernetesAPI,
+    SafetyError,
+    _ensure_pdb,
     _pod_name,
     _pod_object,
     reconcile_workload,
@@ -92,9 +99,6 @@ class FakeAPI:
         self.pods[name] = value
         return deepcopy(value)
 
-    def delete_pod(self, pod: dict[str, Any]) -> None:
-        self.pods[pod["metadata"]["name"]]["metadata"]["deletionTimestamp"] = "now"
-
     def get_pdb(self, name: str) -> dict[str, Any] | None:
         value = self.pdbs.get(name)
         return deepcopy(value) if value else None
@@ -105,15 +109,30 @@ class FakeAPI:
         self.pdbs[value["metadata"]["name"]] = value
         return deepcopy(value)
 
-    def patch_pdb(self, name: str, resource_version: str, spec: dict[str, Any]) -> dict[str, Any]:
+    def patch_pdb(
+        self,
+        name: str,
+        resource_version: str,
+        spec: dict[str, Any],
+        annotations: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        metadata = self.pdbs[name]["metadata"]
+        if metadata.get("resourceVersion") != resource_version:
+            raise ApiError(409, "resourceVersion conflict")
         self.pdbs[name]["spec"] = deepcopy(spec)
+        if annotations is not None:
+            metadata.setdefault("annotations", {}).update(deepcopy(annotations))
+        metadata["resourceVersion"] = str(int(resource_version) + 1)
         return deepcopy(self.pdbs[name])
 
     def patch_status(
         self, name: str, resource_version: str, status: dict[str, Any]
     ) -> dict[str, Any]:
         self.status = deepcopy(status)
-        return {"status": deepcopy(status)}
+        return {
+            "metadata": {"name": name, "resourceVersion": str(int(resource_version) + 1)},
+            "status": deepcopy(status),
+        }
 
 
 def test_creates_owned_pod_with_hard_allowed_set_topology_and_pdb_selector() -> None:
@@ -173,8 +192,220 @@ def test_creates_owned_pod_with_hard_allowed_set_topology_and_pdb_selector() -> 
     pdb = api.pdbs["api"]
     assert pdb["spec"]["selector"] == {"matchLabels": {WORKLOAD_UID_LABEL: "workload-uid"}}
     assert pdb["spec"]["maxUnavailable"] == 0
+    assert pdb["metadata"]["annotations"][WORKLOAD_GENERATION_ANNOTATION] == "1"
     assert api.status["labelSelector"] == f"{WORKLOAD_UID_LABEL}=workload-uid"
     assert api.status["readyReplicas"] == 0
+
+
+def test_stale_workload_snapshot_cannot_loosen_a_newer_managed_pdb() -> None:
+    api = FakeAPI()
+    current = _workload(replicas=2, availabilityFloor=1)
+    current["metadata"]["generation"] = 3
+    _ensure_pdb(api, current)
+    api.pdbs["api"]["spec"]["maxUnavailable"] = 1
+
+    stale = deepcopy(current)
+    stale["metadata"]["generation"] = 2
+    stale["spec"]["replicas"] = 5
+    stale["spec"]["disruption"]["maxConcurrentDisruptions"] = 5
+
+    with pytest.raises(SafetyError, match="stale workload snapshot"):
+        _ensure_pdb(api, stale)
+
+    assert api.pdbs["api"]["spec"]["maxUnavailable"] == 1
+    assert api.pdbs["api"]["metadata"]["annotations"][WORKLOAD_GENERATION_ANNOTATION] == "3"
+
+
+def test_stale_generation_cannot_create_pods_after_a_newer_workload_update() -> None:
+    api = FakeAPI()
+    current = _workload(replicas=1)
+    current["metadata"]["generation"] = 3
+    reconcile_workload(api, current, _nodes())
+    original_pdb = deepcopy(api.pdbs["api"])
+    original_pods = deepcopy(api.pods)
+
+    def reject_create(_pod: dict[str, Any]) -> dict[str, Any]:
+        pytest.fail("stale workload snapshot reached Pod creation")
+
+    def reject_delete(_pod: dict[str, Any]) -> None:
+        pytest.fail("stale workload snapshot reached Pod deletion")
+
+    api.create_pod = reject_create
+    api.delete_pod = reject_delete
+    stale = _workload(replicas=2)
+    stale["metadata"]["generation"] = 2
+
+    reconcile_workload(api, stale, _nodes())
+
+    assert api.pods == original_pods
+    assert api.pdbs["api"] == original_pdb
+    assert api.status["conditions"][2]["reason"] == "StaleWorkloadGeneration"
+
+
+def test_delayed_old_create_after_takeover_remains_a_valid_deterministic_slot() -> None:
+    class CompareAndSwapStatusAPI(FakeAPI):
+        status_resource_version = "1"
+
+        def patch_status(
+            self, name: str, resource_version: str, status: dict[str, Any]
+        ) -> dict[str, Any]:
+            if resource_version != self.status_resource_version:
+                raise ApiError(409, "status resourceVersion conflict")
+            self.status = deepcopy(status)
+            self.status_resource_version = str(int(resource_version) + 1)
+            return {
+                "metadata": {"name": name, "resourceVersion": self.status_resource_version},
+                "status": deepcopy(status),
+            }
+
+    api = CompareAndSwapStatusAPI()
+    initial = _workload()
+    initial["spec"]["executionProtocol"] = "monotonic-scale-up-v1"
+    reconcile_workload(api, initial, _nodes())
+    api.pods[next(iter(api.pods))]["status"] = {
+        "phase": "Running",
+        "conditions": [{"type": "Ready", "status": "True"}],
+    }
+    initial["metadata"]["resourceVersion"] = api.status_resource_version
+    reconcile_workload(api, initial, _nodes())
+    api.status_resource_version = str(int(api.status_resource_version) + 1)
+    delayed = deepcopy(initial)
+    delayed["metadata"].update(generation=2, resourceVersion=api.status_resource_version)
+    delayed["spec"].update(
+        replicas=2,
+        executionRequest={
+            "planID": "plan-1",
+            "operationID": "action-1",
+            "generation": 100,
+            "expectedReplicas": 1,
+            "targetReplicas": 2,
+        },
+    )
+    delayed["status"] = deepcopy(api.status)
+    entered_post, release_post = Event(), Event()
+    create = api.create_pod
+
+    def delayed_create(pod: dict[str, Any]) -> dict[str, Any]:
+        if (
+            threading.current_thread().name.startswith("old-controller")
+            and pod["metadata"]["labels"][REPLICA_ID_LABEL] == "api-1"
+        ):
+            entered_post.set()
+            assert release_post.wait(timeout=3)
+        return create(pod)
+
+    api.create_pod = delayed_create
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="old-controller") as pool:
+        old = pool.submit(reconcile_workload, api, delayed, _nodes())
+        assert entered_post.wait(timeout=3)
+
+        api.status_resource_version = str(int(api.status_resource_version) + 1)
+        takeover = deepcopy(delayed)
+        takeover["metadata"].update(generation=3, resourceVersion=api.status_resource_version)
+        takeover["spec"]["executionRequest"]["generation"] = 101
+        takeover["status"] = deepcopy(api.status)
+        reconcile_workload(api, takeover, _nodes())
+
+        api.status_resource_version = str(int(api.status_resource_version) + 1)
+        next_operation = deepcopy(takeover)
+        next_operation["metadata"].update(generation=4, resourceVersion=api.status_resource_version)
+        next_operation["spec"].update(
+            replicas=3,
+            executionRequest={
+                "planID": "plan-2",
+                "operationID": "action-2",
+                "generation": 102,
+                "expectedReplicas": 2,
+                "targetReplicas": 3,
+            },
+        )
+        next_operation["status"] = deepcopy(api.status)
+        reconcile_workload(api, next_operation, _nodes())
+        release_post.set()
+        with pytest.raises(ApiError, match="status resourceVersion conflict"):
+            old.result(timeout=3)
+
+    assert len(api.pods) == 3
+    assert {_pod_name("workload-uid", ordinal) for ordinal in range(3)} == set(api.pods)
+    assert api.status["execution"]["operationID"] == "action-2"
+    assert api.status["execution"]["phase"] == "APPLIED"
+
+
+def test_execution_request_on_unreconciled_create_cannot_start_pod_creation() -> None:
+    api = FakeAPI()
+    workload = _workload(
+        executionProtocol="monotonic-scale-up-v1",
+        executionRequest={
+            "planID": "forged-plan",
+            "operationID": "forged-operation",
+            "generation": 42,
+            "expectedReplicas": 0,
+            "targetReplicas": 1,
+        },
+    )
+
+    reconcile_workload(api, workload, _nodes())
+
+    assert api.pods == {}
+    assert api.status["execution"]["operationID"] == "forged-operation"
+    assert api.status["execution"]["phase"] == "BLOCKED"
+    assert api.status["conditions"][2]["reason"] == "WorkloadOperationUnreconciled"
+
+
+def test_stale_pdb_get_cannot_overwrite_a_newer_write() -> None:
+    api = FakeAPI()
+    stale = _workload(replicas=2, availabilityFloor=1)
+    stale["metadata"]["generation"] = 2
+    _ensure_pdb(api, stale)
+    stale_pdb = api.get_pdb("api")
+    assert stale_pdb is not None
+
+    current = api.pdbs["api"]
+    current["metadata"]["resourceVersion"] = "2"
+    current["metadata"]["annotations"][WORKLOAD_GENERATION_ANNOTATION] = "3"
+    current["spec"]["maxUnavailable"] = 2
+    api.get_pdb = lambda _name: deepcopy(stale_pdb)
+    stale["spec"]["replicas"] = 5
+    stale["spec"]["disruption"]["maxConcurrentDisruptions"] = 5
+
+    with pytest.raises(ApiError, match="resourceVersion conflict"):
+        _ensure_pdb(api, stale)
+
+    assert current["spec"]["maxUnavailable"] == 2
+    assert current["metadata"]["annotations"][WORKLOAD_GENERATION_ANNOTATION] == "3"
+
+
+def test_newer_workload_generation_advances_managed_pdb_budget() -> None:
+    api = FakeAPI()
+    old = _workload(replicas=2, availabilityFloor=1)
+    old["metadata"]["generation"] = 2
+    _ensure_pdb(api, old)
+    old["metadata"]["resourceVersion"] = "2"
+    old["spec"]["replicas"] = 4
+    old["spec"]["disruption"]["maxConcurrentDisruptions"] = 2
+    old["metadata"]["generation"] = 3
+
+    _ensure_pdb(api, old)
+
+    assert api.pdbs["api"]["spec"]["maxUnavailable"] == 2
+    assert api.pdbs["api"]["metadata"]["annotations"][WORKLOAD_GENERATION_ANNOTATION] == "3"
+
+
+def test_unversioned_managed_pdb_fails_closed_without_changing_budget() -> None:
+    api = FakeAPI()
+    old = _workload(replicas=3, availabilityFloor=2)
+    _ensure_pdb(api, old)
+    del api.pdbs["api"]["metadata"]["annotations"][WORKLOAD_GENERATION_ANNOTATION]
+    old["spec"]["availabilityFloor"] = 1
+    old["spec"]["disruption"]["maxConcurrentDisruptions"] = 2
+    old["metadata"]["generation"] = 2
+    original_spec = deepcopy(api.pdbs["api"]["spec"])
+
+    with pytest.raises(SafetyError, match="no trusted workload generation"):
+        _ensure_pdb(api, old)
+
+    assert api.pdbs["api"]["spec"] == original_spec
+    assert WORKLOAD_GENERATION_ANNOTATION not in api.pdbs["api"]["metadata"]["annotations"]
 
 
 def test_reconcile_after_restart_reconstructs_existing_replica_without_duplicate() -> None:
@@ -415,7 +646,7 @@ def test_env_order_change_is_detected_as_pod_template_change() -> None:
     assert api.status["conditions"][0]["reason"] == "PodTemplateChanged"
 
 
-def test_terminal_pod_is_deleted_by_uid_and_recreated_only_after_absence() -> None:
+def test_terminal_pod_is_preserved_until_explicit_replacement_protocol() -> None:
     api = FakeAPI()
     workload = _workload()
     reconcile_workload(api, workload, _nodes())
@@ -425,12 +656,52 @@ def test_terminal_pod_is_deleted_by_uid_and_recreated_only_after_absence() -> No
     reconcile_workload(api, workload, _nodes())
 
     assert len(api.pods) == 1
-    assert api.pods[name]["metadata"]["deletionTimestamp"] == "now"
+    assert api.pods[name]["status"]["phase"] == "Failed"
+    assert api.status["conditions"][2]["reason"] == "TerminalPodRequiresStagedExecution"
+
+
+def test_terminal_pod_replacement_uses_same_deterministic_slot_after_removal() -> None:
+    api = FakeAPI()
+    workload = _workload()
+    reconcile_workload(api, workload, _nodes())
+    name, pod = next(iter(api.pods.items()))
+    pod["status"]["phase"] = "Failed"
     del api.pods[name]
     reconcile_workload(api, workload, _nodes())
 
     assert len(api.pods) == 1
     assert next(iter(api.pods.values()))["metadata"]["uid"] != pod["metadata"]["uid"]
+
+
+def test_kubernetes_pdb_patch_uses_current_resource_version_and_generation_marker() -> None:
+    api = KubernetesAPI.__new__(KubernetesAPI)
+    api.namespace = "fleetright-v2"
+    requests: list[tuple[str, str, dict[str, Any] | None, str | None]] = []
+    api.request = lambda method, path, body=None, *, content_type="application/json": (
+        requests.append((method, path, body, content_type)) or {}
+    )
+
+    api.patch_pdb(
+        "api",
+        "resource-version-7",
+        {"maxUnavailable": 1},
+        {WORKLOAD_GENERATION_ANNOTATION: "3"},
+    )
+
+    assert requests == [
+        (
+            "PATCH",
+            "/apis/policy/v1/namespaces/fleetright-v2/poddisruptionbudgets/api",
+            {
+                "metadata": {
+                    "resourceVersion": "resource-version-7",
+                    "annotations": {WORKLOAD_GENERATION_ANNOTATION: "3"},
+                },
+                "spec": {"maxUnavailable": 1},
+            },
+            "application/merge-patch+json",
+        )
+    ]
 
 
 def test_terminating_logical_replica_is_not_recreated_until_absent() -> None:
@@ -474,7 +745,7 @@ def test_count_satisfied_with_ordinal_gap_does_not_delete_or_create_surge() -> N
     assert api.status["surgeReplicas"] == 0
 
 
-def test_scale_down_deletes_only_one_high_ordinal_when_floor_permits() -> None:
+def test_scale_down_requires_staged_execution_when_floor_permits() -> None:
     api = FakeAPI()
     workload = _workload(replicas=3, availabilityFloor=2)
     reconcile_workload(api, workload, _nodes())
@@ -488,30 +759,50 @@ def test_scale_down_deletes_only_one_high_ordinal_when_floor_permits() -> None:
 
     reconcile_workload(api, scaled_down, _nodes())
 
-    deleted = [
-        pod
-        for pod in api.pods.values()
-        if pod["metadata"].get("deletionTimestamp")
-    ]
-    assert len(deleted) == 1
-    assert deleted[0]["metadata"]["labels"][REPLICA_ID_LABEL] == "api-2"
+    assert all("deletionTimestamp" not in pod["metadata"] for pod in api.pods.values())
     assert len(api.pods) == 3
-    assert api.status["replicas"] == 2
-    assert api.status["readyReplicas"] == 2
-    assert api.status["availableReplicas"] == 2
+    assert api.status["replicas"] == 3
+    assert api.status["readyReplicas"] == 3
+    assert api.status["availableReplicas"] == 3
+    assert api.status["conditions"][0]["status"] == "True"
+    assert api.status["conditions"][1]["status"] == "True"
+    assert api.status["conditions"][2]["status"] == "False"
+    assert api.status["conditions"][2]["reason"] == "ScaleDownRequiresStagedExecution"
+    assert "requires staged" in api.status["conditions"][2]["message"]
+
+    recovered_status = deepcopy(scaled_down)
+    recovered_status["status"] = deepcopy(api.status)
+    recovered_status["metadata"]["resourceVersion"] = "2"
+    reconcile_workload(api, recovered_status, _nodes())
+
+    assert all("deletionTimestamp" not in pod["metadata"] for pod in api.pods.values())
+    assert api.status["conditions"][2]["reason"] == "ScaleDownRequiresStagedExecution"
+
+
+def test_scale_down_waits_for_existing_deletion_without_retiring_another_pod() -> None:
+    api = FakeAPI()
+    workload = _workload(replicas=3, availabilityFloor=2)
+    reconcile_workload(api, workload, _nodes())
+    for pod in api.pods.values():
+        pod["status"] = {
+            "phase": "Running",
+            "conditions": [{"type": "Ready", "status": "True"}],
+        }
+    deleting_name = _pod_name(workload["metadata"]["uid"], 2)
+    api.pods[deleting_name]["metadata"]["deletionTimestamp"] = "in-progress"
+    scaled_down = deepcopy(workload)
+    scaled_down["spec"]["replicas"] = 2
 
     reconcile_workload(api, scaled_down, _nodes())
 
-    still_deleted = [
-        pod
-        for pod in api.pods.values()
-        if pod["metadata"].get("deletionTimestamp")
+    assert [name for name, pod in api.pods.items() if pod["metadata"].get("deletionTimestamp")] == [
+        deleting_name
     ]
-    assert len(still_deleted) == 1
-    assert still_deleted[0]["metadata"]["labels"][REPLICA_ID_LABEL] == "api-2"
+    assert api.status["conditions"][2]["status"] == "False"
+    assert api.status["conditions"][2]["reason"] == "ScaleDownRequiresStagedExecution"
 
 
-def test_scale_down_skips_high_ready_pod_at_floor_and_removes_lower_pending_pod() -> None:
+def test_scale_down_does_not_delete_pending_or_ready_pods() -> None:
     api = FakeAPI()
     workload = _workload(replicas=3, availabilityFloor=2)
     reconcile_workload(api, workload, _nodes())
@@ -527,18 +818,16 @@ def test_scale_down_skips_high_ready_pod_at_floor_and_removes_lower_pending_pod(
             "phase": "Running",
             "conditions": [{"type": "Ready", "status": "True"}],
         }
+    api.pods[_pod_name(workload["metadata"]["uid"], 1)]["status"] = {
+        "phase": "Running",
+        "conditions": [{"type": "Ready", "status": "False"}],
+    }
     scaled_down = deepcopy(workload)
     scaled_down["spec"]["replicas"] = 2
 
     reconcile_workload(api, scaled_down, _nodes())
 
-    deleted = [
-        pod
-        for pod in api.pods.values()
-        if pod["metadata"].get("deletionTimestamp")
-    ]
-    assert len(deleted) == 1
-    assert deleted[0]["metadata"]["labels"][REPLICA_ID_LABEL] == "api-1"
+    assert all("deletionTimestamp" not in pod["metadata"] for pod in api.pods.values())
     ready_ids = {
         pod["metadata"]["labels"][REPLICA_ID_LABEL]
         for pod in api.pods.values()
@@ -549,6 +838,38 @@ def test_scale_down_skips_high_ready_pod_at_floor_and_removes_lower_pending_pod(
     }
     assert ready_ids == {"api-0", "api-2"}
     assert api.status["readyReplicas"] == 2
+    assert all("deletionTimestamp" not in pod["metadata"] for pod in api.pods.values())
+    assert api.status["conditions"][2]["reason"] == "ScaleDownRequiresStagedExecution"
+
+
+def test_zero_configured_disruption_keeps_source_pod_during_scale_down() -> None:
+    class NoDeleteAPI(FakeAPI):
+        def delete_pod(self, pod: dict[str, Any]) -> None:
+            raise AssertionError(
+                f"nonterminal Pod deletion bypassed PDB: {pod['metadata']['name']}"
+            )
+
+    api = NoDeleteAPI()
+    workload = _workload(replicas=3, availabilityFloor=2)
+    workload["spec"]["disruption"]["maxConcurrentDisruptions"] = 0
+    reconcile_workload(api, workload, _nodes())
+    for pod in api.pods.values():
+        pod["status"] = {
+            "phase": "Running",
+            "conditions": [{"type": "Ready", "status": "True"}],
+        }
+    scaled_down = deepcopy(workload)
+    scaled_down["spec"]["replicas"] = 2
+
+    reconcile_workload(api, scaled_down, _nodes())
+
+    assert len(api.pods) == 3
+    assert all("deletionTimestamp" not in pod["metadata"] for pod in api.pods.values())
+    assert api.pdbs["api"]["spec"]["maxUnavailable"] == 0
+    assert api.status["conditions"][0]["status"] == "True"
+    assert api.status["conditions"][1]["status"] == "True"
+    assert api.status["conditions"][2]["status"] == "False"
+    assert api.status["conditions"][2]["reason"] == "ScaleDownRequiresStagedExecution"
 
 
 def test_scale_down_does_not_delete_ready_replica_below_availability_floor() -> None:
@@ -566,7 +887,7 @@ def test_scale_down_does_not_delete_ready_replica_below_availability_floor() -> 
 
     reconcile_workload(api, workload, _nodes())
 
-    assert ready_pod["metadata"].get("deletionTimestamp") is None
+    assert all("deletionTimestamp" not in pod["metadata"] for pod in api.pods.values())
     assert api.status["conditions"][0]["reason"] == "AvailabilityFloorWouldBeViolated"
 
 

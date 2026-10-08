@@ -68,11 +68,103 @@ Any replacement/retirement path that bypasses PDB admission is unsupported.
 
 ## Consequences
 
-Replica scaling remains the only supported Kubernetes mutation. The current
-plan schema, verifier proof, and Deployment adapter are unchanged. Staged
-replacement, durable PDB eviction, and node-drain orchestration remain blocked
-until the canonical contract and target-side fencing semantics can be proven
-and tested together.
+Only monotonic replica growth on a newly created, explicitly marked
+FleetRightWorkload is exposed through the Kubernetes API target. Direct
+Deployment execution is rejected by application configuration and the executor
+Role has no Deployment, Pod, Eviction, PDB, or Node mutation permission. The
+executor atomically publishes its durable plan/action identity, SQL fencing
+generation, expected replica count, target count, and new replica high-water
+mark using a resourceVersion-guarded write to the FleetRightWorkload object.
+The existing FleetRightWorkload controller remains the only Pod creator.
+
+This is a narrow monotonic scale-up guarantee, not a general stale-request
+fence: an old Pod CREATE can arrive after takeover. It remains compatible only
+because every admitted target count is nondecreasing, the object UID/template/
+placement are fixed, and each ordinal has one deterministic Pod name and owner
+UID. A newer action waits until the previous action is `APPLIED`. Scale-down,
+terminal Pod replacement, `MOVE_REPLICA`, `DEACTIVATE_NODE`, Eviction, and
+node-drain orchestration remain disabled. No Eviction/Deployment claim can be
+derived from this protocol or its resourceVersion CAS.
+
+`_ensure_pdb` stores the workload generation in a managed-PDB annotation and
+refuses to patch from a lower-generation snapshot when that marker is present.
+It fails closed with `PDBGenerationUnknown` for an existing PDB without the
+marker: a possibly stale workload snapshot cannot safely establish the
+high-water generation. A trusted migration procedure is not implemented.
+Older controller binaries ignore the marker and can still patch an existing PDB
+from a fresh PDB resourceVersion using stale workload data. The Deployment is
+configured with `Recreate`, but a mixed-version rollout with an already running
+older process has not been qualified. For a marked monotonic workload, stale
+Pod CREATEs remain possible but are bounded by the prior replica high-water
+mark and deterministic immutable slot identity; this is not a general Pod
+request fence. Legacy objects cannot be promoted and direct API execution is
+disabled for the Deployment path. Mixed-version PDB behavior remains a blocker
+for any future staged retirement or drain.
+
+The FleetRightWorkload controller fails closed when live Pod count exceeds the
+desired count and reports `ScaleDownRequiresStagedExecution`. It no longer has
+a Pod DELETE path, including for terminal Pods; terminal logical identities
+require a future staged protocol. The direct Deployment `SET_REPLICA_COUNT`
+adapter remains in the code for legacy non-Kubernetes adapters/tests, but
+`create_app` rejects it as a Kubernetes execution target and its executor Role
+does not grant Deployment patch permission.
+
+## Checkpoint A monotonic scale-up protocol (2026-10-08)
+
+The supported object must be created with
+`spec.executionProtocol: monotonic-scale-up-v1`. CRD CEL makes the protocol,
+workload ID, Pod template, placement, availability floor, disruption settings,
+and surge budget immutable; it rejects scale-down, unbound replica growth, and
+in-place promotion of an object without the marker. The API Role can get and
+patch only the named `cpu-api` object in `fleetright-v2`. The controller Role
+can create Pods and manage the matching PDB, but cannot patch workload spec,
+delete Pods, submit Evictions, or mutate Nodes.
+
+The execution generation is stored with plan ID, operation ID, expected replica
+count, and target replica count in `.spec.executionRequest`. One Kubernetes
+Merge Patch guarded by the object's `metadata.resourceVersion` updates that
+record and `.spec.replicas`; concurrent writers using the same prior object
+version cannot both succeed. The controller validates current workload UID,
+deterministic logical Pod identity, owner UID, immutable template fingerprint,
+allowed Node name/UID, observed readiness, and availability floor before it
+creates or adopts any Pod. It records `RECONCILING` before Pod creation and
+`APPLIED` after all desired ordinals are present and verified. New operation
+identity is blocked until prior status is `APPLIED`, the object generation is
+observed with `Reconciled=True`, and the current availability floor is met.
+
+Safety property: under this protocol and while the same workload object UID is
+retained, any delayed Pod CREATE can only create an ordinal within a previously
+authorized replica high-water mark. Creates for one ordinal use the same name;
+Kubernetes admits at most one object at that name, and an existing object is
+adopted only after owner, logical ID, template, and placement checks. This is
+order-safe monotonic execution, not atomic fencing of Pod POST requests and not
+a guarantee that only one controller process is live. It does not cover
+workload deletion/recreation by a privileged administrator. The executor's
+resourceVersion CAS serializes authorization writes only. No lease, Pod UID,
+PDB observation, or admission-webhook check is claimed to atomically fence a
+separate Eviction request.
+
+The retained live v1.37.0 evidence below demonstrates why Eviction stays
+disabled: an unready same-UID Pod under `IfHealthyBudget` was accepted after its
+resourceVersion changed even when the PDB reported zero disruptions allowed.
+PDB enforcement for any future retirement must use the Eviction API, and this
+repository grants no Eviction permission to either executor or workload
+controller.
+
+## Live Kubernetes v1.37.0 confirmation (2026-10-08)
+
+On the dedicated `kind-fleetright-safety-lab` server, an allowed healthy-Pod
+Eviction with a stale Pod resourceVersion was rejected while its separate PDB
+reported `currentHealthy=2`, `desiredHealthy=1`, and `disruptionsAllowed=1`.
+Under a separate PDB using `IfHealthyBudget`, a stale Eviction request for an
+unready Pod was accepted with response code 201 after that same Pod UID's
+resourceVersion had changed; Ready was False, and the PDB reported
+`currentHealthy=1`, `desiredHealthy=1`, `disruptionsAllowed=0` immediately before
+the request. The exact source UID became absent. The temporary test namespaces
+were removed and confirmed absent. See [the live execution-authority evidence](../evidence/execution-authority-race-2026-10-08.txt).
+
+This confirms that Pod UID plus caller resourceVersion is not a universal stale
+controller fence for Eviction. It does not enable the helper or V2 execution.
 
 ## 2026-10-08 preimplementation audit (historical)
 
@@ -113,6 +205,10 @@ request able to evict the same Pod UID.
 The UID precondition prevents acting on a different Pod with the same name;
 it does not fence a stale request against the same Pod. A DB token, pre-read,
 Pod annotation, or request resourceVersion is insufficient across that race.
+For the permitted unready-Pod branches, the [v1.37.0 handler](https://github.com/kubernetes/kubernetes/blob/v1.37.0/pkg/registry/core/pod/storage/eviction.go)
+returns before `checkAndDecrement`, so the accepted request is not recorded in
+the PDB's `disruptedPods` status map. A takeover cannot use that map to prove
+that no older same-UID eviction remains in flight.
 No target-side mechanism in this repository enforces the fencing token at the
 final eviction mutation for every supported branch. Therefore no replacement,
 eviction, restart-recovery, or live Kubernetes evacuation test was attempted.

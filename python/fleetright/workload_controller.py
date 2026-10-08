@@ -26,6 +26,7 @@ WORKLOAD_UID_LABEL = "fleetright.io/workload-uid"
 WORKLOAD_ID_LABEL = "fleetright.io/workload-id"
 REPLICA_ID_LABEL = "fleetright.io/replica-id"
 TEMPLATE_HASH_ANNOTATION = "fleetright.io/pod-template-sha256"
+WORKLOAD_GENERATION_ANNOTATION = "fleetright.io/workload-generation"
 _DNS_LABEL = re.compile(r"[a-z0-9](?:[-a-z0-9]*[a-z0-9])?\Z")
 _QUANTITY = re.compile(r"([0-9]+(?:\.[0-9]+)?|\.[0-9]+)(n|u|m|Ki|Mi|Gi|Ti|Pi|Ei|K|M|G|T|P|E)?\Z")
 _DECIMAL_MULTIPLIERS = {
@@ -150,19 +151,6 @@ class KubernetesAPI:
         path = f"/api/v1/namespaces/{self.namespace}/pods"
         return self.request("POST", path, pod)
 
-    def delete_pod(self, pod: dict[str, Any]) -> None:
-        metadata = pod.get("metadata", {})
-        path = f"/api/v1/namespaces/{self.namespace}/pods/{metadata['name']}"
-        self.request(
-            "DELETE",
-            path,
-            {
-                "apiVersion": "v1",
-                "kind": "DeleteOptions",
-                "preconditions": {"uid": metadata["uid"]},
-            },
-        )
-
     def get_pdb(self, name: str) -> dict[str, Any] | None:
         path = f"/apis/policy/v1/namespaces/{self.namespace}/poddisruptionbudgets/{name}"
         try:
@@ -176,12 +164,21 @@ class KubernetesAPI:
         path = f"/apis/policy/v1/namespaces/{self.namespace}/poddisruptionbudgets"
         return self.request("POST", path, pdb)
 
-    def patch_pdb(self, name: str, resource_version: str, spec: dict[str, Any]) -> dict[str, Any]:
+    def patch_pdb(
+        self,
+        name: str,
+        resource_version: str,
+        spec: dict[str, Any],
+        annotations: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
         path = f"/apis/policy/v1/namespaces/{self.namespace}/poddisruptionbudgets/{name}"
+        metadata: dict[str, Any] = {"resourceVersion": resource_version}
+        if annotations is not None:
+            metadata["annotations"] = annotations
         return self.request(
             "PATCH",
             path,
-            {"metadata": {"resourceVersion": resource_version}, "spec": spec},
+            {"metadata": metadata, "spec": spec},
             content_type="application/merge-patch+json",
         )
 
@@ -435,6 +432,7 @@ def _pdb_object(workload: dict[str, Any]) -> dict[str, Any]:
         "metadata": {
             "name": metadata["name"],
             "labels": {WORKLOAD_UID_LABEL: metadata["uid"]},
+            "annotations": {WORKLOAD_GENERATION_ANNOTATION: str(metadata["generation"])},
             "ownerReferences": [_owner_reference(workload)],
         },
         "spec": {
@@ -526,11 +524,18 @@ def _validate_spec(
     if not isinstance(spec, dict):
         raise SafetyError("InvalidSpec", "spec must be an object")
     metadata = workload.get("metadata")
-    if not isinstance(metadata, dict) or not all(
-        isinstance(metadata.get(key), str) and metadata.get(key)
-        for key in ("name", "uid", "resourceVersion")
+    if (
+        not isinstance(metadata, dict)
+        or not all(
+            isinstance(metadata.get(key), str) and metadata.get(key)
+            for key in ("name", "uid", "resourceVersion")
+        )
+        or type(metadata.get("generation")) is not int
+        or metadata["generation"] < 1
     ):
-        raise SafetyError("InvalidIdentity", "workload name, UID, and resourceVersion are required")
+        raise SafetyError(
+            "InvalidIdentity", "workload name, UID, generation, and resourceVersion are required"
+        )
     workload_id = spec.get("workloadID")
     if (
         not isinstance(workload_id, str)
@@ -546,6 +551,24 @@ def _validate_spec(
             raise SafetyError("InvalidSpec", f"{field} is outside its supported range")
     if spec["availabilityFloor"] > spec["replicas"]:
         raise SafetyError("InvalidSpec", "availabilityFloor cannot exceed replicas")
+    execution = spec.get("executionRequest")
+    if execution is not None and (
+        spec.get("executionProtocol") != "monotonic-scale-up-v1"
+        or not isinstance(execution, dict)
+        or not all(
+            isinstance(execution.get(key), str) and execution[key]
+            for key in ("planID", "operationID")
+        )
+        or type(execution.get("generation")) is not int
+        or execution["generation"] < 1
+        or type(execution.get("expectedReplicas")) is not int
+        or type(execution.get("targetReplicas")) is not int
+        or execution["targetReplicas"] != spec["replicas"]
+        or execution["expectedReplicas"] > execution["targetReplicas"]
+    ):
+        raise SafetyError(
+            "InvalidExecutionRequest", "execution request identity or target is invalid"
+        )
     disruption = spec.get("disruption")
     max_unavailable = (
         disruption.get("maxConcurrentDisruptions") if isinstance(disruption, dict) else None
@@ -625,38 +648,46 @@ def _status(
     ready_replicas = sum(1 for pod in live_pods if _pod_ready(pod))
     desired = workload.get("spec", {}).get("replicas", 0)
     floor = workload.get("spec", {}).get("availabilityFloor", 0)
-    ready = reason == "Reconciled" and ready_replicas >= desired
-    available = reason == "Reconciled" and ready_replicas >= floor
+    counts_are_trustworthy = reason in {"Reconciled", "ScaleDownRequiresStagedExecution"}
+    ready = counts_are_trustworthy and ready_replicas >= desired
+    available = counts_are_trustworthy and ready_replicas >= floor
     old_conditions = old.get("conditions", [])
+    ready_reason = "AllReplicasReady" if ready else "ReplicasNotReady"
+    availability_reason = "MinimumAvailabilityMet" if available else "AvailabilityFloorNotMet"
+    ready_message = (
+        ("all desired replicas are ready" if ready else "waiting for all desired replicas")
+        if counts_are_trustworthy
+        else message
+    )
+    availability_message = (
+        (
+            "ready replicas meet the availability floor"
+            if available
+            else "ready replicas are below availabilityFloor"
+        )
+        if counts_are_trustworthy
+        else message
+    )
     conditions = [
         _condition(
             "Ready",
-            reason
-            if reason != "Reconciled"
-            else ("AllReplicasReady" if ready else "ReplicasNotReady"),
-            message
-            if reason != "Reconciled"
-            else (
-                "all desired replicas are ready"
-                if ready
-                else "waiting for all desired replicas to become ready"
-            ),
+            ready_reason if counts_are_trustworthy else reason,
+            ready_message,
             ready,
             old_conditions,
         ),
         _condition(
             "Available",
-            reason
-            if reason != "Reconciled"
-            else ("MinimumAvailabilityMet" if available else "AvailabilityFloorNotMet"),
-            message
-            if reason != "Reconciled"
-            else (
-                "ready replicas meet the availability floor"
-                if available
-                else "ready replicas are below availabilityFloor"
-            ),
+            availability_reason if counts_are_trustworthy else reason,
+            availability_message,
             available,
+            old_conditions,
+        ),
+        _condition(
+            "Reconciled",
+            "Reconciled" if reason == "Reconciled" else reason,
+            "workload state was reconciled" if reason == "Reconciled" else message,
+            reason == "Reconciled",
             old_conditions,
         ),
     ]
@@ -671,7 +702,60 @@ def _status(
         "activeOperationRefs": old.get("activeOperationRefs", []),
         "conditions": conditions,
     }
+    if isinstance(old.get("execution"), dict):
+        status["execution"] = old["execution"]
     return status
+
+
+def _validate_execution_request(workload: dict[str, Any]) -> None:
+    spec = workload["spec"]
+    request = spec.get("executionRequest")
+    if request is None:
+        return
+    metadata, status = workload["metadata"], workload.get("status", {})
+    previous = status.get("execution")
+    observed_generation = status.get("observedGeneration")
+    expected = request["expectedReplicas"]
+    same_operation = isinstance(previous, dict) and all(
+        previous.get(key) == request[key] for key in ("planID", "operationID")
+    )
+    if same_operation and (
+        type(previous.get("generation")) is int
+        and previous["generation"] <= request["generation"]
+        and previous.get("targetReplicas") == request["targetReplicas"]
+    ):
+        return
+    reconciled_previous_generation = (
+        type(observed_generation) is int
+        and observed_generation == metadata["generation"] - 1
+        and status.get("replicas") == expected
+    )
+    if isinstance(previous, dict):
+        if (
+            reconciled_previous_generation
+            and previous.get("phase") == "APPLIED"
+            and type(previous.get("generation")) is int
+            and request["generation"] > previous["generation"]
+        ):
+            return
+    else:
+        conditions = status.get("conditions", [])
+        reconciled = any(
+            isinstance(condition, dict)
+            and condition.get("type") == "Reconciled"
+            and condition.get("status") == "True"
+            for condition in conditions
+        )
+        if (
+            reconciled_previous_generation
+            and reconciled
+            and status.get("readyReplicas", 0) >= spec["availabilityFloor"]
+        ):
+            return
+    raise SafetyError(
+        "WorkloadOperationUnreconciled",
+        "execution request does not follow a durable reconciled workload state",
+    )
 
 
 def _write_status(
@@ -688,6 +772,27 @@ def _write_status(
         api.patch_status(metadata["name"], metadata["resourceVersion"], desired)
 
 
+def _write_execution_phase(api: Any, workload: dict[str, Any], phase: str) -> None:
+    request = workload.get("spec", {}).get("executionRequest")
+    if not isinstance(request, dict):
+        return
+    identity = {
+        key: request[key] for key in ("planID", "operationID", "generation", "targetReplicas")
+    }
+    execution = {**identity, "phase": phase}
+    old_status = workload.get("status", {})
+    if old_status.get("execution") == execution:
+        return
+    status = {**old_status, "execution": execution}
+    result = api.patch_status(
+        workload["metadata"]["name"], workload["metadata"]["resourceVersion"], status
+    )
+    metadata = result.get("metadata", {}) if isinstance(result, dict) else {}
+    if isinstance(metadata.get("resourceVersion"), str):
+        workload["metadata"]["resourceVersion"] = metadata["resourceVersion"]
+    workload["status"] = status
+
+
 def _ensure_pdb(api: Any, workload: dict[str, Any]) -> None:
     desired = _pdb_object(workload)
     name = desired["metadata"]["name"]
@@ -695,24 +800,47 @@ def _ensure_pdb(api: Any, workload: dict[str, Any]) -> None:
     if existing is None:
         api.create_pdb(desired)
         return
+    if not isinstance(existing, dict):
+        raise SafetyError("PDBIdentityConflict", "existing PodDisruptionBudget is invalid")
+    existing_metadata = existing.get("metadata", {})
+    existing_spec = existing.get("spec", {})
+    if not isinstance(existing_metadata, dict) or not isinstance(existing_spec, dict):
+        raise SafetyError("PDBIdentityConflict", "existing PodDisruptionBudget is invalid")
     if (
         not _is_owned(existing, workload)
-        or existing.get("spec", {}).get("selector") != desired["spec"]["selector"]
+        or existing_spec.get("selector") != desired["spec"]["selector"]
     ):
         raise SafetyError(
             "PDBIdentityConflict", "a PodDisruptionBudget with a conflicting identity exists"
         )
-    existing_spec = existing.get("spec", {})
+    annotations = existing_metadata.get("annotations", {})
+    if not isinstance(annotations, dict):
+        raise SafetyError("PDBIdentityConflict", "managed PDB annotations are invalid")
+    raw_generation = annotations.get(WORKLOAD_GENERATION_ANNOTATION)
+    version = existing_metadata.get("resourceVersion")
+    if not isinstance(version, str):
+        raise SafetyError(
+            "PDBIdentityConflict", "existing PodDisruptionBudget has no resourceVersion"
+        )
+    workload_generation = workload["metadata"]["generation"]
+    if raw_generation is None:
+        raise SafetyError(
+            "PDBGenerationUnknown",
+            "managed PodDisruptionBudget has no trusted workload generation",
+        )
+    if not isinstance(raw_generation, str) or not raw_generation.isdecimal():
+        raise SafetyError("PDBIdentityConflict", "managed PDB workload generation is invalid")
+    if workload_generation < int(raw_generation):
+        raise SafetyError(
+            "StaleWorkloadGeneration",
+            "stale workload snapshot cannot mutate Pods or its managed PDB",
+        )
     if (
         existing_spec.get("selector") != desired["spec"]["selector"]
         or existing_spec.get("maxUnavailable") != desired["spec"]["maxUnavailable"]
+        or workload_generation > int(raw_generation)
     ):
-        version = existing.get("metadata", {}).get("resourceVersion")
-        if not isinstance(version, str):
-            raise SafetyError(
-                "PDBIdentityConflict", "existing PodDisruptionBudget has no resourceVersion"
-            )
-        api.patch_pdb(name, version, desired["spec"])
+        api.patch_pdb(name, version, desired["spec"], desired["metadata"]["annotations"])
 
 
 def reconcile_workload(api: Any, workload: dict[str, Any], nodes: list[dict[str, Any]]) -> None:
@@ -725,9 +853,9 @@ def reconcile_workload(api: Any, workload: dict[str, Any], nodes: list[dict[str,
             raise SafetyError("InvalidIdentity", "workload UID is required")
         pods = api.list_pods(uid)
         _, approved_uids = _validate_spec(workload, nodes)
+        _validate_execution_request(workload)
         _ensure_pdb(api, workload)
         pods_by_ordinal: dict[int, dict[str, Any]] = {}
-        terminal_pod_deleted = False
         for pod in pods:
             ordinal = _check_existing_pod(pod, workload)
             if ordinal in pods_by_ordinal:
@@ -761,12 +889,12 @@ def reconcile_workload(api: Any, workload: dict[str, Any], nodes: list[dict[str,
             if pod.get("status", {}).get("phase") in {"Succeeded", "Failed"} and not pod.get(
                 "metadata", {}
             ).get("deletionTimestamp"):
-                api.delete_pod(pod)
-                terminal_pod_deleted = True
+                raise SafetyError(
+                    "TerminalPodRequiresStagedExecution",
+                    "terminal logical replica requires an explicit replacement protocol",
+                )
 
-        if terminal_pod_deleted:
-            _write_status(api, workload, pods, "Reconciled", "terminal Pod deletion requested")
-            return
+        _write_execution_phase(api, workload, "RECONCILING")
 
         desired = workload["spec"]["replicas"]
         live_pods = [
@@ -775,38 +903,30 @@ def reconcile_workload(api: Any, workload: dict[str, Any], nodes: list[dict[str,
         live_count = len(live_pods)
         ready_replicas = sum(1 for pod in live_pods if _pod_ready(pod))
         if live_count > desired:
-            # Count owned live Pods, not ordinal membership: gaps must not cause
-            # a healthy extra ordinal to be deleted when the desired count is met.
             if any(pod.get("metadata", {}).get("deletionTimestamp") for pod in live_pods):
                 _write_status(
-                    api, workload, pods, "Reconciled", "waiting for an in-progress Pod deletion"
+                    api,
+                    workload,
+                    pods,
+                    "ScaleDownRequiresStagedExecution",
+                    "waiting for an in-progress Pod deletion before staged retirement",
                 )
                 return
-            pod_to_delete = next(
-                (
-                    pod
-                    for _, pod in sorted(pods_by_ordinal.items(), reverse=True)
-                    if pod.get("status", {}).get("phase") not in {"Succeeded", "Failed"}
-                    and ready_replicas - int(_pod_ready(pod))
-                    >= workload["spec"]["availabilityFloor"]
-                ),
-                None,
+            can_preserve_floor = any(
+                pod
+                for pod in pods_by_ordinal.values()
+                if pod.get("status", {}).get("phase") not in {"Succeeded", "Failed"}
+                and ready_replicas - int(_pod_ready(pod)) >= workload["spec"]["availabilityFloor"]
             )
-            if pod_to_delete is None:
+            if not can_preserve_floor:
                 raise SafetyError(
                     "AvailabilityFloorWouldBeViolated",
                     "no single Pod can be removed while preserving availabilityFloor",
                 )
-            api.delete_pod(pod_to_delete)
-            # Observe the deletion timestamp before reporting counts or starting another step.
-            _write_status(
-                api,
-                workload,
-                api.list_pods(uid),
-                "Reconciled",
-                "one eligible Pod deletion requested",
+            raise SafetyError(
+                "ScaleDownRequiresStagedExecution",
+                "nonterminal Pod retirement requires staged PDB-aware execution",
             )
-            return
 
         # Phase 1 ordinary reconciliation never consumes surgeBudget. It is
         # reserved for a future explicit staged-replacement protocol.
@@ -816,30 +936,68 @@ def reconcile_workload(api: Any, workload: dict[str, Any], nodes: list[dict[str,
                 continue
             if live_count >= maximum_live:
                 break
-            pod = api.get_pod(_pod_name(uid, ordinal))
+            name = _pod_name(uid, ordinal)
+            pod = api.get_pod(name)
             if pod is not None:
                 _check_existing_pod(pod, workload)
-                raise SafetyError(
-                    "PodIdentityConflict", "deterministic Pod name is occupied by another identity"
-                )
+                _validate_scheduled_pod(pod, approved_uids, nodes)
+                pods_by_ordinal[ordinal] = pod
+                pods.append(pod)
+                live_count += 1
+                continue
             try:
-                api.create_pod(_pod_object(workload, ordinal))
+                created = api.create_pod(_pod_object(workload, ordinal))
             except ApiError as error:
                 if error.status == 409:
-                    raise SafetyError(
-                        "PodIdentityConflict", "deterministic Pod name is already in use"
-                    ) from error
+                    existing = api.get_pod(name)
+                    if existing is None:
+                        raise SafetyError(
+                            "PodCreateOutcomeUnknown",
+                            "Pod create conflicted but the deterministic name is not observable",
+                        ) from error
+                    _check_existing_pod(existing, workload)
+                    _validate_scheduled_pod(existing, approved_uids, nodes)
+                    pods_by_ordinal[ordinal] = existing
+                    pods.append(existing)
+                    live_count += 1
+                    continue
                 if error.status in {400, 403, 422}:
                     raise SafetyError(
                         "PodCreateRejectedByAPIServer",
                         f"Kubernetes API rejected Pod creation (HTTP {error.status})",
                     ) from error
                 raise
+            pods_by_ordinal[ordinal] = created
+            pods.append(created)
             live_count += 1
+        if all(ordinal in pods_by_ordinal for ordinal in range(desired)):
+            _write_execution_phase(api, workload, "APPLIED")
         _write_status(api, workload, pods, "Reconciled", "workload reconciled from API state")
     except SafetyError as error:
+        _write_execution_phase(api, workload, "BLOCKED")
         current_pods = api.list_pods(uid) if isinstance(uid, str) and uid else []
         _write_status(api, workload, current_pods, error.reason, str(error))
+
+
+def _validate_scheduled_pod(
+    pod: dict[str, Any], approved_uids: dict[str, str], nodes: list[dict[str, Any]]
+) -> None:
+    scheduled_name = pod.get("spec", {}).get("nodeName")
+    if not scheduled_name:
+        return
+    if scheduled_name not in approved_uids:
+        raise SafetyError("PodOutsideAllowedNodes", "Pod is scheduled outside the allowed Node set")
+    current_node = next(
+        (node for node in nodes if node.get("metadata", {}).get("name") == scheduled_name),
+        None,
+    )
+    if (
+        current_node is None
+        or current_node.get("metadata", {}).get("uid") != approved_uids[scheduled_name]
+    ):
+        raise SafetyError(
+            "NodeIdentityChanged", "scheduled Pod Node UID differs from approved identity"
+        )
 
 
 def run() -> None:

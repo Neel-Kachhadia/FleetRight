@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -8,7 +12,9 @@ from fleetright.api import create_app
 from fleetright.execution import (
     ActionBlocked,
     DockerComposeTarget,
+    FleetRightWorkloadTarget,
     KubernetesTarget,
+    TargetError,
     TargetPreconditionFailed,
     TargetUnavailable,
     WorkloadHealthObserver,
@@ -16,6 +22,7 @@ from fleetright.execution import (
     bounded_execution_health_policy,
     valid_execution_health_policy,
 )
+from fleetright.reconciler import ExecutionController
 
 
 def test_execution_health_policy_is_capped_by_server_workload_contract() -> None:
@@ -29,12 +36,17 @@ def test_execution_health_policy_is_capped_by_server_workload_contract() -> None
     assert not valid_execution_health_policy("cpu-api", {**policy, "p99_limit_ms": 10_000})
 
 
-def test_kubernetes_execute_requires_the_supported_explicit_namespace(
+def test_workload_execute_requires_the_supported_explicit_namespace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("FLEETRIGHT_KUBERNETES_KUBECONFIG", "/tmp/fleetright-kubeconfig")
     monkeypatch.delenv("FLEETRIGHT_KUBERNETES_NAMESPACE", raising=False)
-    with pytest.raises(RuntimeError, match="namespace fleetright"):
+    with pytest.raises(RuntimeError, match="namespace fleetright-v2"):
+        create_app(mode="EXECUTE", execution_target="kubernetes-workload")
+
+
+def test_direct_deployment_execution_target_is_disabled() -> None:
+    with pytest.raises(RuntimeError, match="docker or kubernetes-workload"):
         create_app(mode="EXECUTE", execution_target="kubernetes")
 
 
@@ -139,6 +151,69 @@ def test_kubernetes_fence_receipt_uses_atomic_patch_response(
     assert len(observations) == 1
 
 
+def test_kubernetes_stale_scale_patch_loses_to_newer_target_fence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = KubernetesTarget(namespace="fleetright")
+    deployment = {
+        "metadata": {
+            "uid": "deployment-uid",
+            "generation": 3,
+            "resourceVersion": "17",
+            "annotations": {"fleetright.io/fencing-token": "1"},
+        },
+        "spec": {"replicas": 8},
+        "status": {"readyReplicas": 8, "availableReplicas": 8, "observedGeneration": 3},
+    }
+
+    monkeypatch.setattr(
+        target,
+        "observe_scale",
+        lambda _workload: KubernetesTarget._scale_observation(deepcopy(deployment)),
+    )
+    takeover = False
+
+    def patch(*args: str) -> dict[str, object]:
+        nonlocal takeover
+        operations = json.loads(args[args.index("-p") + 1])
+        if not takeover and any(item.get("path") == "/spec/replicas" for item in operations):
+            takeover = True
+            target.fence_scale("cpu-api", 2, expected=target.observe_scale("cpu-api"))
+
+        def read(path: str) -> object:
+            current: object = deployment
+            for part in path.split("/")[1:]:
+                current = current[part.replace("~1", "/")]  # type: ignore[index]
+            return current
+
+        for operation in operations:
+            if operation["op"] == "test" and read(operation["path"]) != operation["value"]:
+                raise TargetError("target rejected the operation")
+        for operation in operations:
+            path = operation["path"]
+            if path == "/metadata/annotations/fleetright.io~1fencing-token":
+                deployment["metadata"]["annotations"]["fleetright.io/fencing-token"] = operation[
+                    "value"
+                ]
+            elif path == "/spec/replicas":
+                deployment["spec"]["replicas"] = operation["value"]
+                deployment["metadata"]["generation"] += 1
+        deployment["metadata"]["resourceVersion"] = str(
+            int(deployment["metadata"]["resourceVersion"]) + 1
+        )
+        return deepcopy(deployment)
+
+    monkeypatch.setattr(target, "_json", patch)
+    observed = target.observe_scale("cpu-api")
+
+    with pytest.raises(TargetError, match="target rejected the operation"):
+        target.set_replicas("cpu-api", 9, observed, expected_replicas=8, fencing_token=1)
+
+    assert takeover
+    assert deployment["spec"]["replicas"] == 8
+    assert deployment["metadata"]["annotations"]["fleetright.io/fencing-token"] == "2"
+
+
 def test_docker_process_fence_rejects_a_stale_controller(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
@@ -194,58 +269,294 @@ def test_docker_refuses_replica_counts_that_conflict_on_the_published_port(
         target.set_replicas("cpu-api", 2, current, expected_replicas=1, fencing_token=1)
 
 
-def test_eviction_uses_policy_api_with_uid_precondition(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_kubernetes_target_has_no_pod_eviction_or_node_cordon_mutators() -> None:
     target = KubernetesTarget(namespace="fleetright")
+
+    assert not hasattr(target, "evict_one")
+    assert not hasattr(target, "cordon")
+
+
+def test_kubernetes_roles_publish_requests_and_leave_pod_creation_to_controller() -> None:
+    root = Path(__file__).resolve().parents[2]
+    api_rbac = (root / "deploy/kubernetes/rbac.yaml").read_text()
+    workload_rbac = (root / "deploy/kubernetes/fleetright-workload-controller.yaml").read_text()
+
+    assert 'resources: ["fleetrightworkloads"]' in api_rbac
+    assert 'verbs: ["get", "patch"]' in api_rbac
+    assert 'resources: ["deployments"]' not in api_rbac
+    assert 'resources: ["pods/eviction"]' not in api_rbac
+    assert 'resources: ["pods"]\n    verbs: ["get", "list", "create"]' in workload_rbac
+    assert 'verbs: ["get", "list", "create", "delete"]' not in workload_rbac
+    assert 'resources: ["pods/eviction"]' not in workload_rbac
+    assert "type: Recreate" in workload_rbac
+
+
+def _workload_object() -> dict[str, object]:
+    return {
+        "metadata": {
+            "name": "cpu-api",
+            "uid": "workload-uid",
+            "generation": 4,
+            "resourceVersion": "7",
+        },
+        "spec": {
+            "workloadID": "cpu-api",
+            "executionProtocol": "monotonic-scale-up-v1",
+            "replicas": 2,
+            "availabilityFloor": 1,
+        },
+        "status": {
+            "observedGeneration": 4,
+            "replicas": 2,
+            "readyReplicas": 2,
+            "availableReplicas": 2,
+            "conditions": [{"type": "Reconciled", "status": "True"}],
+        },
+    }
+
+
+def test_workload_request_cas_binds_identity_generation_and_replica_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = FleetRightWorkloadTarget(namespace="fleetright-v2")
+    state = _workload_object()
+    patches: list[dict[str, object]] = []
+
+    def apply(*args: str) -> dict[str, object]:
+        if args[0] == "get":
+            return deepcopy(state)
+        patch = json.loads(args[args.index("-p") + 1])
+        patches.append(patch)
+        if patch["metadata"]["resourceVersion"] != state["metadata"]["resourceVersion"]:  # type: ignore[index]
+            raise TargetPreconditionFailed("resourceVersion compare-and-swap failed")
+        state["spec"].update(patch["spec"])  # type: ignore[index]
+        state["metadata"]["generation"] += 1  # type: ignore[index]
+        state["metadata"]["resourceVersion"] = str(  # type: ignore[index]
+            int(state["metadata"]["resourceVersion"]) + 1  # type: ignore[index]
+        )
+        return deepcopy(state)
+
+    monkeypatch.setattr(target, "_json", apply)
+    before = target.observe_scale("cpu-api")
+    result = target.authorize_scale(
+        "cpu-api", 12, expected=before, plan_id="plan-1", operation_id="action-1", target_replicas=3
+    )
+
+    assert result["uid"] == "workload-uid"
+    assert result["replicas"] == 3
+    assert result["fencing_token"] == 12
+    assert result["execution_request"] == {
+        "planID": "plan-1",
+        "operationID": "action-1",
+        "generation": 12,
+        "expectedReplicas": 2,
+        "targetReplicas": 3,
+    }
+    assert patches[0] == {
+        "metadata": {"resourceVersion": "7"},
+        "spec": {
+            "executionRequest": {
+                "planID": "plan-1",
+                "operationID": "action-1",
+                "generation": 12,
+                "expectedReplicas": 2,
+                "targetReplicas": 3,
+            },
+            "replicas": 3,
+        },
+    }
+
+
+def test_workload_scale_down_is_rejected_before_any_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = FleetRightWorkloadTarget(namespace="fleetright-v2")
+    before = target._observe(_workload_object(), "cpu-api")
+    monkeypatch.setattr(target, "observe_scale", lambda _name: before)
     monkeypatch.setattr(
-        target,
-        "_json",
-        lambda *args: {
-            "metadata": {
-                "uid": "01234567-89ab-cdef-0123-456789abcdef",
-                "resourceVersion": "1",
-                "labels": {"fleetright.io/workload": "cpu-api"},
-                "ownerReferences": [{"kind": "ReplicaSet"}],
-            }
+        target, "_json", lambda *_args: pytest.fail("scale-down patched Kubernetes")
+    )
+
+    with pytest.raises(ActionBlocked, match="WORKLOAD_SCALE_DOWN_DISABLED"):
+        target.authorize_scale(
+            "cpu-api",
+            13,
+            expected=before,
+            plan_id="plan-1",
+            operation_id="action-1",
+            target_replicas=1,
+        )
+
+
+def test_workload_takeover_blocks_new_operation_until_prior_request_is_applied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = FleetRightWorkloadTarget(namespace="fleetright-v2")
+    value = _workload_object()
+    value["spec"].update(
+        replicas=3,
+        executionRequest={
+            "planID": "plan-1",
+            "operationID": "action-1",
+            "generation": 100,
+            "expectedReplicas": 2,
+            "targetReplicas": 3,
         },
     )
-    monkeypatch.setattr(target, "_require_schedulable_node", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(target, "_pdb_allows", lambda _labels: None)
+    value["status"].update(
+        execution={
+            "planID": "plan-1",
+            "operationID": "action-1",
+            "generation": 100,
+            "targetReplicas": 3,
+            "phase": "RECONCILING",
+        }
+    )
+    current = target._observe(value, "cpu-api")
+    monkeypatch.setattr(target, "observe_scale", lambda _name: current)
     monkeypatch.setattr(
-        target,
-        "fence_pod",
-        lambda _name, uid, token: {"uid": uid, "resource_version": "2", "fencing_token": token},
+        target, "_json", lambda *_args: pytest.fail("new request bypassed takeover")
     )
-    calls: list[tuple[list[str], str | None]] = []
 
-    def run(*args: str, stdin: str | None = None) -> object:
-        calls.append((list(args), stdin))
-        return object()
-
-    monkeypatch.setattr(target, "_kubectl", run)
-    target.evict_one(
-        "cpu-api-abcde",
-        "01234567-89ab-cdef-0123-456789abcdef",
-        1,
-        destination_node="node-a",
-    )
-    args, body = calls[0]
-    assert args[0] == "create"
-    assert args[1] == "--raw=/api/v1/namespaces/fleetright/pods/cpu-api-abcde/eviction"
-    preconditions = json.loads(body or "{}")["deleteOptions"]["preconditions"]
-    assert preconditions["uid"] == "01234567-89ab-cdef-0123-456789abcdef"
-    assert preconditions["resourceVersion"] == "2"
-
-
-def test_eviction_rejects_pod_identity_change(monkeypatch: pytest.MonkeyPatch) -> None:
-    target = KubernetesTarget(namespace="fleetright")
-    monkeypatch.setattr(target, "_json", lambda *args: {"metadata": {"uid": "different"}})
-    with pytest.raises(TargetPreconditionFailed, match="identity changed"):
-        target.evict_one(
-            "cpu-api-abcde",
-            "01234567-89ab-cdef-0123-456789abcdef",
-            1,
-            destination_node="node-a",
+    with pytest.raises(ActionBlocked, match="PRIOR_WORKLOAD_OPERATION_UNRESOLVED"):
+        target.authorize_scale(
+            "cpu-api",
+            101,
+            expected=current,
+            plan_id="plan-2",
+            operation_id="action-2",
+            target_replicas=4,
         )
+
+
+def test_workload_authorization_fails_closed_on_unreconciled_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = FleetRightWorkloadTarget(namespace="fleetright-v2")
+    value = _workload_object()
+    value["status"]["conditions"] = [{"type": "Reconciled", "status": "False"}]
+    current = target._observe(value, "cpu-api")
+    monkeypatch.setattr(target, "observe_scale", lambda _name: current)
+    monkeypatch.setattr(
+        target, "_json", lambda *_args: pytest.fail("unreconciled workload was authorized")
+    )
+
+    with pytest.raises(ActionBlocked, match="WORKLOAD_NOT_RECONCILED"):
+        target.authorize_scale(
+            "cpu-api",
+            13,
+            expected=current,
+            plan_id="plan-1",
+            operation_id="action-1",
+            target_replicas=3,
+        )
+
+
+def test_workload_action_is_not_complete_until_controller_status_is_applied() -> None:
+    target = FleetRightWorkloadTarget(namespace="fleetright-v2")
+    value = _workload_object()
+    value["spec"]["executionRequest"] = {
+        "planID": "plan-1",
+        "operationID": "action-1",
+        "generation": 12,
+        "expectedReplicas": 2,
+        "targetReplicas": 2,
+    }
+    value["status"]["execution"] = {
+        "planID": "plan-1",
+        "operationID": "action-1",
+        "generation": 12,
+        "targetReplicas": 2,
+        "phase": "APPLIED",
+    }
+    observed = target._observe(value, "cpu-api")
+    assert ExecutionController._capacity_ready(observed)
+
+    pending = deepcopy(value)
+    pending["status"]["execution"]["phase"] = "RECONCILING"
+    assert not ExecutionController._capacity_ready(target._observe(pending, "cpu-api"))
+
+    incomplete = deepcopy(value)
+    incomplete["status"]["replicas"] = 1
+    assert not ExecutionController._capacity_ready(target._observe(incomplete, "cpu-api"))
+
+
+def test_legacy_workload_cannot_be_targeted_by_execution(monkeypatch: pytest.MonkeyPatch) -> None:
+    target = FleetRightWorkloadTarget(namespace="fleetright-v2")
+    value = _workload_object()
+    del value["spec"]["executionProtocol"]
+    monkeypatch.setattr(target, "_json", lambda *_args: value)
+
+    with pytest.raises(TargetPreconditionFailed, match="not created for monotonic scale-up"):
+        target.observe_scale("cpu-api")
+
+
+def test_concurrent_workload_takeover_uses_resource_version_cas(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = FleetRightWorkloadTarget(namespace="fleetright-v2")
+    state = _workload_object()
+    barrier = threading.Barrier(2)
+    lock = threading.Lock()
+    gets = 0
+
+    def apply(*args: str) -> dict[str, object]:
+        nonlocal gets
+        if args[0] == "get":
+            with lock:
+                wait = gets < 2
+                gets += 1
+                result = deepcopy(state)
+            if wait:
+                barrier.wait(timeout=2)
+            return result
+        patch = json.loads(args[args.index("-p") + 1])
+        with lock:
+            if patch["metadata"]["resourceVersion"] != state["metadata"]["resourceVersion"]:  # type: ignore[index]
+                raise TargetPreconditionFailed("resourceVersion compare-and-swap lost")
+            state["spec"].update(patch["spec"])  # type: ignore[index]
+            state["metadata"]["generation"] += 1  # type: ignore[index]
+            state["metadata"]["resourceVersion"] = str(  # type: ignore[index]
+                int(state["metadata"]["resourceVersion"]) + 1  # type: ignore[index]
+            )
+            return deepcopy(state)
+
+    monkeypatch.setattr(target, "_json", apply)
+    before = target._observe(state, "cpu-api")
+
+    def takeover(token: int) -> object:
+        try:
+            return target.authorize_scale(
+                "cpu-api",
+                token,
+                expected=before,
+                plan_id="plan-1",
+                operation_id="action-1",
+                target_replicas=3,
+            )
+        except TargetPreconditionFailed as error:
+            return error
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(takeover, (100, 101)))
+
+    winner = max(
+        (value for value in outcomes if isinstance(value, dict)),
+        key=lambda value: value["fencing_token"],
+    )
+    if winner["fencing_token"] < 101:
+        current = target.observe_scale("cpu-api")
+        winner = target.authorize_scale(
+            "cpu-api",
+            101,
+            expected=current,
+            plan_id="plan-1",
+            operation_id="action-1",
+            target_replicas=3,
+        )
+    assert winner["fencing_token"] == 101
+    assert winner["replicas"] == 3
+    assert winner["execution_request"]["operationID"] == "action-1"
 
 
 def test_eviction_distinguishes_pdb_429_from_api_throttling(

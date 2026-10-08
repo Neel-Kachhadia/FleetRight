@@ -10,14 +10,19 @@ metadata:
   namespace: fleetright
 automountServiceAccountToken: false
 ---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fleetright-v2
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: fleetright-executor
-  namespace: fleetright
+  namespace: fleetright-v2
 rules:
-  - apiGroups: ["apps"]
-    resources: ["deployments"]
+  - apiGroups: ["fleetright.io"]
+    resources: ["fleetrightworkloads"]
     resourceNames: ["cpu-api"]
     verbs: ["get", "patch"]
 ---
@@ -25,7 +30,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: fleetright-executor
-  namespace: fleetright
+  namespace: fleetright-v2
 subjects:
   - kind: ServiceAccount
     name: fleetright-controller

@@ -18,7 +18,12 @@ from fleetright.control import (
     Repository,
     transition_allowed,
 )
-from fleetright.execution import OutcomeUnknown, TargetNotFound, TargetPreconditionFailed
+from fleetright.execution import (
+    ActionBlocked,
+    OutcomeUnknown,
+    TargetNotFound,
+    TargetPreconditionFailed,
+)
 from fleetright.reconciler import ExecutionController
 from psycopg import sql
 from psycopg.conninfo import make_conninfo
@@ -199,6 +204,135 @@ class FakeScaleTarget:
             self.lose_next_response = False
             raise OutcomeUnknown("injected lost mutation response")
         return result
+
+
+class FakeFleetRightWorkloadTarget:
+    supports_workload_execution = True
+
+    def __init__(self, replicas: int, *, lose_next_response: bool = False) -> None:
+        self.uid = "deployment-uid"
+        self.generation = 1
+        self.resource_version = "1"
+        self.replicas = replicas
+        self.observed_replicas = replicas
+        self.ready_replicas = replicas
+        self.available_replicas = replicas
+        self.availability_floor = replicas
+        self.observed_generation = 1
+        self.fencing_token = 0
+        self.execution_request: dict[str, object] | None = None
+        self.execution: dict[str, object] | None = None
+        self.reconciled = True
+        self.lose_next_response = lose_next_response
+        self.authorizations = 0
+
+    def observe_scale(self, _workload_id: str) -> dict[str, object]:
+        return {
+            "uid": self.uid,
+            "generation": self.generation,
+            "resource_version": self.resource_version,
+            "generation_tracks_spec": True,
+            "workload_execution": True,
+            "replicas": self.replicas,
+            "observed_replicas": self.observed_replicas,
+            "ready_replicas": self.ready_replicas,
+            "available_replicas": self.available_replicas,
+            "availability_floor": self.availability_floor,
+            "observed_generation": self.observed_generation,
+            "fencing_token": self.fencing_token,
+            "execution_request": self.execution_request,
+            "execution": self.execution,
+            "reconciled": self.reconciled,
+        }
+
+    def authorize_scale(
+        self,
+        _workload_id: str,
+        token: int,
+        *,
+        expected: dict[str, object],
+        plan_id: str,
+        operation_id: str,
+        target_replicas: int,
+    ) -> dict[str, object]:
+        current = self.observe_scale(_workload_id)
+        if any(current.get(key) != expected.get(key) for key in ("uid", "generation", "replicas")):
+            raise TargetPreconditionFailed("workload precondition changed")
+        same = (
+            isinstance(self.execution_request, dict)
+            and self.execution_request.get("planID") == plan_id
+            and self.execution_request.get("operationID") == operation_id
+            and self.execution_request.get("targetReplicas") == target_replicas
+        )
+        if token <= self.fencing_token:
+            raise TargetPreconditionFailed("newer workload execution generation exists")
+        if target_replicas < self.replicas:
+            raise ActionBlocked("WORKLOAD_SCALE_DOWN_DISABLED")
+        if (
+            self.execution_request is not None
+            and not same
+            and not (
+                isinstance(self.execution, dict)
+                and self.execution.get("phase") == "APPLIED"
+                and self.observed_generation == self.generation
+            )
+        ):
+            raise ActionBlocked("PRIOR_WORKLOAD_OPERATION_UNRESOLVED")
+        self.fencing_token = token
+        self.execution_request = {
+            "planID": plan_id,
+            "operationID": operation_id,
+            "generation": token,
+            "expectedReplicas": self.replicas,
+            "targetReplicas": target_replicas,
+        }
+        self.replicas = target_replicas
+        self.generation += 1
+        self.resource_version = str(int(self.resource_version) + 1)
+        self.reconciled = False
+        self.authorizations += 1
+        return {**self.observe_scale(_workload_id), "fence_precondition": expected}
+
+    def set_replicas(
+        self,
+        _workload_id: str,
+        replicas: int,
+        _observed: dict[str, object],
+        *,
+        expected_replicas: int,
+        fencing_token: int,
+        plan_id: str,
+        operation_id: str,
+    ) -> dict[str, object]:
+        if (
+            self.fencing_token != fencing_token
+            or self.replicas != replicas
+            or not isinstance(self.execution_request, dict)
+            or self.execution_request.get("planID") != plan_id
+            or self.execution_request.get("operationID") != operation_id
+            or self.execution_request.get("targetReplicas") != replicas
+            or expected_replicas > replicas
+        ):
+            raise TargetPreconditionFailed("durable workload authorization changed")
+        if self.lose_next_response:
+            self.lose_next_response = False
+            raise OutcomeUnknown("injected lost workload authorization response")
+        return {**self.observe_scale(_workload_id), "applied": True}
+
+    def mark_applied(self) -> None:
+        assert isinstance(self.execution_request, dict)
+        self.execution = {
+            **{
+                key: self.execution_request[key]
+                for key in ("planID", "operationID", "generation", "targetReplicas")
+            },
+            "phase": "APPLIED",
+        }
+        self.observed_generation = self.generation
+        self.observed_replicas = self.replicas
+        self.ready_replicas = self.replicas
+        self.available_replicas = self.replicas
+        self.reconciled = True
 
 
 class FakeHealth:
@@ -1003,6 +1137,55 @@ def test_cancel_fences_unknown_not_applied_request_before_terminal_action(
     assert execution["status"] == "CANCELLED"
     assert target.mutations == []
     assert target.fence_calls == 2
+
+
+def test_cancel_keeps_workload_outcome_unknown_until_controller_applies_it(
+    clean_database: Database,
+) -> None:
+    repo = clean_database.repository
+    controller, _legacy_target, _health = _prepare_controller(repo, "workload-cancel-unknown", 8, 9)
+    target = FakeFleetRightWorkloadTarget(8, lose_next_response=True)
+    controller.target = target
+    controller.run_once()
+
+    with repo.transaction() as conn:
+        action = conn.execute(
+            "SELECT execution_state FROM action_intents WHERE plan_id = 'workload-cancel-unknown'"
+        ).fetchone()
+        assert action["execution_state"] == "OUTCOME_UNKNOWN"
+        Repository.request_execution_control(
+            conn, "workload-cancel-unknown", "CANCEL", "operator cancel"
+        )
+
+    for _ in range(4):
+        controller.run_once()
+    with repo.transaction() as conn:
+        action = conn.execute(
+            "SELECT execution_state FROM action_intents WHERE plan_id = 'workload-cancel-unknown'"
+        ).fetchone()
+        execution = conn.execute(
+            "SELECT status FROM plan_executions WHERE plan_id = 'workload-cancel-unknown'"
+        ).fetchone()
+    assert action["execution_state"] == "OUTCOME_UNKNOWN"
+    assert execution["status"] == "EXECUTING"
+    assert target.observed_replicas == 8
+    assert target.replicas == 9
+
+    target.mark_applied()
+    for _ in range(5):
+        controller.run_once()
+
+    with repo.transaction() as conn:
+        action = conn.execute(
+            "SELECT execution_state FROM action_intents WHERE plan_id = 'workload-cancel-unknown'"
+        ).fetchone()
+        execution = conn.execute(
+            "SELECT status FROM plan_executions WHERE plan_id = 'workload-cancel-unknown'"
+        ).fetchone()
+    assert action["execution_state"] == "SUCCEEDED"
+    assert execution["status"] == "CANCELLED"
+    assert target.authorizations == 2
+    assert target.replicas == target.observed_replicas == 9
 
 
 @pytest.mark.parametrize("control, terminal", [("CANCEL", "CANCELLED"), ("PAUSE", "PAUSED")])

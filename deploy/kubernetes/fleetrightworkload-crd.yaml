@@ -31,6 +31,9 @@ spec:
         - name: Available
           type: string
           jsonPath: .status.conditions[?(@.type=="Available")].status
+        - name: Reconciled
+          type: string
+          jsonPath: .status.conditions[?(@.type=="Reconciled")].status
         - name: Age
           type: date
           jsonPath: .metadata.creationTimestamp
@@ -56,9 +59,39 @@ spec:
                   message: podTemplate is immutable until a rollout protocol exists
                 - rule: self.placement == oldSelf.placement
                   message: placement is immutable until a placement update protocol exists
+                - rule: self.availabilityFloor == oldSelf.availabilityFloor
+                  message: availabilityFloor is immutable for monotonic execution
+                - rule: self.disruption == oldSelf.disruption
+                  message: disruption policy is immutable for monotonic execution
+                - rule: self.surgeBudget == oldSelf.surgeBudget
+                  message: surgeBudget is immutable for monotonic execution
+                - rule: self.replicas >= oldSelf.replicas
+                  message: replicas cannot decrease through this execution protocol
+                - rule: "!has(self.executionRequest) || self.executionProtocol == 'monotonic-scale-up-v1'"
+                  message: execution requests require a workload created for monotonic scale-up
+                - rule: "!has(oldSelf.executionProtocol) || self.executionProtocol == oldSelf.executionProtocol"
+                  message: executionProtocol is immutable
+                - rule: "has(oldSelf.executionProtocol) || !has(self.executionProtocol)"
+                  message: legacy workloads cannot be promoted into the execution protocol
+                - rule: "!has(oldSelf.executionRequest) || has(self.executionRequest)"
+                  message: executionRequest cannot be removed
+                - rule: "!has(oldSelf.executionRequest) || !has(self.executionRequest) || self.executionRequest.generation >= oldSelf.executionRequest.generation"
+                  message: execution generation cannot decrease
+                - rule: "!has(oldSelf.executionRequest) || !has(self.executionRequest) || (self.executionRequest.planID == oldSelf.executionRequest.planID && self.executionRequest.operationID == oldSelf.executionRequest.operationID) || self.executionRequest.generation > oldSelf.executionRequest.generation"
+                  message: changing operation identity requires a higher execution generation
+                - rule: "!has(oldSelf.executionRequest) || !has(self.executionRequest) || self.executionRequest.generation > oldSelf.executionRequest.generation || self.executionRequest == oldSelf.executionRequest"
+                  message: changing an execution request requires a higher generation
+                - rule: "!has(self.executionRequest) || self.executionRequest.targetReplicas == self.replicas"
+                  message: execution request target must equal desired replicas
+                - rule: "self.replicas <= oldSelf.replicas || (self.executionProtocol == 'monotonic-scale-up-v1' && has(self.executionRequest) && self.executionRequest.expectedReplicas == oldSelf.replicas && self.executionRequest.targetReplicas == self.replicas && (!has(oldSelf.executionRequest) || self.executionRequest.generation > oldSelf.executionRequest.generation))"
+                  message: replica growth requires a new durable execution request
                 - rule: self.availabilityFloor <= self.replicas
                   message: availabilityFloor cannot exceed replicas
               properties:
+                executionProtocol:
+                  type: string
+                  enum: [monotonic-scale-up-v1]
+                  description: Must be set at workload creation; legacy objects cannot be promoted in place.
                 workloadID:
                   type: string
                   minLength: 1
@@ -71,6 +104,32 @@ spec:
                   minimum: 0
                   maximum: 1000
                   default: 1
+                executionRequest:
+                  type: object
+                  required: [planID, operationID, generation, expectedReplicas, targetReplicas]
+                  properties:
+                    planID:
+                      type: string
+                      minLength: 1
+                      maxLength: 128
+                    operationID:
+                      type: string
+                      minLength: 1
+                      maxLength: 128
+                    generation:
+                      type: integer
+                      format: int64
+                      minimum: 1
+                    expectedReplicas:
+                      type: integer
+                      format: int32
+                      minimum: 0
+                      maximum: 1000
+                    targetReplicas:
+                      type: integer
+                      format: int32
+                      minimum: 0
+                      maximum: 1000
                 availabilityFloor:
                   type: integer
                   format: int32
@@ -334,6 +393,25 @@ spec:
                         type: integer
                         format: int32
                         minimum: 0
+                execution:
+                  type: object
+                  required: [planID, operationID, generation, targetReplicas, phase]
+                  properties:
+                    planID:
+                      type: string
+                    operationID:
+                      type: string
+                    generation:
+                      type: integer
+                      format: int64
+                      minimum: 1
+                    targetReplicas:
+                      type: integer
+                      format: int32
+                      minimum: 0
+                    phase:
+                      type: string
+                      enum: [RECONCILING, APPLIED, BLOCKED]
                 conditions:
                   type: array
                   x-kubernetes-list-type: map
