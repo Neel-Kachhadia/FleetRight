@@ -1,0 +1,69 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cpu-api
+  namespace: fleetright
+spec:
+  replicas: 3
+  selector:
+    matchLabels: {fleetright.io/workload: cpu-api}
+  template:
+    metadata:
+      labels: {fleetright.io/workload: cpu-api}
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels: {fleetright.io/workload: cpu-api}
+      containers:
+        - name: cpu-api
+          image: fleetright-workload:local
+          imagePullPolicy: IfNotPresent
+          ports: [{name: http, containerPort: 8080}]
+          env:
+            - {name: WORKLOAD_MODE, value: cpu}
+            - {name: SERVICE_MS, value: "4"}
+            - {name: SERVICE_DISTRIBUTION, value: jittered}
+            - {name: COLD_START_MS, value: "3000"}
+            - {name: WARMUP_MS, value: "2000"}
+            - {name: LATENCY_SLO_MS, value: "120"}
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: 500m, memory: 512Mi}
+          startupProbe:
+            httpGet: {path: /ready, port: http}
+            periodSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: {path: /ready, port: http}
+            periodSeconds: 2
+          livenessProbe:
+            httpGet: {path: /ready, port: http}
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            capabilities: {drop: [ALL]}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cpu-api
+  namespace: fleetright
+spec:
+  selector: {fleetright.io/workload: cpu-api}
+  ports: [{name: http, port: 8080, targetPort: http}]
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: cpu-api
+  namespace: fleetright
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels: {fleetright.io/workload: cpu-api}

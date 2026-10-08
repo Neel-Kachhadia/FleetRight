@@ -50,3 +50,32 @@
   count, and the limitation is reported.
 
 No model opinion overrides compiler, test, sanitizer, fuzz, or measured benchmark evidence.
+
+## Prompt 2B execution review
+
+- GPT-6.1 Sol Max reviewed durable intent ordering, ambiguity, fencing, recovery, pause/cancel,
+  scale-down progression, readiness, and compensation. The follow-up fixes added target-side fencing
+  before mutation, unresolved-action recovery, a one-replica destructive step, health verification,
+  and persisted compensation.
+- Claude Sonnet 5.5 High reviewed the Prompt 2B implementation once through the first-party
+  subscription CLI. It found six material issues: unresolved actions could wedge, scale-out could
+  compensate by scaling down, approval bound a volatile Kubernetes resourceVersion, terminal
+  failures leaked leases, scale-down could use stale health, and caller data could relax health
+  limits. Fixes added observed-state failure resolution (including deleted targets), scale-in-only
+  compensation, fresh resourceVersion CAS at mutation time, shared terminal lease release, fresh
+  sample gating, and server-owned health ceilings. It also identified re-dispatch after a known
+  response/external revert and broader Kubernetes RBAC defaults; those were fixed with regressions
+  and a named-resource Role.
+- Regression evidence: focused Prompt 2B/2A suite passed after the fixes (see final report for the
+  final count). The Sonnet packet excluded `docs/implementation.md` because of a credential-pattern
+  scan; the reviewer did not read that file. The call completed successfully and was not replayed.
+
+## Prompt 2B final validation
+
+- Focused execution/journal/API regression: 47 passed. Full Python suite: 81 passed. Ruff lint,
+  formatting, compileall, Compose configuration, and `git diff --check` passed. Secret scanning
+  reported zero findings. A real Docker Compose adapter smoke run changed the target from zero to
+  one running container, observed readiness and fresh health metrics, then cleaned up.
+- Local Kubernetes validation is blocked: kind, k3d, kubectl, and the kind node image were absent.
+  Kubernetes API/runtime behavior, PDB and drain behavior, ServiceAccount denial, and the real
+  cluster E2E remain unverified. No Prompt 2B milestone tag is appropriate with these gates open.

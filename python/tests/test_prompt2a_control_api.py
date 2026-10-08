@@ -424,8 +424,8 @@ def test_authenticated_api_idempotency_approval_restart_and_fail_closed_execute(
             },
             json={},
         )
-        assert execute.status_code == 501
-        assert execute.json()["detail"] == "execution-layer-not-enabled"
+        assert execute.status_code == 409
+        assert execute.json()["detail"] == "execution-mode-not-enabled"
 
     restarted = Repository(clean_database.dsn)
     assert restarted.get_plan(plan_id)["state"] == "APPROVED"
@@ -443,11 +443,119 @@ def test_authenticated_api_idempotency_approval_restart_and_fail_closed_execute(
             ).fetchone()["n"]
             == 2
         )
-        assert conn.execute("SELECT count(*) AS n FROM idempotency_keys").fetchone()["n"] >= 3
-        assert conn.execute("SELECT count(*) AS n FROM plan_leases").fetchone()["n"] > 0
-        audit = conn.execute("SELECT actor, role, reason FROM audit_events").fetchall()
+        assert conn.execute("SELECT count(*) AS n FROM idempotency_keys").fetchone()["n"] >= 2
+
+
+def test_execute_mode_is_authenticated_async_and_idempotent(clean_database: Database) -> None:
+    tokens, raw_tokens = _tokens()
+
+    class NoMutationTarget:
+        calls = 0
+
+        def observe_scale(self, _workload_id: str) -> dict[str, object]:
+            return {
+                "uid": "compose/cpu-service",
+                "generation": 1,
+                "resource_version": "1",
+                "replicas": 3,
+                "ready_replicas": 3,
+            }
+
+    app = create_app(
+        clean_database.repository,
+        tokens=tokens,
+        mode="EXECUTE",
+        execution_target="docker",
+        target_adapter=NoMutationTarget(),
+        health_observer=object(),
+        start_execution_worker=False,
+    )
+    with TestClient(app) as client:
+        now_ms = time.time_ns() // 1_000_000
+        samples = [
+            {
+                "observed_at_ms": now_ms - (120 - index) * 60_000,
+                "qps_milli": 1_500_000,
+                "concurrency": 210,
+            }
+            for index in range(120)
+        ]
+        snapshot = _snapshot(now_ms, predictive_scale_out=True)
+        for node in snapshot["nodes"][4:]:
+            node["active"] = False
+        optimized = client.post(
+            "/v1/optimize",
+            headers={
+                "Authorization": f"Bearer {raw_tokens['recommender']}",
+                "Idempotency-Key": "execute-plan-optimize",
+            },
+            json={
+                "snapshot": snapshot,
+                "history": {"cpu-api": samples},
+                "model": "ewma_trend",
+                "scheduling_buffer_ms": 30_000,
+                "scale_in_evidence": _observed_scale_in_evidence(now_ms),
+            },
+        )
+        assert optimized.status_code == 201, optimized.text
+        plan = optimized.json()
+        plan_id = plan["plan_id"]
+        operator = f"Bearer {raw_tokens['operator']}"
+        approved = client.post(
+            f"/v1/plans/{plan_id}/approve",
+            headers={"Authorization": operator, "Idempotency-Key": "approve-execute"},
+            json={},
+        )
+        assert approved.status_code == 200
+        unauthorized = client.post(
+            f"/v1/plans/{plan_id}/execute",
+            headers={"Idempotency-Key": "unauthorized-execute"},
+            json={},
+        )
+        assert unauthorized.status_code == 401
+        headers = {"Authorization": operator, "Idempotency-Key": "execute-once"}
+        accepted = client.post(f"/v1/plans/{plan_id}/execute", headers=headers, json={})
+        replayed = client.post(f"/v1/plans/{plan_id}/execute", headers=headers, json={})
+        assert accepted.status_code == 202, accepted.text
+        assert replayed.status_code == 202, replayed.text
+        assert accepted.json() == replayed.json()
+        assert accepted.json()["state"] == "EXECUTING"
+        with clean_database.repository.transaction() as conn:
+            execution = conn.execute(
+                "SELECT status FROM plan_executions WHERE plan_id = %s", (plan_id,)
+            ).fetchone()
+            action_states = conn.execute(
+                "SELECT execution_state, attempt_number FROM action_intents "
+                "WHERE plan_id = %s ORDER BY action_sequence",
+                (plan_id,),
+            ).fetchall()
+            plan_lease_count = conn.execute(
+                "SELECT count(*) AS n FROM plan_leases WHERE plan_id = %s", (plan_id,)
+            ).fetchone()["n"]
+            audit = conn.execute(
+                "SELECT actor, role, reason FROM audit_events WHERE plan_id = %s", (plan_id,)
+            ).fetchall()
+        assert execution["status"] == "EXECUTING"
+        assert action_states
+        assert all(
+            row["execution_state"] == "NOT_STARTED" and row["attempt_number"] == 0
+            for row in action_states
+        )
+        assert app.state.execution_target == "docker"
+        assert plan_lease_count > 0
         serialized = repr(audit)
         assert all(token not in serialized for token in raw_tokens.values())
+        detail = client.get(
+            f"/v1/plans/{plan_id}",
+            headers={"Authorization": f"Bearer {raw_tokens['viewer']}"},
+        )
+        assert detail.status_code == 200
+        assert detail.json()["execution"]["status"] == "EXECUTING"
+        assert detail.json()["execution"]["controller_fencing_token"] > 0
+        assert all(
+            action["execution_state"] == "NOT_STARTED"
+            for action in detail.json()["candidate_actions"]
+        )
 
 
 def test_pause_cancel_release_ownership_and_prevent_resurrection(

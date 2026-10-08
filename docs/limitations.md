@@ -35,7 +35,18 @@ control API. Forecast coverage is evaluated on historical test windows only; no 
 history has been supplied for model calibration. The control API uses a single cluster-wide
 workload/node lease set, so parallel planning for independent workloads is not supported yet.
 
-Live Docker execution and live Kubernetes execution are intentionally not enabled in Prompt 2A.
-PDB handling, node drain behavior, external ambiguous-side-effect recovery, and real compensation
-remain deferred to Prompt 2B or later. The PostgreSQL control-plane profile manages the local DB;
-the API runs as a loopback-bound local process and uses the checked-out planner/verifier binaries.
+Prompt 2B adds live Docker Compose and Kubernetes Deployment replica scaling behind explicit
+`EXECUTE` configuration. The Docker fence is host-local and Docker Compose's fixed published ports
+limit the checked-in service harness to one replica per service. Kubernetes execution must use an
+explicit namespace-scoped kubeconfig; kind/k3d, kubectl, and a local Kubernetes image were not
+available for this run, so Kubernetes runtime, readiness, topology, PDB, and RBAC behavior were not
+validated against a cluster. The documented optimize-to-approve-to-execute API runbook was not
+exercised end-to-end; API idempotency was tested with a fake target, and the real Docker adapter
+was exercised separately.
+
+Only immutable replica-count actions are executable. `MOVE_REPLICA`, node deactivation/drain, and
+resource resizing are rejected before journal creation. Although the Kubernetes target code has
+PDB-aware eviction helpers, eviction and node drain are not wired to the durable reconciler, so
+PDB-blocked retry and partial-drain recovery are not supported. SHADOW produces recommendations
+without a separate simulated reconciliation pass. The API runs as a loopback-bound local process
+and invokes the checked-out planner/verifier binaries.

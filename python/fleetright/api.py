@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 from copy import deepcopy
@@ -17,6 +18,7 @@ from typing import Any, Literal
 import psycopg
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
+from psycopg.types.json import Jsonb
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -24,12 +26,22 @@ from fleetright.contracts import decode_text, encode_snapshot
 from fleetright.control import (
     ArtifactIntegrityError,
     ControlError,
+    ExecutionConflict,
     IdempotencyConflict,
     LeaseConflict,
     Repository,
     StaleState,
     canonical_json,
     transition_allowed,
+)
+from fleetright.execution import (
+    DockerComposeTarget,
+    KubernetesTarget,
+    TargetError,
+    TargetNotFound,
+    WorkloadHealthObserver,
+    bounded_execution_health_policy,
+    valid_execution_health_policy,
 )
 from fleetright.forecast import (
     DemandForecast,
@@ -41,6 +53,7 @@ from fleetright.forecast import (
     forecast_decision,
     scale_in_eligibility,
 )
+from fleetright.reconciler import ExecutionController
 
 ROOT = Path(__file__).resolve().parents[2]
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
@@ -50,6 +63,7 @@ ROLES = {"viewer", "recommender", "operator", "admin"}
 READ_ROLES = ROLES
 OPTIMIZE_ROLES = {"recommender", "operator", "admin"}
 OPERATOR_ROLES = {"operator", "admin"}
+EXECUTION_WORKLOADS = {"cpu-api", "memory-api", "queued-api"}
 
 
 class StrictModel(BaseModel):
@@ -867,26 +881,106 @@ def _public_plan(row: dict[str, object]) -> dict[str, object]:
     return result
 
 
+def _supported_execution_workloads(target: str | None) -> set[str]:
+    return {"cpu-api"} if target == "kubernetes" else EXECUTION_WORKLOADS
+
+
 def create_app(
     repository: Repository | None = None,
     *,
     tokens: dict[str, Principal] | None = None,
     mode: str | None = None,
     controller_id: str | None = None,
+    execution_target: str | None = None,
+    target_adapter: Any | None = None,
+    health_observer: Any | None = None,
+    start_execution_worker: bool | None = None,
 ) -> FastAPI:
     if repository is None:
         database_url = os.getenv("FLEETRIGHT_DATABASE_URL", "")
         repository = Repository(database_url) if database_url else None
     token_hashes = _token_index(tokens)
     configured_mode = mode or os.getenv("FLEETRIGHT_MODE", "RECOMMEND")
-    if configured_mode not in {"OBSERVE", "RECOMMEND", "SHADOW"}:
-        raise RuntimeError("FLEETRIGHT_MODE must be OBSERVE, RECOMMEND or SHADOW")
+    if configured_mode not in {"OBSERVE", "RECOMMEND", "SHADOW", "EXECUTE"}:
+        raise RuntimeError("FLEETRIGHT_MODE must be OBSERVE, RECOMMEND, SHADOW or EXECUTE")
+    target_name = execution_target or os.getenv("FLEETRIGHT_EXECUTION_TARGET", "")
+    if (
+        configured_mode == "EXECUTE"
+        and not target_adapter
+        and target_name
+        not in {
+            "docker",
+            "kubernetes",
+        }
+    ):
+        raise RuntimeError("EXECUTE mode requires FLEETRIGHT_EXECUTION_TARGET=docker or kubernetes")
     instance_id = controller_id or f"controller-{uuid.uuid4()}"
-    app = FastAPI(title="FleetRight Control API", version="2.0a")
+    app = FastAPI(title="FleetRight Control API", version="2.0b")
     app.state.repository = repository
     app.state.tokens = token_hashes
     app.state.mode = configured_mode
     app.state.controller_id = instance_id
+    app.state.execution_enabled = configured_mode == "EXECUTE"
+    app.state.execution_target = target_name
+    if app.state.execution_enabled:
+        if target_adapter:
+            target = target_adapter
+        elif target_name == "docker":
+            target = DockerComposeTarget()
+        else:
+            kubeconfig = os.getenv("FLEETRIGHT_KUBERNETES_KUBECONFIG", "")
+            namespace = os.getenv("FLEETRIGHT_KUBERNETES_NAMESPACE", "")
+            if not kubeconfig:
+                raise RuntimeError(
+                    "Kubernetes EXECUTE requires an explicit least-privilege kubeconfig"
+                )
+            if namespace != "fleetright":
+                raise RuntimeError("Kubernetes EXECUTE requires namespace fleetright")
+            target = KubernetesTarget(kubeconfig=kubeconfig, namespace=namespace)
+        health = health_observer or WorkloadHealthObserver()
+        app.state.execution_controller = ExecutionController(
+            repository,
+            target,
+            health,
+            instance_id,
+            lease_ttl_ms=int(os.getenv("FLEETRIGHT_EXECUTION_LEASE_TTL_MS", "120000")),
+            max_attempts=2,
+            readiness_timeout_seconds=float(
+                os.getenv("FLEETRIGHT_READINESS_TIMEOUT_SECONDS", "60")
+            ),
+            poll_seconds=float(os.getenv("FLEETRIGHT_RECONCILE_POLL_SECONDS", "1")),
+        )
+    else:
+        app.state.execution_controller = None
+    app.state.execution_stop = None
+    app.state.execution_thread = None
+    run_worker = (
+        configured_mode == "EXECUTE" if start_execution_worker is None else start_execution_worker
+    )
+
+    def start_execution_worker_fn() -> None:
+        if not run_worker or app.state.execution_controller is None:
+            return
+        stop = threading.Event()
+        worker = threading.Thread(
+            target=app.state.execution_controller.run_forever,
+            args=(stop,),
+            name="fleetright-execution-reconciler",
+            daemon=True,
+        )
+        app.state.execution_stop = stop
+        app.state.execution_thread = worker
+        worker.start()
+
+    def stop_execution_worker_fn() -> None:
+        stop, worker = app.state.execution_stop, app.state.execution_thread
+        if stop is not None:
+            stop.set()
+        if worker is not None:
+            worker.join(timeout=70)
+
+    app.router.on_startup.append(start_execution_worker_fn)
+    app.router.on_shutdown.append(stop_execution_worker_fn)
     app.add_middleware(RequestSizeLimit, maximum=MAX_REQUEST_BYTES)
 
     @app.middleware("http")
@@ -906,7 +1000,7 @@ def create_app(
 
     @app.get("/healthz")
     def healthz():
-        return {"status": "ok", "execution_enabled": False}
+        return {"status": "ok", "execution_enabled": app.state.execution_enabled}
 
     @app.get("/readyz")
     def readyz():
@@ -922,7 +1016,7 @@ def create_app(
         state = repo.current_state()
         return {
             "mode": app.state.mode,
-            "execution_enabled": False,
+            "execution_enabled": app.state.execution_enabled,
             "snapshot_id": None if state is None else state["snapshot_id"],
             "snapshot_generation": None if state is None else state["snapshot_generation"],
         }
@@ -1255,6 +1349,11 @@ def create_app(
                             "proposed_replicas": decision["proposed_replicas"],
                             "current_resources": current["current_resources"],
                             "proposed_resources": decision["proposed_resources"],
+                            "health": bounded_execution_health_policy(
+                                decision["workload_id"],
+                                current["latency_slo_ms"],
+                                current["error_slo_ppm"],
+                            ),
                         }
                         action_type = (
                             "SET_REPLICA_COUNT"
@@ -1367,7 +1466,7 @@ def create_app(
         return _mutate_plan(plan_id, body, request, principal, idempotency_key, "cancel", app)
 
     @app.post("/v1/plans/{plan_id}/execute")
-    def execute_not_enabled(
+    def execute_plan(
         plan_id: str,
         body: OperationRequest,
         request: Request,
@@ -1375,35 +1474,174 @@ def create_app(
         principal: Principal = Depends(_require(*OPERATOR_ROLES)),
     ):
         repo = require_repository()
+        if not app.state.execution_enabled or app.state.execution_controller is None:
+            raise HTTPException(status_code=409, detail="execution-mode-not-enabled")
         key = _required_idempotency_key(idempotency_key)
         operation = f"execute:{plan_id}"
-        result = {"plan_id": plan_id, "state": None, "detail": "execution-layer-not-enabled"}
+        request_id = _request_id(request)
+        request_body = body.model_dump(mode="json")
         try:
             with repo.transaction() as conn:
-                prior = Repository.begin_idempotent(
-                    conn, principal.name, operation, key, body.model_dump(mode="json")
+                claim = Repository.claim_execution(
+                    conn,
+                    plan_id,
+                    principal.name,
+                    key,
+                    request_body,
+                    app.state.controller_id,
+                    int(os.getenv("FLEETRIGHT_EXECUTION_LEASE_TTL_MS", "120000")),
                 )
-                if prior is not None:
-                    return JSONResponse(status_code=prior[0], content=prior[1])
+                if claim.get("response_status") is not None:
+                    return JSONResponse(
+                        status_code=claim["response_status"], content=claim["response"]
+                    )
+                if not claim.get("claimed"):
+                    execution = claim.get("execution", {})
+                    result = {
+                        "plan_id": plan_id,
+                        "state": execution.get("status", "EXECUTING"),
+                        "execution_id": plan_id,
+                    }
+                    Repository.finish_idempotent(conn, principal.name, operation, key, 202, result)
+                    return JSONResponse(status_code=202, content=result)
+
+                row = conn.execute(
+                    "SELECT * FROM plans WHERE plan_id = %s FOR UPDATE", (plan_id,)
+                ).fetchone()
+                if row is None:
+                    raise KeyError(plan_id)
+                state = conn.execute(
+                    "SELECT binding FROM control_state WHERE singleton FOR SHARE"
+                ).fetchone()
+                source_binding = row["binding"].get("source", {})
+                stale_reason = None
+                if state is None or state["binding"] != source_binding:
+                    stale_reason = "base-snapshot-policy-profile-or-catalog-changed"
+                elif _database_now_ms(conn) >= row["expires_at_ms"]:
+                    stale_reason = "plan-expired"
+                if stale_reason:
+                    conn.execute("DELETE FROM plan_executions WHERE plan_id = %s", (plan_id,))
+                    Repository.release_plan_leases(conn, plan_id)
+                    Repository.transition_plan(
+                        conn,
+                        plan_id,
+                        "STALE",
+                        principal.name,
+                        principal.role,
+                        stale_reason,
+                        request_id,
+                        key,
+                    )
+                    result = {"plan_id": plan_id, "state": "STALE", "detail": stale_reason}
+                    Repository.audit(
+                        conn,
+                        actor=principal.name,
+                        role=principal.role,
+                        request_id=request_id,
+                        operation=operation,
+                        plan_id=plan_id,
+                        snapshot_id=row["snapshot_id"],
+                        idempotency_key=key,
+                        before_state="APPROVED",
+                        after_state="STALE",
+                        result="DENIED",
+                        reason=stale_reason,
+                    )
+                    Repository.finish_idempotent(conn, principal.name, operation, key, 409, result)
+                    return JSONResponse(status_code=409, content=result)
+
+                artifacts = Repository.load_artifacts(conn, plan_id)
+                if not {"effective_snapshot.pb", "plan.pb", "verification.pb"}.issubset(artifacts):
+                    raise ArtifactIntegrityError("replay artifacts missing")
+                verifier_ok, verification_hash, verifier_build_id = _run_verifier(
+                    artifacts["effective_snapshot.pb"], artifacts["plan.pb"]
+                )
+                if (
+                    not verifier_ok
+                    or verification_hash != row["verification_hash"].strip()
+                    or verifier_build_id != row["verifier_build_id"]
+                    or not row["verification_accepted"]
+                    or not row["admission_accepted"]
+                ):
+                    raise ArtifactIntegrityError("independent verification no longer passes")
+                actions = conn.execute(
+                    "SELECT action_type, workload_id, payload FROM action_intents "
+                    "WHERE plan_id = %s ORDER BY action_sequence",
+                    (plan_id,),
+                ).fetchall()
+                if not actions:
+                    raise ControlError("plan has no executable action")
+                for action in actions:
+                    payload = action["payload"]
+                    if (
+                        action["action_type"] != "SET_REPLICA_COUNT"
+                        or not isinstance(action["workload_id"], str)
+                        or not re.fullmatch(
+                            r"[a-z0-9](?:[-a-z0-9]*[a-z0-9])?", action["workload_id"]
+                        )
+                        or not isinstance(payload, dict)
+                        or not isinstance(payload.get("current_replicas"), int)
+                        or not isinstance(payload.get("proposed_replicas"), int)
+                        or not isinstance(payload.get("target_precondition"), dict)
+                        or not valid_execution_health_policy(
+                            action["workload_id"], payload.get("health")
+                        )
+                        or payload.get("current_resources") != payload.get("proposed_resources")
+                    ):
+                        raise ControlError("plan contains an unsupported execution action")
+                    if action["workload_id"] not in _supported_execution_workloads(
+                        app.state.execution_target
+                    ):
+                        raise ControlError("plan target is outside the supported workload set")
+
+                Repository.transition_plan(
+                    conn,
+                    plan_id,
+                    "EXECUTING",
+                    principal.name,
+                    principal.role,
+                    body.reason,
+                    request_id,
+                    key,
+                )
+                result = {
+                    "plan_id": plan_id,
+                    "execution_id": plan_id,
+                    "state": "EXECUTING",
+                    "target": app.state.execution_target or "injected",
+                }
                 Repository.audit(
                     conn,
                     actor=principal.name,
                     role=principal.role,
-                    request_id=_request_id(request),
+                    request_id=request_id,
                     operation=operation,
                     plan_id=plan_id,
+                    snapshot_id=row["snapshot_id"],
                     idempotency_key=key,
-                    result="REJECTED",
-                    reason="execution-layer-not-enabled",
+                    before_state="APPROVED",
+                    after_state="EXECUTING",
+                    result="ACCEPTED",
+                    reason=body.reason,
                 )
-                Repository.finish_idempotent(conn, principal.name, operation, key, 501, result)
+                Repository.finish_idempotent(conn, principal.name, operation, key, 202, result)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="plan-not-found") from error
         except IdempotencyConflict as error:
             raise HTTPException(
                 status_code=409, detail="idempotency-key-reused-with-different-request"
             ) from error
+        except ExecutionConflict as error:
+            raise HTTPException(status_code=409, detail="execution-already-claimed") from error
+        except ArtifactIntegrityError as error:
+            raise HTTPException(
+                status_code=409, detail="independent-verification-failed"
+            ) from error
+        except (ControlError, LeaseConflict, StaleState) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
         except psycopg.Error as error:
             raise HTTPException(status_code=503, detail="control-database-error") from error
-        return JSONResponse(status_code=501, content=result)
+        return JSONResponse(status_code=202, content=result)
 
     return app
 
@@ -1458,6 +1696,47 @@ def _mutate_plan(
             target_state = {"approve": "APPROVED", "pause": "PAUSED", "cancel": "CANCELLED"}[
                 operation
             ]
+            has_execution = (
+                conn.execute(
+                    "SELECT 1 FROM plan_executions WHERE plan_id = %s", (plan_id,)
+                ).fetchone()
+                is not None
+            )
+            if (
+                operation in {"pause", "cancel"}
+                and old_state
+                in {
+                    "EXECUTING",
+                    "VERIFYING",
+                    "PAUSED",
+                }
+                and has_execution
+            ):
+                control = Repository.request_execution_control(
+                    conn, plan_id, operation.upper(), body.reason
+                )
+                control_request = "CANCEL" if control["cancel_requested"] else "PAUSE"
+                response = {
+                    "plan_id": plan_id,
+                    "state": old_state,
+                    "control_request": f"{control_request}_REQUESTED",
+                }
+                Repository.audit(
+                    conn,
+                    actor=principal.name,
+                    role=principal.role,
+                    request_id=request_id,
+                    operation=operation,
+                    plan_id=plan_id,
+                    snapshot_id=row["snapshot_id"],
+                    idempotency_key=key,
+                    before_state=old_state,
+                    after_state=old_state,
+                    result="REQUESTED",
+                    reason=body.reason,
+                )
+                Repository.finish_idempotent(conn, principal.name, op_key, key, 202, response)
+                return JSONResponse(status_code=202, content=response)
             if not transition_allowed(old_state, target_state):
                 result = {
                     "plan_id": plan_id,
@@ -1592,6 +1871,105 @@ def _mutate_plan(
                     )
                     Repository.finish_idempotent(conn, principal.name, op_key, key, 409, response)
                     return JSONResponse(status_code=409, content=response)
+                if app.state.execution_enabled:
+                    supported_workloads = _supported_execution_workloads(app.state.execution_target)
+                    approval_actions = conn.execute(
+                        "SELECT intent_id, action_type, workload_id, payload FROM action_intents "
+                        "WHERE plan_id = %s ORDER BY action_sequence",
+                        (plan_id,),
+                    ).fetchall()
+                    for action in approval_actions:
+                        payload = action["payload"]
+                        if (
+                            action["action_type"] != "SET_REPLICA_COUNT"
+                            or action["workload_id"] not in supported_workloads
+                            or not isinstance(payload, dict)
+                            or not valid_execution_health_policy(
+                                action["workload_id"], payload.get("health")
+                            )
+                            or payload.get("current_resources") != payload.get("proposed_resources")
+                        ):
+                            raise ControlError("plan contains an unsupported execution action")
+                        try:
+                            observed = app.state.execution_controller.target.observe_scale(
+                                action["workload_id"]
+                            )
+                        except TargetNotFound:
+                            reason = "target-workload-not-found-at-approval"
+                            Repository.transition_plan(
+                                conn,
+                                plan_id,
+                                "STALE",
+                                principal.name,
+                                principal.role,
+                                reason,
+                                request_id,
+                                key,
+                            )
+                            response = {"plan_id": plan_id, "state": "STALE", "detail": reason}
+                            Repository.audit(
+                                conn,
+                                actor=principal.name,
+                                role=principal.role,
+                                request_id=request_id,
+                                operation=operation,
+                                plan_id=plan_id,
+                                snapshot_id=row["snapshot_id"],
+                                idempotency_key=key,
+                                before_state=old_state,
+                                after_state="STALE",
+                                result="DENIED",
+                                reason=reason,
+                            )
+                            Repository.finish_idempotent(
+                                conn, principal.name, op_key, key, 409, response
+                            )
+                            return JSONResponse(status_code=409, content=response)
+                        except TargetError as error:
+                            raise HTTPException(
+                                status_code=503, detail="execution-target-unavailable"
+                            ) from error
+                        if observed.get("replicas") != payload.get("current_replicas"):
+                            reason = "target-replica-precondition-changed"
+                            Repository.transition_plan(
+                                conn,
+                                plan_id,
+                                "STALE",
+                                principal.name,
+                                principal.role,
+                                reason,
+                                request_id,
+                                key,
+                            )
+                            response = {"plan_id": plan_id, "state": "STALE", "detail": reason}
+                            Repository.audit(
+                                conn,
+                                actor=principal.name,
+                                role=principal.role,
+                                request_id=request_id,
+                                operation=operation,
+                                plan_id=plan_id,
+                                snapshot_id=row["snapshot_id"],
+                                idempotency_key=key,
+                                before_state=old_state,
+                                after_state="STALE",
+                                result="DENIED",
+                                reason=reason,
+                            )
+                            Repository.finish_idempotent(
+                                conn, principal.name, op_key, key, 409, response
+                            )
+                            return JSONResponse(status_code=409, content=response)
+                        payload["target_precondition"] = {
+                            key: observed[key]
+                            for key in ("uid", "generation", "replicas")
+                            if key in observed
+                        }
+                        conn.execute(
+                            "UPDATE action_intents SET payload = %s "
+                            "WHERE plan_id = %s AND intent_id = %s",
+                            (Jsonb(payload), plan_id, action["intent_id"]),
+                        )
                 leases: dict[str, int] = {}
                 conflict_keys = row["binding"].get("conflict_keys", [])
                 ttl_ms = row["expires_at_ms"] - db_now
