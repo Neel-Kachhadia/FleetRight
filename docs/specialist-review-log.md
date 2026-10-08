@@ -72,10 +72,48 @@ No model opinion overrides compiler, test, sanitizer, fuzz, or measured benchmar
 
 ## Prompt 2B final validation
 
-- Focused execution/journal/API regression: 47 passed. Full Python suite: 81 passed. Ruff lint,
-  formatting, compileall, Compose configuration, and `git diff --check` passed. Secret scanning
-  reported zero findings. A real Docker Compose adapter smoke run changed the target from zero to
-  one running container, observed readiness and fresh health metrics, then cleaned up.
-- Local Kubernetes validation is blocked: kind, k3d, kubectl, and the kind node image were absent.
-  Kubernetes API/runtime behavior, PDB and drain behavior, ServiceAccount denial, and the real
-  cluster E2E remain unverified. No Prompt 2B milestone tag is appropriate with these gates open.
+- The current follow-up added durable pending/complete target fence receipts, atomic Kubernetes
+  fence receipts from the JSON Patch response, same-token fence recovery, bounded re-observation
+  when a target changes during fencing, and fail-safe closure for expired plans. A takeover no
+  longer overwrites a known target response by converting every `RUNNING` action into unknown.
+  PostgreSQL journal tests now pass 26/26, including crash after target fence, external generation
+  changes around fencing, pause/cancel after apply, post-apply response loss, and plan expiry.
+- GPT-6.1 Sol Max found material takeover-receipt, generation-adoption, and freshness/termination
+  defects in the in-progress diff. The changes above address those findings; the new target-generation
+  race and expiry tests pass. Sol Max also identified Kubernetes move/drain defects that remain
+  out of scope for this follow-up because the API rejects those actions before claiming execution.
+- Claude Sonnet 5.5 High found two further material recovery wedges. First, pause/cancel after an
+  applied but unacknowledged scale could retry an illegal `OUTCOME_UNKNOWN -> RUNNING` transition
+  forever; the controller now resolves the observed result directly, and parameterized pause/cancel
+  tests pass. Second, an external generation change after a takeover fence but before its receipt
+  commit could wedge same-controller restart; recovery now records the published fence from the
+  live target and fails safely on the generation mismatch. The crash/interleaving regression passes.
+  The focused call used the first-party Pro subscription at requested High effort. Its initial
+  packet attempt did not reach inference because the base commit abbreviation was mistyped; the
+  corrected call completed once. No pay-as-you-go API was used.
+- GPT-6.1 Sol High and the drain-risk review found that the adapter's eviction helpers do not
+  implement the verifier's staged replacement protocol, exact replacement identity, or durable
+  partial-drain recovery. No unsafe integration was added. Durable PDB execution, node drain, and
+  partial-drain recovery remain blocked; the final milestone tag is not appropriate.
+- Final live kind evidence after both Sonnet fixes: kind v0.33.0, Kubernetes v1.37.0, dedicated
+  cluster `fleetright-prompt2b-e2e`.
+  Authenticated optimize/approve/execute scaled the Deployment 3→4. The controller was terminated
+  after the API server applied the scale but before the journal recorded its response. A replacement
+  controller observed four available replicas and committed with one logical mutation and action
+  attempt. Duplicate execute replayed the same 202 response; anonymous execute returned 401. This
+  run used a deterministic healthy observer for SLO fields; Kubernetes readiness/availability were
+  real. A separate approved-plan external change ended `FAILED_SAFE` without a FleetRight mutation.
+- Live least-privilege RBAC check with the checked-in Role: Deployment get/patch allowed; Pod
+  eviction, Node read, and ClusterRoleBinding creation denied. A temporary test-only permission
+  expansion enabled direct PDB helper checks: zero disruption allowance blocked eviction without
+  deleting the Pod; allowed eviction used the Eviction API and the replacement became Ready. These
+  are adapter checks, not durable reconciler execution. The disposable kind cluster had one worker
+  Ready because of the host inotify quota; no host sysctl was changed.
+- Docker Compose adapter smoke evidence from the previous validation remains valid. The real Docker
+  API optimize/approve/execute flow did not qualify: the standard snapshot requires at least two
+  replicas while the fixed-port Compose harness supports one. Real Docker API compensation remains
+  unverified. Prior C++ evidence is 23/23; C++ was not changed in this follow-up.
+- Final focused Python regression: 57 passed. Ruff check, Ruff format check, compileall,
+  `git diff --check`, and a secret scan over all seven changed files passed (zero findings). C++
+  source is unchanged and prior 23/23 evidence is reused. The prior full Python suite was 81 passed;
+  no unrelated tests were rerun.

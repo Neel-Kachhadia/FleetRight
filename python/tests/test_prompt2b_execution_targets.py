@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 from fleetright.api import create_app
@@ -9,7 +10,9 @@ from fleetright.execution import (
     DockerComposeTarget,
     KubernetesTarget,
     TargetPreconditionFailed,
+    TargetUnavailable,
     WorkloadHealthObserver,
+    _run,
     bounded_execution_health_policy,
     valid_execution_health_policy,
 )
@@ -92,6 +95,48 @@ def test_kubernetes_refuses_external_replica_change(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(target, "observe_scale", lambda _: dict(observed))
     with pytest.raises(TargetPreconditionFailed, match="replica precondition changed"):
         target.set_replicas("cpu-api", 7, observed, expected_replicas=8, fencing_token=1)
+
+
+def test_kubernetes_fence_receipt_uses_atomic_patch_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = KubernetesTarget(namespace="fleetright")
+    before = {
+        "uid": "uid-1",
+        "generation": 7,
+        "resource_version": "20",
+        "replicas": 3,
+        "ready_replicas": 3,
+        "available_replicas": 3,
+        "observed_generation": 7,
+        "fencing_token": 0,
+        "annotations_present": True,
+    }
+    later_external_state = {**before, "generation": 9, "resource_version": "22"}
+    observations = [before, later_external_state]
+    monkeypatch.setattr(target, "observe_scale", lambda _: observations.pop(0))
+    monkeypatch.setattr(
+        target,
+        "_json",
+        lambda *_args: {
+            "metadata": {
+                "uid": "uid-1",
+                "generation": 8,
+                "resourceVersion": "21",
+                "annotations": {"fleetright.io/fencing-token": "4"},
+            },
+            "spec": {"replicas": 3},
+            "status": {"readyReplicas": 3, "availableReplicas": 3, "observedGeneration": 8},
+        },
+    )
+
+    result = target.fence_scale("cpu-api", 4, expected=before)
+
+    assert result["generation"] == 8
+    assert result["resource_version"] == "21"
+    assert result["fencing_token"] == 4
+    assert result["fence_precondition"]["generation"] == 7
+    assert len(observations) == 1
 
 
 def test_docker_process_fence_rejects_a_stale_controller(
@@ -201,6 +246,30 @@ def test_eviction_rejects_pod_identity_change(monkeypatch: pytest.MonkeyPatch) -
             1,
             destination_node="node-a",
         )
+
+
+def test_eviction_distinguishes_pdb_429_from_api_throttling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "fleetright.execution.subprocess.run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=1,
+            stderr="Error from server (TooManyRequests): Cannot evict pod; disruption budget",
+        ),
+    )
+    with pytest.raises(ActionBlocked, match="PDB_BLOCKED"):
+        _run(["kubectl", "create"])
+
+    monkeypatch.setattr(
+        "fleetright.execution.subprocess.run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=1,
+            stderr="Error from server (TooManyRequests): API rate limit exceeded",
+        ),
+    )
+    with pytest.raises(TargetUnavailable, match="throttled"):
+        _run(["kubectl", "create"])
 
 
 def test_health_observer_requires_readiness_slo_and_fresh_metrics(

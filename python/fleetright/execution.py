@@ -122,8 +122,10 @@ def _run(command: list[str], *, timeout: float = 10, stdin: str | None = None) -
         raise OutcomeUnknown("target request timed out; observe before retry") from error
     if result.returncode:
         message = result.stderr.lower()
-        if "too many requests" in message or "disruption budget" in message:
+        if "disruption budget" in message:
             raise ActionBlocked("PDB_BLOCKED")
+        if "too many requests" in message or "toomanyrequests" in message:
+            raise TargetUnavailable("Kubernetes API throttled the request")
         if "conflict" in message or "the object has been modified" in message:
             raise TargetPreconditionFailed("target resource version changed")
         if "not found" in message:
@@ -173,7 +175,10 @@ class KubernetesTarget:
         return self._json("get", "deployment", name, "-n", self.namespace, "-o", "json")
 
     def observe_scale(self, workload_id: str) -> dict[str, Any]:
-        value = self.deployment(workload_id)
+        return self._scale_observation(self.deployment(workload_id))
+
+    @staticmethod
+    def _scale_observation(value: dict[str, Any]) -> dict[str, Any]:
         metadata, spec, status = (
             value.get("metadata", {}),
             value.get("spec", {}),
@@ -218,15 +223,39 @@ class KubernetesTarget:
             "available_replicas": available,
             "observed_generation": observed_generation,
             "fencing_token": int(raw_fence),
+            "generation_tracks_spec": True,
             "annotations_present": "annotations" in metadata,
         }
 
-    def fence_scale(self, workload_id: str, fencing_token: int) -> dict[str, Any]:
+    def fence_scale(
+        self,
+        workload_id: str,
+        fencing_token: int,
+        *,
+        expected: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         current = self.observe_scale(workload_id)
+        if expected is not None:
+            identity_matches = current.get("uid") == expected.get("uid") and current.get(
+                "replicas"
+            ) == expected.get("replicas")
+            generation_matches = current.get("generation") == expected.get("generation")
+            prior_fence_applied = (
+                current["fencing_token"] == fencing_token
+                and isinstance(expected.get("generation"), int)
+                and current.get("generation") == expected["generation"] + 1
+            )
+            if not identity_matches or not (generation_matches or prior_fence_applied):
+                raise TargetPreconditionFailed("Deployment changed before fencing")
         if fencing_token <= 0 or current["fencing_token"] > fencing_token:
             raise TargetPreconditionFailed("a newer controller already fenced this Deployment")
+        precondition = (
+            {key: expected[key] for key in ("uid", "generation", "replicas")}
+            if expected is not None and current["fencing_token"] == fencing_token
+            else {key: current[key] for key in ("uid", "generation", "replicas")}
+        )
         if current["fencing_token"] == fencing_token:
-            return current
+            return {**current, "fence_precondition": precondition}
         patch = json.dumps(
             [
                 {
@@ -240,17 +269,26 @@ class KubernetesTarget:
             ],
             separators=(",", ":"),
         )
-        self._json(
+        patched = self._json(
             "patch",
             "deployment",
             _checked_name(workload_id, "workload identifier"),
             "-n",
             self.namespace,
+            "-o",
+            "json",
             "--type=json",
             "-p",
             patch,
         )
-        return self.observe_scale(workload_id)
+        fenced = self._scale_observation(patched)
+        if (
+            fenced["uid"] != current["uid"]
+            or fenced["replicas"] != current["replicas"]
+            or fenced["fencing_token"] != fencing_token
+        ):
+            raise TargetPreconditionFailed("Deployment changed while publishing fence")
+        return {**fenced, "fence_precondition": precondition}
 
     def set_replicas(
         self,
@@ -305,6 +343,8 @@ class KubernetesTarget:
             _checked_name(workload_id, "workload identifier"),
             "-n",
             self.namespace,
+            "-o",
+            "json",
             "--type=json",
             "-p",
             patch,
@@ -496,7 +536,9 @@ class KubernetesTarget:
                 ],
                 separators=(",", ":"),
             )
-            pod = self._json("patch", "pod", name, "-n", self.namespace, "--type=json", "-p", patch)
+            pod = self._json(
+                "patch", "pod", name, "-n", self.namespace, "-o", "json", "--type=json", "-p", patch
+            )
             metadata = pod.get("metadata", {})
         if not isinstance(metadata, dict) or not isinstance(metadata.get("resourceVersion"), str):
             raise TargetError("Pod resource version is missing")
@@ -594,7 +636,14 @@ class KubernetesTarget:
             separators=(",", ":"),
         )
         self._json(
-            "patch", "node", _checked_name(node_id, "node identifier"), "--type=json", "-p", patch
+            "patch",
+            "node",
+            _checked_name(node_id, "node identifier"),
+            "-o",
+            "json",
+            "--type=json",
+            "-p",
+            patch,
         )
         return self.observe_node(node_id)
 
@@ -728,11 +777,28 @@ class DockerComposeTarget:
             finally:
                 os.close(fd)
 
-    def fence_scale(self, workload_id: str, fencing_token: int) -> dict[str, Any]:
+    def fence_scale(
+        self,
+        workload_id: str,
+        fencing_token: int,
+        *,
+        expected: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if not isinstance(fencing_token, int) or fencing_token <= 0:
             raise TargetPreconditionFailed("fencing token must be positive")
         with self._fence(fencing_token):
-            return {**self.observe_scale(workload_id), "fencing_token": fencing_token}
+            current = self.observe_scale(workload_id)
+            if expected is not None and any(
+                current.get(key) != expected.get(key) for key in ("uid", "generation", "replicas")
+            ):
+                raise TargetPreconditionFailed("Compose service changed before fencing")
+            return {
+                **current,
+                "fencing_token": fencing_token,
+                "fence_precondition": {
+                    key: current[key] for key in ("uid", "generation", "replicas")
+                },
+            }
 
     def observe_scale(self, workload_id: str) -> dict[str, Any]:
         service = self._service(workload_id)

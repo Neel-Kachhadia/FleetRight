@@ -101,8 +101,12 @@ class FakeScaleTarget:
         self.resource_version = "1"
         self.replicas = replicas
         self.fencing_token = 0
+        self.generation_tracks_spec = False
         self.lose_next_response = lose_next_response
+        self.lose_before_apply = False
         self.crash_after_apply = False
+        self.crash_after_fence = False
+        self.change_generation_before_fence = False
         self.mutations: list[int] = []
         self.fence_calls = 0
         self.missing = False
@@ -117,17 +121,51 @@ class FakeScaleTarget:
             "observed_generation": self.generation,
             "resource_version": self.resource_version,
             "fencing_token": self.fencing_token,
+            "generation_tracks_spec": self.generation_tracks_spec,
             "replicas": self.replicas,
             "ready_replicas": self.replicas,
             "available_replicas": self.replicas,
         }
 
-    def fence_scale(self, _workload_id: str, token: int) -> dict[str, object]:
+    def fence_scale(
+        self, _workload_id: str, token: int, *, expected: dict[str, object] | None = None
+    ) -> dict[str, object]:
+        if self.change_generation_before_fence:
+            self.change_generation_before_fence = False
+            self.generation += 1
+            self.resource_version = f"rv-{self.generation}"
+        current = self.observe_scale(_workload_id)
         if token < self.fencing_token:
             raise TargetPreconditionFailed("stale fencing token")
         self.fence_calls += 1
-        self.fencing_token = token
-        return self.observe_scale(_workload_id)
+        already_fenced = token == self.fencing_token
+        expected_matches = expected is None or all(
+            current.get(key) == expected.get(key) for key in ("uid", "generation", "replicas")
+        )
+        prior_fence_applied = (
+            already_fenced
+            and expected is not None
+            and current.get("uid") == expected.get("uid")
+            and current.get("replicas") == expected.get("replicas")
+            and current.get("generation") == expected.get("generation", -2) + 1
+        )
+        if not expected_matches and not prior_fence_applied:
+            raise TargetPreconditionFailed("target changed before fencing")
+        if not already_fenced:
+            self.fencing_token = token
+            if self.generation_tracks_spec:
+                self.generation += 1
+                self.resource_version = f"rv-{self.generation}"
+        if self.crash_after_fence:
+            self.crash_after_fence = False
+            raise SystemExit("injected controller crash after target fence")
+        return {
+            **self.observe_scale(_workload_id),
+            "fence_precondition": {
+                key: expected[key] if prior_fence_applied and expected is not None else current[key]
+                for key in ("uid", "generation", "replicas")
+            },
+        }
 
     def set_replicas(
         self,
@@ -140,6 +178,9 @@ class FakeScaleTarget:
     ) -> dict[str, object]:
         if fencing_token != self.fencing_token or expected_replicas != self.replicas:
             raise TargetPreconditionFailed("stale target precondition")
+        if self.lose_before_apply:
+            self.lose_before_apply = False
+            raise OutcomeUnknown("injected timeout before target application")
         if desired != self.replicas:
             self.mutations.append(desired)
             self.replicas = desired
@@ -933,6 +974,257 @@ def test_lost_response_after_target_success_recovers_without_duplicate_mutation(
     assert target.fence_calls == 2
 
 
+def test_cancel_fences_unknown_not_applied_request_before_terminal_action(
+    clean_database: Database,
+) -> None:
+    repo = clean_database.repository
+    controller, target, _health = _prepare_controller(repo, "cancel-unknown", 8, 9)
+    target.lose_before_apply = True
+    target.generation_tracks_spec = True
+    controller.run_once()
+    assert target.replicas == 8
+
+    with repo.transaction() as conn:
+        Repository.request_execution_control(conn, "cancel-unknown", "CANCEL", "operator cancel")
+
+    for _ in range(4):
+        controller.run_once()
+
+    with repo.transaction() as conn:
+        action = conn.execute(
+            "SELECT execution_state, execution_result FROM action_intents "
+            "WHERE plan_id = 'cancel-unknown'"
+        ).fetchone()
+        execution = conn.execute(
+            "SELECT status FROM plan_executions WHERE plan_id = 'cancel-unknown'"
+        ).fetchone()
+    assert action["execution_state"] == "FAILED"
+    assert action["execution_result"]["result"]["target_fence"]["token"] == target.fencing_token
+    assert execution["status"] == "CANCELLED"
+    assert target.mutations == []
+    assert target.fence_calls == 2
+
+
+@pytest.mark.parametrize("control, terminal", [("CANCEL", "CANCELLED"), ("PAUSE", "PAUSED")])
+def test_control_resolves_applied_unknown_action_without_replay(
+    clean_database: Database, control: str, terminal: str
+) -> None:
+    repo = clean_database.repository
+    controller, target, _health = _prepare_controller(repo, f"{control.lower()}-applied", 8, 9)
+    target.generation_tracks_spec = True
+    target.lose_next_response = True
+    controller.run_once()
+    assert target.replicas == 9
+    with repo.transaction() as conn:
+        action = conn.execute(
+            "SELECT execution_state FROM action_intents WHERE plan_id = %s",
+            (f"{control.lower()}-applied",),
+        ).fetchone()
+        assert action["execution_state"] == "OUTCOME_UNKNOWN"
+        Repository.request_execution_control(
+            conn, f"{control.lower()}-applied", control, f"operator {control.lower()}"
+        )
+
+    for _ in range(5):
+        controller.run_once()
+
+    with repo.transaction() as conn:
+        action = conn.execute(
+            "SELECT execution_state FROM action_intents WHERE plan_id = %s",
+            (f"{control.lower()}-applied",),
+        ).fetchone()
+        execution = conn.execute(
+            "SELECT status FROM plan_executions WHERE plan_id = %s",
+            (f"{control.lower()}-applied",),
+        ).fetchone()
+    assert execution["status"] == terminal
+    assert action["execution_state"] == "SUCCEEDED"
+    assert target.replicas == 9
+    assert target.mutations == [9]
+
+
+def test_unknown_action_rejects_external_generation_change_before_retry(
+    clean_database: Database,
+) -> None:
+    controller, target, _health = _prepare_controller(
+        clean_database.repository, "unknown-generation-change", 8, 9
+    )
+    target.lose_before_apply = True
+    target.generation_tracks_spec = True
+    controller.run_once()
+    target.generation += 1
+
+    for _ in range(5):
+        controller.run_once()
+
+    with clean_database.repository.transaction() as conn:
+        action = conn.execute(
+            "SELECT execution_state, execution_error FROM action_intents "
+            "WHERE plan_id = 'unknown-generation-change'"
+        ).fetchone()
+        execution = conn.execute(
+            "SELECT status FROM plan_executions WHERE plan_id = 'unknown-generation-change'"
+        ).fetchone()
+    assert action["execution_state"] == "FAILED"
+    assert action["execution_error"] == "target-generation-changed-during-unknown-action"
+    assert execution["status"] == "FAILED_SAFE"
+    assert target.mutations == []
+
+
+def test_takeover_recovers_crash_after_target_fence_before_receipt_commit(
+    clean_database: Database,
+) -> None:
+    repo = clean_database.repository
+    controller_a, target, _health = _prepare_controller(repo, "fence-crash", 8, 9)
+    target.generation_tracks_spec = True
+    target.lose_before_apply = True
+    controller_a.run_once()
+    target.crash_after_fence = True
+    with repo.transaction() as conn:
+        conn.execute(
+            "UPDATE plan_executions SET controller_lease_expires_at = clock_timestamp() "
+            "WHERE plan_id = 'fence-crash'"
+        )
+
+    controller_b = ExecutionController(repo, target, FakeHealth(), "controller-b")
+    with pytest.raises(SystemExit, match="crash after target fence"):
+        controller_b.run_once()
+    with repo.transaction() as conn:
+        pending_token = conn.execute(
+            "SELECT pending_controller_fencing_token FROM plan_executions "
+            "WHERE plan_id = 'fence-crash'"
+        ).fetchone()["pending_controller_fencing_token"]
+        pending = Repository.execution_fence_receipt(conn, "fence-crash", "scale", pending_token)
+        assert pending is not None and pending["state"] == "PENDING"
+        assert (
+            conn.execute(
+                "SELECT execution_state FROM action_intents WHERE plan_id = 'fence-crash'"
+            ).fetchone()["execution_state"]
+            == "OUTCOME_UNKNOWN"
+        )
+
+    for _ in range(5):
+        controller_b.run_once()
+    with repo.transaction() as conn:
+        action = conn.execute(
+            "SELECT execution_state, attempt_number FROM action_intents "
+            "WHERE plan_id = 'fence-crash'"
+        ).fetchone()
+        execution = conn.execute(
+            "SELECT status FROM plan_executions WHERE plan_id = 'fence-crash'"
+        ).fetchone()
+        receipt = Repository.execution_fence_receipt(conn, "fence-crash", "scale", pending_token)
+    assert action["execution_state"] == "SUCCEEDED"
+    assert action["attempt_number"] == 2
+    assert execution["status"] == "COMMITTED"
+    assert receipt is not None and receipt["state"] == "COMPLETE"
+    assert receipt["precondition"]["generation"] + 1 == receipt["generation"]
+    assert target.replicas == 9
+    assert target.mutations == [9]
+
+
+def test_takeover_recovers_published_fence_then_detects_external_generation_change(
+    clean_database: Database,
+) -> None:
+    repo = clean_database.repository
+    controller_a, target, _health = _prepare_controller(repo, "fence-crash-external", 8, 9)
+    target.generation_tracks_spec = True
+    target.lose_before_apply = True
+    controller_a.run_once()
+    target.crash_after_fence = True
+    with repo.transaction() as conn:
+        conn.execute(
+            "UPDATE plan_executions SET controller_lease_expires_at = clock_timestamp() "
+            "WHERE plan_id = 'fence-crash-external'"
+        )
+
+    controller_b = ExecutionController(repo, target, FakeHealth(), "controller-b")
+    with pytest.raises(SystemExit, match="crash after target fence"):
+        controller_b.run_once()
+    target.generation += 1
+
+    for _ in range(4):
+        controller_b.run_once()
+
+    with repo.transaction() as conn:
+        execution = conn.execute(
+            "SELECT status FROM plan_executions WHERE plan_id = 'fence-crash-external'"
+        ).fetchone()
+        action = conn.execute(
+            "SELECT execution_state, execution_error FROM action_intents "
+            "WHERE plan_id = 'fence-crash-external'"
+        ).fetchone()
+    assert execution["status"] == "FAILED_SAFE"
+    assert action["execution_state"] == "FAILED"
+    assert action["execution_error"] == "target-generation-changed-during-unknown-action"
+    assert target.mutations == []
+
+
+def test_external_change_during_takeover_is_fenced_then_failed_safe(
+    clean_database: Database,
+) -> None:
+    repo = clean_database.repository
+    controller_a, target, _health = _prepare_controller(repo, "takeover-race", 8, 9)
+    target.generation_tracks_spec = True
+    target.lose_before_apply = True
+    controller_a.run_once()
+    target.change_generation_before_fence = True
+    with repo.transaction() as conn:
+        conn.execute(
+            "UPDATE plan_executions SET controller_lease_expires_at = clock_timestamp() "
+            "WHERE plan_id = 'takeover-race'"
+        )
+
+    controller_b = ExecutionController(repo, target, FakeHealth(), "controller-b")
+    for _ in range(4):
+        controller_b.run_once()
+
+    with repo.transaction() as conn:
+        execution = conn.execute(
+            "SELECT status FROM plan_executions WHERE plan_id = 'takeover-race'"
+        ).fetchone()
+        action = conn.execute(
+            "SELECT execution_state, execution_error FROM action_intents "
+            "WHERE plan_id = 'takeover-race'"
+        ).fetchone()
+    assert execution["status"] == "FAILED_SAFE"
+    assert action["execution_state"] == "FAILED"
+    assert action["execution_error"] == "target-generation-changed-during-unknown-action"
+    assert target.mutations == []
+
+
+def test_expired_plan_can_close_fenced_unknown_action_without_retry(
+    clean_database: Database,
+) -> None:
+    repo = clean_database.repository
+    controller, target, _health = _prepare_controller(repo, "expired-unknown", 8, 9)
+    target.generation_tracks_spec = True
+    target.lose_before_apply = True
+    controller.run_once()
+    with repo.transaction() as conn:
+        conn.execute(
+            "UPDATE plans SET expires_at_ms = "
+            "floor(extract(epoch FROM clock_timestamp()) * 1000) - 1 "
+            "WHERE plan_id = 'expired-unknown'"
+        )
+
+    for _ in range(5):
+        controller.run_once()
+
+    with repo.transaction() as conn:
+        execution = conn.execute(
+            "SELECT status FROM plan_executions WHERE plan_id = 'expired-unknown'"
+        ).fetchone()
+        action = conn.execute(
+            "SELECT execution_state, execution_error FROM action_intents "
+            "WHERE plan_id = 'expired-unknown'"
+        ).fetchone()
+    assert execution["status"] == "FAILED_SAFE"
+    assert action["execution_state"] == "FAILED"
+    assert action["execution_error"] == "target-precondition-changed"
+    assert target.mutations == []
+
+
 def test_restart_after_external_success_observes_before_any_replay(
     clean_database: Database,
 ) -> None:
@@ -951,9 +1243,8 @@ def test_restart_after_external_success_observes_before_any_replay(
         assert action["execution_result"]["progress"][-1]["result"]["dispatch_target_replicas"] == 9
 
     restarted = ExecutionController(repo, target, FakeHealth(), "controller-a")
-    restarted.run_once()
-    restarted.run_once()
-    restarted.run_once()
+    for _ in range(5):
+        restarted.run_once()
     with repo.transaction() as conn:
         action = conn.execute(
             "SELECT execution_state, attempt_number FROM action_intents "
@@ -1036,7 +1327,8 @@ def test_external_target_state_conflict_resolves_unknown_without_wedging(
     target.replicas = 7
     target.generation += 1
 
-    controller.run_once()
+    for _ in range(4):
+        controller.run_once()
 
     with repo.transaction() as conn:
         execution = conn.execute(
@@ -1059,7 +1351,8 @@ def test_known_response_followed_by_external_revert_is_not_redispatched(
     )
     target.revert_after_response = 8
 
-    controller.run_once()
+    for _ in range(4):
+        controller.run_once()
 
     with clean_database.repository.transaction() as conn:
         execution = conn.execute(

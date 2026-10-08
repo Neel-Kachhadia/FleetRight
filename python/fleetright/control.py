@@ -857,6 +857,9 @@ class Repository:
     ) -> dict[str, object]:
         if not target_ref or not isinstance(receipt, dict):
             raise ValueError("target reference and fence receipt are required")
+        receipt = {"state": "COMPLETE", **receipt}
+        if receipt["state"] not in {"PENDING", "COMPLETE"}:
+            raise ValueError("fence receipt state is invalid")
         Repository.authorize_takeover_fence(conn, plan_id, intent_id, controller_id, pending_token)
         conn.execute(
             "INSERT INTO execution_takeover_fences "
@@ -864,7 +867,8 @@ class Repository:
             "VALUES (%s, %s, %s, %s, %s) ON CONFLICT "
             "(plan_id, intent_id, controller_fencing_token) "
             "DO UPDATE SET receipt = EXCLUDED.receipt, recorded_at = clock_timestamp() "
-            "WHERE execution_takeover_fences.target_ref = EXCLUDED.target_ref",
+            "WHERE execution_takeover_fences.target_ref = EXCLUDED.target_ref "
+            "AND COALESCE(execution_takeover_fences.receipt->>'state', 'COMPLETE') <> 'COMPLETE'",
             (plan_id, intent_id, pending_token, target_ref, Jsonb(receipt)),
         )
         row = conn.execute(
@@ -875,6 +879,18 @@ class Repository:
         if row is None or row["target_ref"] != target_ref:
             raise ExecutionConflict("target fence receipt changed for a reserved token")
         return row
+
+    @staticmethod
+    def execution_fence_receipt(
+        conn: psycopg.Connection, plan_id: str, intent_id: str, fencing_token: int
+    ) -> dict[str, object] | None:
+        row = conn.execute(
+            "SELECT receipt FROM execution_takeover_fences WHERE plan_id = %s "
+            "AND intent_id = %s AND controller_fencing_token = %s",
+            (plan_id, intent_id, fencing_token),
+        ).fetchone()
+        receipt = row["receipt"] if row is not None else None
+        return receipt if isinstance(receipt, dict) else None
 
     @staticmethod
     def claim_execution_controller(
@@ -904,7 +920,8 @@ class Repository:
             "SELECT ai.intent_id FROM action_intents ai LEFT JOIN execution_takeover_fences f "
             "ON f.plan_id = ai.plan_id AND f.intent_id = ai.intent_id "
             "AND f.controller_fencing_token = %s WHERE ai.plan_id = %s "
-            "AND ai.execution_state IN ('RUNNING', 'OUTCOME_UNKNOWN') AND f.intent_id IS NULL",
+            "AND ai.execution_state IN ('RUNNING', 'OUTCOME_UNKNOWN') "
+            "AND (f.intent_id IS NULL OR COALESCE(f.receipt->>'state', 'COMPLETE') <> 'COMPLETE')",
             (pending_token, plan_id),
         ).fetchone()
         if unresolved is not None:
@@ -922,6 +939,20 @@ class Repository:
         if result is None:
             raise LeaseConflict("execution takeover reservation changed")
         return int(result["controller_fencing_token"])
+
+    @staticmethod
+    def expire_execution_controller(
+        conn: psycopg.Connection, plan_id: str, controller_id: str, fencing_token: int
+    ) -> None:
+        Repository.assert_execution_controller(conn, plan_id, controller_id, fencing_token)
+        row = conn.execute(
+            "UPDATE plan_executions SET controller_lease_expires_at = clock_timestamp(), "
+            "updated_at = clock_timestamp() WHERE plan_id = %s AND controller_id = %s "
+            "AND controller_fencing_token = %s RETURNING plan_id",
+            (plan_id, controller_id, fencing_token),
+        ).fetchone()
+        if row is None:
+            raise LeaseConflict("execution controller lease changed before yielding")
 
     @staticmethod
     def renew_execution_controller(

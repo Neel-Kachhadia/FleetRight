@@ -96,8 +96,76 @@ class ExecutionController:
         for action in unresolved:
             if action["action_type"] != "SET_REPLICA_COUNT" or not action["workload_id"]:
                 return None
+            target_ref = f"deployment:{action['workload_id']}"
+            with self.repository.transaction() as conn:
+                saved_fence = Repository.execution_fence_receipt(
+                    conn, plan_id, action["intent_id"], pending_token
+                )
+            if saved_fence is not None and saved_fence.get("state", "COMPLETE") == "COMPLETE":
+                continue
+            precondition = saved_fence.get("precondition") if saved_fence else None
+            if not isinstance(precondition, dict):
+                try:
+                    live = self.target.observe_scale(action["workload_id"])
+                except TargetNotFound:
+                    with self.repository.transaction() as conn:
+                        Repository.fail_takeover_for_missing_target(
+                            conn,
+                            plan_id,
+                            action["intent_id"],
+                            self.controller_id,
+                            pending_token,
+                        )
+                    return None
+                except TargetError:
+                    return None
+                precondition = {key: live[key] for key in ("uid", "generation", "replicas")}
+                with self.repository.transaction() as conn:
+                    Repository.record_execution_fence(
+                        conn,
+                        plan_id,
+                        action["intent_id"],
+                        self.controller_id,
+                        pending_token,
+                        target_ref,
+                        {"state": "PENDING", "precondition": precondition},
+                    )
+            recovered_fence = False
             try:
-                receipt = self.target.fence_scale(action["workload_id"], pending_token)
+                receipt = self.target.fence_scale(
+                    action["workload_id"], pending_token, expected=precondition
+                )
+            except TargetPreconditionFailed:
+                try:
+                    live = self.target.observe_scale(action["workload_id"])
+                except TargetError:
+                    return None
+                if live.get("uid") != precondition.get("uid"):
+                    return None
+                live_token = live.get("fencing_token", pending_token)
+                recovered_fence = live_token == pending_token
+                if live_token > pending_token:
+                    return None
+                if recovered_fence:
+                    receipt = {**live, "fence_precondition": precondition}
+                else:
+                    precondition = {key: live[key] for key in ("uid", "generation", "replicas")}
+                    with self.repository.transaction() as conn:
+                        Repository.record_execution_fence(
+                            conn,
+                            plan_id,
+                            action["intent_id"],
+                            self.controller_id,
+                            pending_token,
+                            target_ref,
+                            {"state": "PENDING", "precondition": precondition},
+                        )
+                    try:
+                        receipt = self.target.fence_scale(
+                            action["workload_id"], pending_token, expected=precondition
+                        )
+                    except TargetError:
+                        return None
             except TargetNotFound:
                 with self.repository.transaction() as conn:
                     Repository.fail_takeover_for_missing_target(
@@ -110,6 +178,25 @@ class ExecutionController:
                 return None
             except TargetError:
                 return None
+            fence_precondition = receipt.get("fence_precondition", {})
+            if (
+                receipt.get("uid") != precondition.get("uid")
+                or (not recovered_fence and receipt.get("replicas") != precondition.get("replicas"))
+                or receipt.get("fencing_token") != pending_token
+                or any(
+                    fence_precondition.get(key) != precondition.get(key)
+                    for key in ("uid", "generation", "replicas")
+                )
+            ):
+                return None
+            durable_receipt = {
+                "state": "COMPLETE",
+                "token": pending_token,
+                "precondition": precondition,
+                "fence_precondition": precondition,
+                "generation": receipt.get("generation"),
+                "observation": receipt,
+            }
             with self.repository.transaction() as conn:
                 Repository.record_execution_fence(
                     conn,
@@ -117,8 +204,8 @@ class ExecutionController:
                     action["intent_id"],
                     self.controller_id,
                     pending_token,
-                    f"deployment:{action['workload_id']}",
-                    receipt,
+                    target_ref,
+                    durable_receipt,
                 )
         with self.repository.transaction() as conn:
             token = Repository.claim_execution_controller(
@@ -128,18 +215,6 @@ class ExecutionController:
                 pending_token,
                 self.lease_ttl_ms,
             )
-            for action in unresolved:
-                if action["execution_state"] == "RUNNING":
-                    Repository.transition_action(
-                        conn,
-                        plan_id,
-                        action["intent_id"],
-                        "RUNNING",
-                        "OUTCOME_UNKNOWN",
-                        self.controller_id,
-                        token,
-                        error="controller-takeover-requires-target-observation",
-                    )
             return token
 
     def _reconcile(self, plan_id: str, token: int, stop: threading.Event | None) -> None:
@@ -532,6 +607,46 @@ class ExecutionController:
             self._fail_safe(plan_id, token, "action-dispatch-journal-invalid")
             return
         current = observed["replicas"]
+        if state == "OUTCOME_UNKNOWN" and observed.get("generation_tracks_spec") is True:
+            dispatch_observation = (
+                progress[dispatch_index].get("observation")
+                if dispatch_index is not None and isinstance(progress, list)
+                else pre
+            )
+            expected_generation = (
+                dispatch_observation.get("generation")
+                if isinstance(dispatch_observation, dict)
+                else None
+            )
+            if current == dispatch_target and isinstance(expected_generation, int):
+                expected_generation += 1
+            if isinstance(expected_generation, int) and current in {
+                dispatch_expected,
+                dispatch_target,
+            }:
+                takeover_receipt = self._takeover_fence_receipt(plan_id, action["intent_id"], token)
+                if takeover_receipt is None:
+                    generation_matches = observed.get("generation") == expected_generation
+                else:
+                    fence_precondition = takeover_receipt.get("fence_precondition", {})
+                    fence_observation = takeover_receipt.get("observation", {})
+                    generation_matches = (
+                        isinstance(fence_precondition, dict)
+                        and fence_precondition.get("generation") == expected_generation
+                        and takeover_receipt.get("generation") == expected_generation + 1
+                        and observed.get("generation")
+                        == takeover_receipt.get(
+                            "generation",
+                            fence_observation.get("generation")
+                            if isinstance(fence_observation, dict)
+                            else None,
+                        )
+                    )
+                if not generation_matches:
+                    self._fail_safe(
+                        plan_id, token, "target-generation-changed-during-unknown-action"
+                    )
+                    return
         if state in {"RUNNING", "OUTCOME_UNKNOWN"} and current not in {
             dispatch_expected,
             dispatch_target,
@@ -550,9 +665,34 @@ class ExecutionController:
             self._fail_safe(plan_id, token, "target-reverted-after-accepted-mutation")
             return
         if state == "OUTCOME_UNKNOWN":
+            takeover_receipt = self._takeover_fence_receipt(plan_id, action["intent_id"], token)
+            if takeover_receipt is None:
+                self._yield_for_target_fence(plan_id, token, action["intent_id"])
+                return
             if current == dispatch_expected and not allow_dispatch:
                 self._finish_action(
-                    plan_id, token, action, "FAILED", observed, "control-request-before-apply"
+                    plan_id,
+                    token,
+                    action,
+                    "FAILED",
+                    observed,
+                    "control-request-before-apply",
+                    result={"target_fence": takeover_receipt},
+                )
+                return
+            if current == dispatch_target and not allow_dispatch:
+                applied_final_target = current == desired
+                self._finish_action(
+                    plan_id,
+                    token,
+                    action,
+                    "SUCCEEDED" if applied_final_target else "FAILED",
+                    observed,
+                    None if applied_final_target else "control-request-after-partial-step",
+                    result={
+                        "reconciled_applied_step": True,
+                        "target_fence": takeover_receipt,
+                    },
                 )
                 return
             if (
@@ -560,7 +700,13 @@ class ExecutionController:
                 and action.get("attempt_number", 1) >= self.max_attempts
             ):
                 self._finish_action(
-                    plan_id, token, action, "FAILED", observed, "bounded-retry-exhausted"
+                    plan_id,
+                    token,
+                    action,
+                    "FAILED",
+                    observed,
+                    "bounded-retry-exhausted",
+                    result={"target_fence": takeover_receipt},
                 )
                 self._fail_safe(plan_id, token, "ambiguous-action-not-applied")
                 return
@@ -576,7 +722,10 @@ class ExecutionController:
                             self.controller_id,
                             token,
                             target_observation=observed,
-                            result={"reconciled_by_observation": True},
+                            result={
+                                "reconciled_by_observation": True,
+                                "target_fence": takeover_receipt,
+                            },
                             retry_proven_not_applied=True,
                             max_attempts=self.max_attempts,
                         )
@@ -789,13 +938,18 @@ class ExecutionController:
                         "SELECT nextval('execution_controller_fence_seq') AS token"
                     ).fetchone()["token"]
                 )
-                fenced = self.target.fence_scale(workload, target_token)
+                fenced = self.target.fence_scale(workload, target_token, expected=live)
+                fence_precondition = fenced.get("fence_precondition", {})
                 if (
                     fenced.get("uid") != live["uid"]
-                    or fenced.get("generation") != live["generation"]
+                    or fence_precondition.get("uid") != live["uid"]
+                    or fence_precondition.get("generation") != live["generation"]
+                    or fence_precondition.get("replicas") != expected
                     or fenced.get("replicas") != expected
                 ):
                     raise TargetPreconditionFailed("target changed while publishing fence")
+                live = fenced
+                observed = fenced
                 Repository.record_action_progress(
                     conn,
                     plan_id,
@@ -921,6 +1075,31 @@ class ExecutionController:
         except TargetUnavailable:
             return None
 
+    def _takeover_fence_receipt(
+        self, plan_id: str, intent_id: str, token: int
+    ) -> dict[str, Any] | None:
+        with self.repository.transaction() as conn:
+            receipt = Repository.execution_fence_receipt(conn, plan_id, intent_id, token)
+        if receipt is not None and receipt.get("state", "COMPLETE") != "COMPLETE":
+            return None
+        return receipt if isinstance(receipt, dict) else None
+
+    def _yield_for_target_fence(self, plan_id: str, token: int, intent_id: str) -> None:
+        try:
+            with self.repository.transaction() as conn:
+                Repository.expire_execution_controller(conn, plan_id, self.controller_id, token)
+        except LeaseConflict:
+            return
+        LOG.warning(
+            "controller yielded unresolved action for a new fencing token",
+            extra={
+                "plan_id": plan_id,
+                "action_id": intent_id,
+                "controller_id": self.controller_id,
+                "fencing_token": token,
+            },
+        )
+
     def _finish_action(
         self,
         plan_id: str,
@@ -929,6 +1108,7 @@ class ExecutionController:
         state: str,
         observation: dict[str, Any],
         error: str | None = None,
+        result: dict[str, Any] | None = None,
     ) -> None:
         try:
             with self.repository.transaction() as conn:
@@ -941,6 +1121,7 @@ class ExecutionController:
                     self.controller_id,
                     token,
                     target_observation=observation,
+                    result=result,
                     error=error,
                 )
         except (ControlError, LeaseConflict, StaleState):
@@ -1059,6 +1240,14 @@ class ExecutionController:
                     extra={"plan_id": plan_id, "action_id": action["intent_id"], "reason": reason},
                 )
                 return
+            target_fence = self._takeover_fence_receipt(plan_id, action["intent_id"], token)
+            if target_fence is None:
+                LOG.error(
+                    "execution yielded until its unresolved target can be fenced",
+                    extra={"plan_id": plan_id, "action_id": action["intent_id"], "reason": reason},
+                )
+                self._yield_for_target_fence(plan_id, token, action["intent_id"])
+                return
             with self.repository.transaction() as conn:
                 Repository.assert_execution_controller(conn, plan_id, self.controller_id, token)
                 current = conn.execute(
@@ -1076,6 +1265,7 @@ class ExecutionController:
                         self.controller_id,
                         token,
                         target_observation=observed,
+                        result={"target_fence": target_fence},
                         error=reason,
                     )
         with self.repository.transaction() as conn:

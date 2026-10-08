@@ -159,7 +159,10 @@ count; `COMPENSATED` is written only after capacity and a fresh healthy window a
 scale-out health regression leaves the added capacity in place and ends `FAILED_SAFE`. Known target
 state conflicts fail the action and release its leases; an unknown outcome remains active until
 observation is available. Pause and cancel stop later dispatches; cancellation does not undo
-completed changes.
+completed changes. If an action has an unknown outcome, the controller first yields ownership and
+publishes a durable target fence. It then records an already-applied step as complete (or failed if
+it stopped partway through a multi-step reduction), or records a proven unapplied step as failed,
+before transitioning to `PAUSED` or `CANCELLED`.
 
 Execution health thresholds are bounded by the checked-in local workload contracts: CPU 120 ms,
 memory 150 ms, queued 80 ms p99, and 1,000 ppm errors. A supplied snapshot may request stricter
@@ -175,20 +178,50 @@ same Compose project while FleetRight executes.
 
 The Kubernetes adapter supports only `SET_REPLICA_COUNT` on the checked-in `cpu-api` stateless
 Deployment. It reads UID, generation, resourceVersion, desired/ready/available counts, and the
-stored fencing annotation. Approval binds UID, generation, and replicas; it does not bind the
-volatile resourceVersion. The live JSON Patch tests UID, generation, freshly observed
-resourceVersion, replica precondition, and fence before changing `.spec.replicas`. The checked-in
-kind fixture contains one CPU Deployment, Service, readiness/startup probes, resource bounds,
-topology spread, and a PDB. Its namespace Role permits only `get` and `patch` on Deployment
-`cpu-api`. Kubernetes EXECUTE requires an explicit mode-0600 kubeconfig and
-`FLEETRIGHT_KUBERNETES_NAMESPACE=fleetright`.
+stored fencing annotation. Approval binds UID, generation, and replicas; the live JSON Patch tests
+those values plus freshly observed resourceVersion and the fencing annotation before changing
+`.spec.replicas`. Fence requests persist a pending receipt before the target patch; takeover retries
+the same fence token after a crash, and reconciliation checks the recorded precondition and
+post-fence generation before resolving an ambiguous scale. The namespace Role permits named
+Deployment `get`/`patch` only. It grants no Pod eviction, PDB, or Node operations because those
+actions are not wired to the reconciler. Kubernetes EXECUTE requires an explicit mode-0600
+kubeconfig and `FLEETRIGHT_KUBERNETES_NAMESPACE=fleetright`.
 
-Current reconciler/API support is replica scaling only. Plans containing `MOVE_REPLICA`,
-`DEACTIVATE_NODE`, or resource resizing are rejected before a journal is claimed. The Pod eviction
-and node cordon/drain protocol is not integrated; therefore PDB-blocked eviction, progressive node
-drain, partial-drain recovery, and the RBAC negative test remain blocked. The PDB in the fixture
-does not gate Deployment replica updates. The local Kubernetes toolchain was unavailable during
-Prompt 2B validation, so no kind target E2E or ServiceAccount authorization test passed.
+Live execution evidence was collected on the dedicated `fleetright-prompt2b-e2e` kind cluster
+(kind v0.33.0, Kubernetes v1.37.0). Through the authenticated API, a verified plan scaled the
+Deployment from three to four replicas. The adapter then simulated a lost response by terminating
+the controller after the API server applied the scale. A replacement controller observed four
+available replicas, marked the existing action successful on attempt one, and committed the plan;
+the instrumented adapter counted exactly one scale mutation. A repeated execute request returned
+the same `202` response, and an unauthenticated execute returned `401`. This E2E used a deterministic
+healthy health observer; readiness and available replica counts came from the live Deployment, but
+Prometheus SLO metrics were not used in this run. A separate real API check changed the Deployment
+after approval and observed `FAILED_SAFE` with zero FleetRight target mutations.
+
+With a temporary test-only Role expansion, direct adapter checks against the live PDB observed
+`PDB_BLOCKED` at zero disruptions and left the Pod present; after the PDB allowed disruption, the
+Eviction API accepted the request and the replacement became Ready. These are adapter-level checks,
+not durable reconciler actions, and the expanded permissions are not in the checked-in manifest.
+With the checked-in Role applied, the ServiceAccount could read the named Deployment while creating
+a ClusterRoleBinding was denied. The kind host had only the control plane and one worker Ready
+because of its inotify quota; the test-only Deployment had a temporary control-plane toleration. No
+host sysctl was changed.
+
+The API and reconciler still reject `MOVE_REPLICA`, `DEACTIVATE_NODE`, and resource resizing before
+claiming execution. The Pod eviction, PDB check, cordon, and movement observation helpers are not
+connected to the durable action journal. Therefore durable PDB-blocked execution, progressive node
+drain, partial-drain restart recovery, and end-to-end topology-preserving evacuation are not
+implemented. The RBAC manifest has no Node `patch` permission, so FleetRight cannot cordon Nodes.
+Do not treat the direct eviction checks as a supported drain path. The PDB does not gate Deployment
+replica updates.
+
+The live Docker Compose adapter smoke run changed its supported service from zero to one container
+and observed readiness and fresh metrics. A Docker API optimize/approve/execute E2E was attempted
+but did not qualify: the checked-in optimization snapshot requires at least two existing replicas,
+while the Compose harness publishes fixed ports and supports at most one service replica. The
+independent verifier correctly rejected the zero-replica fixture before execution. Real Docker API
+compensation and crash recovery remain unverified; fake-target journal tests cover compensation and
+the live kind run covers post-apply crash recovery.
 
 Docker local operation commands:
 
@@ -272,6 +305,6 @@ export FLEETRIGHT_EXECUTION_TARGET=kubernetes
 PYTHONPATH=python .venv/bin/uvicorn fleetright.api:app --host 127.0.0.1 --port 8080
 ```
 
-Never point Kubernetes EXECUTE at the kind administrator kubeconfig. The short-lived token only
-has the named Deployment permissions in the `fleetright` namespace; delete the temporary
-kubeconfig when finished.
+Never point Kubernetes EXECUTE at the kind administrator kubeconfig. The Role grants only the
+named Deployment reads and patches used by the live scale adapter; delete the temporary kubeconfig
+when finished. Pod eviction and Node cordoning remain disabled by the checked-in RBAC.
