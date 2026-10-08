@@ -1,0 +1,173 @@
+{
+  "phase": 1,
+  "captured_date_utc": "2026-10-08",
+  "source": {
+    "branch": "phase4/safe-execution-reconciliation",
+    "commit": "ee29b96ec8975b3bb7703ab258a5e8ffcd81e59b",
+    "image": "fleetright-workload-controller:ee29b96",
+    "local_image_id": "sha256:1fc7bf209f0829f46b4da4fee210140d7f8561fb93f7ccdff2ba67b04bf660b9",
+    "pod_image_id": "docker.io/library/import-2026-10-08@sha256:75f321605ceaacc1f3d03bc5f2a7282cdd7cfc610c35b99131ab979dc9d6a322"
+  },
+  "environment": {
+    "context": "kind-fleetright-safety-lab",
+    "kind": "v0.33.0",
+    "docker": "29.1.3",
+    "kubernetes_client": "v1.37.1",
+    "kubernetes_server": "v1.37.0",
+    "nodes": [
+      {
+        "name": "fleetright-safety-lab-control-plane",
+        "uid": "2e942096-7d61-46d0-9900-fe76b50864f0",
+        "allocatable_cpu": "32"
+      },
+      {
+        "name": "fleetright-safety-lab-worker",
+        "uid": "e7c814bb-ef80-4b47-9e3d-2cb0066ecb3d",
+        "allocatable_cpu": "32"
+      },
+      {
+        "name": "fleetright-safety-lab-worker2",
+        "uid": "ef0148d6-50cd-4e67-8f50-e2cb01b3005c",
+        "allocatable_cpu": "32"
+      }
+    ]
+  },
+  "controller": {
+    "namespace": "fleetright-v2",
+    "ready": true,
+    "image": "fleetright-workload-controller:ee29b96",
+    "node": "fleetright-safety-lab-control-plane",
+    "temporary_override": "The live Deployment copy had a control-plane nodeSelector and NoSchedule toleration; the checked-in manifest is unchanged. This was needed because both worker kube-proxy Pods were Error with 'fsnotify watcher init: too many open files'."
+  },
+  "pod_security_admission": {
+    "enforce": "restricted",
+    "audit": "restricted",
+    "warn": "restricted",
+    "generated_workload_pod_admitted": true,
+    "generated_pod_security": {
+      "runAsNonRoot": true,
+      "runAsUser": 10001,
+      "runAsGroup": 10001,
+      "seccompProfile": "RuntimeDefault",
+      "allowPrivilegeEscalation": false,
+      "capabilities_drop": ["ALL"]
+    },
+    "runAsUser_zero_cr_rejected": "schema minimum is 1",
+    "privileged_direct_pod_rejected": "restricted PSA denied privileged=true, privilege escalation, capabilities, nonroot, and seccomp violations"
+  },
+  "successful_workload": {
+    "name": "phase1-demo",
+    "uid": "1c8f7aa0-7829-4d7a-bd1e-2d0ef3d76953",
+    "desired_replicas": 2,
+    "status": {
+      "generation": 5,
+      "observedGeneration": 5,
+      "replicas": 2,
+      "readyReplicas": 2,
+      "availableReplicas": 2,
+      "surgeReplicas": 0,
+      "Ready": true
+    },
+    "allowed_nodes": [
+      "fleetright-safety-lab-worker",
+      "fleetright-safety-lab-worker2"
+    ],
+    "required_node_affinity": "Two ORed nodeSelectorTerms; each has metadata.name In [one allowed worker]. No nodeName binding or preferred affinity.",
+    "pods": [
+      {
+        "name": "frw-fee46541c71614bd3fdc4f9cc5b2610193091eca85a765e44da28c054747b5b9-r0",
+        "uid": "cb43be34-788e-425e-9e27-7404d2777f29",
+        "owner_uid": "1c8f7aa0-7829-4d7a-bd1e-2d0ef3d76953",
+        "node": "fleetright-safety-lab-worker2",
+        "ready": true
+      },
+      {
+        "name": "frw-fee46541c71614bd3fdc4f9cc5b2610193091eca85a765e44da28c054747b5b9-r1",
+        "uid": "81d19864-6b6d-4ce7-893a-cb654b4309b0",
+        "owner_uid": "1c8f7aa0-7829-4d7a-bd1e-2d0ef3d76953",
+        "node": "fleetright-safety-lab-worker",
+        "ready": true
+      }
+    ],
+    "scale_subresource": {
+      "spec_replicas": 2,
+      "status_replicas": 2,
+      "selector": "fleetright.io/workload-uid=1c8f7aa0-7829-4d7a-bd1e-2d0ef3d76953"
+    },
+    "pdb_observations": [
+      {
+        "availability_floor": 1,
+        "maxUnavailable": 1,
+        "expectedPods": 2,
+        "currentHealthy": 2,
+        "desiredHealthy": 1,
+        "disruptionsAllowed": 1
+      },
+      {
+        "availability_floor": 2,
+        "maxUnavailable": 0,
+        "expectedPods": 2,
+        "currentHealthy": 2,
+        "desiredHealthy": 2,
+        "disruptionsAllowed": 0
+      }
+    ],
+    "scale_to_three": {
+      "scale_spec_replicas": 3,
+      "pdb_maxUnavailable": 1,
+      "pdb_expectedPods": 3,
+      "pdb_currentHealthy": 2,
+      "pdb_desiredHealthy": 2,
+      "pdb_disruptionsAllowed": 0,
+      "third_pod": "Pending because both workers failed required anti-affinity and the control-plane failed required node affinity."
+    },
+    "scale_down_to_two": "One pending high ordinal was removed; workload returned Ready with two replicas, Ready=2, surge=0.",
+    "controller_restart": {
+      "rollout_completed": true,
+      "pod_names_and_uids_unchanged": true,
+      "duplicate_logical_replicas": 0
+    }
+  },
+  "negative_scheduler_cases": {
+    "topology": {
+      "workload_uid": "5707d1c5-a209-4c43-81b9-dfce009cdb69",
+      "allowed_node": "fleetright-safety-lab-worker",
+      "minDomains": 2,
+      "pending_pod_uid": "1b982da8-db8d-45eb-ad36-b80df0f8dbe2",
+      "scheduler_message": "1 node(s) didn't match pod topology spread constraints, 2 node(s) didn't satisfy plugin(s) [NodeAffinity]."
+    },
+    "capacity": {
+      "workload_uid": "4df872fa-521d-4f20-82a8-6c94ff10fb15",
+      "cpu_request_per_pod": "64",
+      "worker_allocatable_cpu": "32",
+      "pending_pod_uid": "d06dc642-e2b6-4867-837a-394ea1a572c1",
+      "scheduler_message": "2 Insufficient cpu; control-plane rejected by required NodeAffinity."
+    }
+  },
+  "rbac_subject_access_reviews": {
+    "create_pods_in_fleetright_v2": "yes",
+    "create_pods_in_fleetright": "no",
+    "create_pods_subresource_eviction_in_fleetright_v2": "no",
+    "get_secrets_in_fleetright_v2": "no",
+    "patch_deployments_in_fleetright": "no",
+    "get_nodes": "yes",
+    "patch_nodes": "no",
+    "patch_fleetrightworkloads": "no"
+  },
+  "api_checks": {
+    "env_reorder_dry_run": "rejected: podTemplate is immutable until a rollout protocol exists",
+    "no_eviction_request_sent": true,
+    "v2_plan_execution_enabled": false
+  },
+  "database": {
+    "accessed": false,
+    "postgresql_tests": "skipped because FLEETRIGHT_TEST_DATABASE_URL was unset"
+  },
+  "cleanup": {
+    "namespace_absent": true,
+    "crd_absent": true,
+    "cluster_role_absent": true,
+    "cluster_role_binding_absent": true,
+    "fleetright_workload_labeled_pods_remaining": 0
+  }
+}
