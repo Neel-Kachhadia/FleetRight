@@ -505,6 +505,73 @@ def test_execution_admission_allows_only_supported_plan_actions() -> None:
     ) == ["UNSUPPORTED_EXECUTION_WORKLOAD:memory-api"]
 
 
+def test_verified_v2_plan_stays_out_of_the_execution_journal(clean_database: Database) -> None:
+    from test_evacuation_v2 import _v2_snapshot
+
+    now_ms = time.time_ns() // 1_000_000
+    snapshot, _, _ = _v2_snapshot(now_ms)
+    tokens, raw_tokens = _tokens()
+    target_calls: list[str] = []
+
+    class UnusedTarget:
+        def __getattr__(self, name: str) -> object:
+            target_calls.append(name)
+            raise AssertionError(f"rejected V2 plan reached target method {name}")
+
+    app = create_app(
+        clean_database.repository,
+        tokens=tokens,
+        mode="EXECUTE",
+        execution_target="kubernetes",
+        target_adapter=UnusedTarget(),
+        health_observer=object(),
+        start_execution_worker=False,
+    )
+    with TestClient(app) as client:
+        created = client.post(
+            "/v1/optimize",
+            headers={
+                "Authorization": f"Bearer {raw_tokens['recommender']}",
+                "Idempotency-Key": "verified-v2-remains-disabled",
+            },
+            json={"snapshot": snapshot},
+        )
+        assert created.status_code == 200
+        plan = created.json()
+        assert plan["state"] == "REJECTED"
+        assert plan["verification_accepted"] is True
+        assert plan["admission_accepted"] is False
+        assert "UNSUPPORTED_EXECUTION_PROTOCOL_V2" in plan["reason_codes"]
+        assert plan["candidate_actions"] == []
+
+        app.state.execution_controller.run_once()
+        execute = client.post(
+            f"/v1/plans/{plan['plan_id']}/execute",
+            headers={
+                "Authorization": f"Bearer {raw_tokens['operator']}",
+                "Idempotency-Key": "verified-v2-execute-remains-disabled",
+            },
+            json={},
+        )
+        assert execute.status_code == 409
+        assert target_calls == []
+        with clean_database.repository.transaction() as conn:
+            assert (
+                conn.execute(
+                    "SELECT count(*) AS n FROM action_intents WHERE plan_id=%s",
+                    (plan["plan_id"],),
+                ).fetchone()["n"]
+                == 0
+            )
+            assert (
+                conn.execute(
+                    "SELECT count(*) AS n FROM plan_executions WHERE plan_id=%s",
+                    (plan["plan_id"],),
+                ).fetchone()["n"]
+                == 0
+            )
+
+
 @pytest.mark.parametrize("unsupported_action", ["MOVE_REPLICA", "DEACTIVATE_NODE"])
 @pytest.mark.parametrize("mode", ["RECOMMEND", "EXECUTE"])
 def test_approval_keeps_unsupported_actions_out_of_execution_journal(

@@ -7,17 +7,24 @@ from fleetright.contracts import decode_text, encode_text
 from fleetright.scenario import oracle_snapshot_fields
 
 
-def _v2_snapshot() -> tuple[dict[str, object], bytes, dict[str, object]]:
+def _v2_snapshot(now_ms: int | None = None) -> tuple[dict[str, object], bytes, dict[str, object]]:
     fields = oracle_snapshot_fields()
+    now_ms = int(fields["evaluation_time_ms"]) if now_ms is None else now_ms
+    fields.update(
+        observed_at_ms=now_ms - 1_000,
+        expires_at_ms=now_ms + 3_600_000,
+        evaluation_time_ms=now_ms,
+    )
     workload = fields["workloads"][0]
     fields["capacity_profiles"][0]["allocation"] = deepcopy(workload["current_resources"])
+    for profile in fields["capacity_profiles"]:
+        profile.update(generated_at_ms=now_ms - 1_000, valid_until_ms=now_ms + 3_600_000)
     for index in range(3, 5):
         node = deepcopy(fields["nodes"][0])
         node["node_id"] = f"extra-node-{index}"
         node["generation"] = 1
         fields["nodes"].append(node)
 
-    now_ms = int(fields["evaluation_time_ms"])
     inventory = {
         "cluster_uid": "cluster-python-test",
         "namespace": "default",
