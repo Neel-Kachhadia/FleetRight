@@ -215,6 +215,73 @@ implemented. The RBAC manifest has no Node `patch` permission, so FleetRight can
 Do not treat the direct eviction checks as a supported drain path. The PDB does not gate Deployment
 replica updates.
 
+## V2 workload model: Phase 1
+
+`deploy/kubernetes/fleetrightworkload-crd.yaml` defines the namespaced
+`fleetright.io/v1alpha1` `FleetRightWorkload` CRD. Its scale subresource maps
+desired replicas to `.spec.replicas`, observed replicas to `.status.replicas`, and
+the PDB selector to the serialized `.status.labelSelector`. The controller in
+`python/fleetright/workload_controller.py` owns deterministic logical replica
+Pods through `FleetRightWorkload` owner references and reconstructs them from API
+state on every reconcile. Conflicting owner/replica identity or a changed Pod
+template blocks reconciliation; no orphan replacement is adopted.
+The controller canonicalizes only order-insensitive map lists (`allowedNodes`,
+`containers`, and `ports`) in its template fingerprint. The CRD keeps `env`
+atomic and the fingerprint preserves its order because environment expansion
+can depend on earlier entries.
+
+Ordinary reconciliation targets the count of live owned Pods. A missing
+ordinal does not cause a high-ordinal Pod to be deleted when the desired count
+is already met. Scale-down removes at most one Pod per pass, preferring the
+highest ordinal whose removal preserves the availability floor; a higher Ready
+Pod at the floor may be skipped in favor of a lower non-Ready Pod. Scale-down
+only runs when the live count exceeds desired. A terminating Pod keeps its
+logical identity reserved until it is absent.
+`surgeBudget` is an upper cap reserved for a future explicit staged-replacement
+protocol; Phase 1 ordinary reconciliation does not use it and does not create
+over-desired Pods. A workload with `deletionTimestamp` is ignored so its owner
+deletion can remove dependents without the controller recreating them.
+
+The workload records allowed Node `{name, uid}` identities. Pods use required
+node affinity on `metadata.name` so the Kubernetes scheduler enforces the allowed
+name set. Each reconcile fetches one Node inventory and requires every allowed
+name to retain its recorded UID before creating Pods; later reconciles check
+scheduled Pod nodes against a fresh inventory. A same-name Node replacement
+between an inventory read and scheduler binding can race detection until the next
+reconcile. Kubernetes cannot match Node UID in native Pod affinity, so Phase 1
+does not claim exact UID placement, and V2 execution remains disabled. Optional
+topology spread uses `DoNotSchedule`; optional Pod anti-affinity
+uses `requiredDuringSchedulingIgnoredDuringExecution`. No soft affinity or
+custom scheduler is used.
+
+The `fleetright-v2` namespace enforces, audits, and warns at the Kubernetes
+`restricted` Pod Security level. Generated workload Pods set
+`runAsNonRoot: true`, default to UID/GID `10001`, and use the `RuntimeDefault`
+seccomp profile. A workload may request a different positive UID/GID or
+`fsGroup`; UID/GID zero and a user supplied `runAsNonRoot` override are rejected.
+Every generated container sets `allowPrivilegeEscalation: false` and drops all
+capabilities. The `Ready` condition reports Kubernetes Pod readiness only,
+including the configured container readiness probe; it is not a separate
+application health check.
+
+The controller runs only in the isolated `fleetright-v2` namespace. Its namespaced
+Role can manage Pods and PDBs there; a separate cluster role grants read-only
+access to Nodes. The existing `fleetright` namespace and Deployment executor
+Role are not shared with this controller. The controller keeps an owner-matched
+PodDisruptionBudget whose selector matches
+the serialized scale selector and whose integer `maxUnavailable` is capped by
+both the availability floor and maximum concurrent disruptions. Status reports
+observed, ready, available, and surge replicas plus the selector and operation references.
+CPU and memory requests are sent to the scheduler. `networkMbps` accepts only
+zero because this cluster has no network-bandwidth scheduling resource; no
+network headroom is inferred. The controller's service account is separate from
+the Deployment execution account and has no Deployment, Node mutation, or Pod
+eviction permission. This controller is workload plumbing only; the API,
+independent verifier, and V1 Deployment scale adapter are unchanged.
+An API 400, 403, or 422 while creating a generated Pod sets a sanitized
+workload condition; transient request errors and failed status writes still
+surface as controller errors.
+
 The live Docker Compose adapter smoke run changed its supported service from zero to one container
 and observed readiness and fresh metrics. A Docker API optimize/approve/execute E2E was attempted
 but did not qualify: the checked-in optimization snapshot requires at least two existing replicas,

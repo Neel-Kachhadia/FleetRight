@@ -1,0 +1,356 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: fleetrightworkloads.fleetright.io
+spec:
+  group: fleetright.io
+  scope: Namespaced
+  names:
+    plural: fleetrightworkloads
+    singular: fleetrightworkload
+    kind: FleetRightWorkload
+    shortNames: [frw]
+    categories: [fleetright]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+        scale:
+          specReplicasPath: .spec.replicas
+          statusReplicasPath: .status.replicas
+          labelSelectorPath: .status.labelSelector
+      additionalPrinterColumns:
+        - name: Desired
+          type: integer
+          jsonPath: .spec.replicas
+        - name: Ready
+          type: integer
+          jsonPath: .status.readyReplicas
+        - name: Available
+          type: string
+          jsonPath: .status.conditions[?(@.type=="Available")].status
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              required:
+                - workloadID
+                - replicas
+                - availabilityFloor
+                - disruption
+                - surgeBudget
+                - placement
+                - podTemplate
+              x-kubernetes-validations:
+                - rule: self.workloadID == oldSelf.workloadID
+                  message: workloadID is immutable
+                - rule: self.podTemplate == oldSelf.podTemplate
+                  message: podTemplate is immutable until a rollout protocol exists
+                - rule: self.placement == oldSelf.placement
+                  message: placement is immutable until a placement update protocol exists
+                - rule: self.availabilityFloor <= self.replicas
+                  message: availabilityFloor cannot exceed replicas
+              properties:
+                workloadID:
+                  type: string
+                  minLength: 1
+                  maxLength: 44
+                  pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
+                  description: Immutable logical workload identity used in deterministic replica IDs.
+                replicas:
+                  type: integer
+                  format: int32
+                  minimum: 0
+                  maximum: 1000
+                  default: 1
+                availabilityFloor:
+                  type: integer
+                  format: int32
+                  minimum: 0
+                  maximum: 1000
+                  description: Minimum Kubernetes Ready Pods protected by the managed disruption budget; Ready reflects Pod readiness conditions and probes only.
+                surgeBudget:
+                  type: integer
+                  format: int32
+                  minimum: 0
+                  maximum: 100
+                  default: 0
+                  description: Upper cap for future explicit staged replacements; Phase 1 ordinary reconciliation never creates over-desired Pods.
+                networkMbps:
+                  type: integer
+                  format: int32
+                  minimum: 0
+                  maximum: 0
+                  default: 0
+                  description: Network bandwidth scheduling is unsupported in Phase 1; nonzero requests are rejected.
+                disruption:
+                  type: object
+                  required: [maxConcurrentDisruptions]
+                  properties:
+                    maxConcurrentDisruptions:
+                      type: integer
+                      format: int32
+                      minimum: 0
+                      maximum: 1000
+                      description: Maximum simultaneous voluntary disruptions represented by the managed PDB.
+                placement:
+                  type: object
+                  required: [allowedNodes]
+                  properties:
+                    allowedNodes:
+                      type: array
+                      minItems: 1
+                      maxItems: 8
+                      x-kubernetes-list-type: map
+                      x-kubernetes-list-map-keys: [name]
+                      items:
+                        type: object
+                        required: [name, uid]
+                        properties:
+                          name:
+                            type: string
+                            minLength: 1
+                            maxLength: 253
+                            pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'
+                          uid:
+                            type: string
+                            minLength: 1
+                            maxLength: 128
+                    topology:
+                      type: object
+                      required: [key]
+                      properties:
+                        key:
+                          type: string
+                          minLength: 1
+                          maxLength: 253
+                          pattern: '^[a-zA-Z0-9]([-_.a-zA-Z0-9]*[a-zA-Z0-9])?(\/[a-zA-Z0-9]([-_.a-zA-Z0-9]*[a-zA-Z0-9])?)?$'
+                        maxSkew:
+                          type: integer
+                          format: int32
+                          minimum: 1
+                          default: 1
+                        minDomains:
+                          type: integer
+                          minimum: 1
+                    requirePodAntiAffinity:
+                      type: boolean
+                      default: false
+                podTemplate:
+                  type: object
+                  required: [containers]
+                  properties:
+                    labels:
+                      type: object
+                      additionalProperties:
+                        type: string
+                    annotations:
+                      type: object
+                      additionalProperties:
+                        type: string
+                    terminationGracePeriodSeconds:
+                      type: integer
+                      format: int64
+                      minimum: 0
+                      maximum: 300
+                    securityContext:
+                      type: object
+                      description: Optional positive UID/GID overrides; runAsNonRoot and seccomp profile are enforced by the controller.
+                      properties:
+                        runAsUser:
+                          type: integer
+                          format: int64
+                          minimum: 1
+                        runAsGroup:
+                          type: integer
+                          format: int64
+                          minimum: 1
+                        fsGroup:
+                          type: integer
+                          format: int64
+                          minimum: 1
+                    containers:
+                      type: array
+                      minItems: 1
+                      x-kubernetes-list-type: map
+                      x-kubernetes-list-map-keys: [name]
+                      items:
+                        type: object
+                        required: [name, image, resources]
+                        properties:
+                          name:
+                            type: string
+                            minLength: 1
+                            maxLength: 63
+                            pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
+                          image:
+                            type: string
+                            minLength: 1
+                          imagePullPolicy:
+                            type: string
+                            enum: [Always, IfNotPresent, Never]
+                          command:
+                            type: array
+                            items:
+                              type: string
+                          args:
+                            type: array
+                            items:
+                              type: string
+                          env:
+                            type: array
+                            x-kubernetes-list-type: atomic
+                            items:
+                              type: object
+                              required: [name]
+                              properties:
+                                name:
+                                  type: string
+                                  minLength: 1
+                                value:
+                                  type: string
+                          ports:
+                            type: array
+                            x-kubernetes-list-type: map
+                            x-kubernetes-list-map-keys: [containerPort, protocol]
+                            items:
+                              type: object
+                              required: [containerPort]
+                              properties:
+                                name:
+                                  type: string
+                                  minLength: 1
+                                  maxLength: 15
+                                containerPort:
+                                  type: integer
+                                  format: int32
+                                  minimum: 1
+                                  maximum: 65535
+                                protocol:
+                                  type: string
+                                  enum: [TCP, UDP, SCTP]
+                                  default: TCP
+                          readinessProbe:
+                            type: object
+                            properties:
+                              httpGet:
+                                type: object
+                                required: [path, port]
+                                properties:
+                                  path:
+                                    type: string
+                                  port:
+                                    anyOf:
+                                      - type: integer
+                                      - type: string
+                                    x-kubernetes-int-or-string: true
+                                  scheme:
+                                    type: string
+                                    enum: [HTTP, HTTPS]
+                              periodSeconds:
+                                type: integer
+                                format: int32
+                                minimum: 1
+                                default: 10
+                              timeoutSeconds:
+                                type: integer
+                                format: int32
+                                minimum: 1
+                                default: 1
+                              failureThreshold:
+                                type: integer
+                                format: int32
+                                minimum: 1
+                                default: 3
+                          resources:
+                            type: object
+                            required: [requests]
+                            properties:
+                              requests:
+                                type: object
+                                required: [cpu, memory]
+                                properties:
+                                  cpu:
+                                    type: string
+                                    pattern: '^(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)(?:n|u|m)?$'
+                                  memory:
+                                    type: string
+                                    pattern: '^(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)(?:Ki|Mi|Gi|Ti|Pi|Ei|K|M|G|T|P|E)?$'
+                              limits:
+                                type: object
+                                properties:
+                                  cpu:
+                                    type: string
+                                    pattern: '^(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)(?:n|u|m)?$'
+                                  memory:
+                                    type: string
+                                    pattern: '^(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)(?:Ki|Mi|Gi|Ti|Pi|Ei|K|M|G|T|P|E)?$'
+            status:
+              type: object
+              properties:
+                observedGeneration:
+                  type: integer
+                  format: int64
+                  minimum: 0
+                replicas:
+                  type: integer
+                  format: int32
+                  minimum: 0
+                readyReplicas:
+                  type: integer
+                  format: int32
+                  minimum: 0
+                availableReplicas:
+                  type: integer
+                  format: int32
+                  minimum: 0
+                surgeReplicas:
+                  type: integer
+                  format: int32
+                  minimum: 0
+                labelSelector:
+                  type: string
+                activeOperationRefs:
+                  type: array
+                  items:
+                    type: object
+                    required: [operationID, planID]
+                    properties:
+                      operationID:
+                        type: string
+                        minLength: 1
+                      planID:
+                        type: string
+                        minLength: 1
+                      sequence:
+                        type: integer
+                        format: int32
+                        minimum: 0
+                conditions:
+                  type: array
+                  x-kubernetes-list-type: map
+                  x-kubernetes-list-map-keys: [type]
+                  items:
+                    type: object
+                    required: [type, status, reason, message, lastTransitionTime]
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                        enum: ["True", "False", Unknown]
+                      reason:
+                        type: string
+                      message:
+                        type: string
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
