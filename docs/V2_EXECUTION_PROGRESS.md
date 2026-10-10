@@ -15,13 +15,12 @@ worktree was clean at start.
 **Local implementation checkpoint:** `10292a2`
 (`fix: fence workload authority across takeovers`). No tag or push was made.
 
-**Checkpoint recorded:** 2026-10-10 15:16 UTC (about 2 hours 9 minutes elapsed;
-about 6 hours 51 minutes remains to the hard stop).
+**Checkpoint recorded:** 2026-10-10 15:49 UTC (about 2 hours 42 minutes elapsed;
+about 6 hours 18 minutes remains to the hard stop).
 
-**Current committed HEAD:** `6abf694` (`docs: record Prompt 2B fencing evidence and limits`).
-The worktree contains this follow-up safety review, a stricter CRD preflight,
-updated evidence, and takeover replay regression tests; these changes are not
-yet committed.
+**Current committed HEAD:** `1671339`
+(`feat: support portless Compose scale execution`). Only the current-session
+progress and evidence documents remain uncommitted.
 
 **Current gate:** Prompt 2B remains PARTIAL. Current Kubernetes execution
 admits only monotonic scale-up on a newly created, explicitly marked
@@ -35,19 +34,20 @@ resourceVersion precondition; no safe final-mutation fence has been established.
 | Check | Result | Evidence |
 |---|---|---|
 | Initial repository audit | PASS | Expected root and branch; clean worktree; `git diff --check` clean; HEAD `d70c276`; no milestone-4 or release tag |
-| Python and PostgreSQL suite | PASS, 160 passed, 1 warning (7.93s) | `.venv/bin/python -m pytest -q python/tests`; fresh no-volume PostgreSQL 16 `fleetright_test`, trust auth bound to `127.0.0.1:32971`; temporary container stopped and removed. |
-| Targeted takeover replay regression | PASS | Included in the 160-test suite; injects response loss after fake target authorization has published the request, then checks takeover replay and one authorization. |
+| Python and PostgreSQL suite | PASS, 163 passed, 1 skipped, 1 warning (7.99s) | `.venv/bin/python -m pytest -q python/tests`; fresh no-volume PostgreSQL 16 `fleetright_test`, trust auth bound to `127.0.0.1:32975`; temporary container stopped and removed. The opt-in Docker E2E is the one skip. |
+| Targeted takeover replay regression | PASS | Included in the 162-test suite; injects response loss after fake target authorization has published the request, then checks takeover replay and one authorization. |
+| Docker API E2E | PASS, 1 passed (21.37s) | `test_docker_api_execution_changes_real_compose_state`; authenticated optimize/verify/approve/execute, duplicate request, real Compose 3→4, healthcheck readiness for all four replicas, fresh SLO metrics, injected response loss after mutation, controller-thread stop, lease expiry, new-controller takeover, observed commit without redispatch. Fresh no-volume `fleetright_test` on `127.0.0.1:32973`; isolated random project removed. |
 | CRD preflight unit and manifest checks | PASS | 5 focused tests; all 25 required runtime execution rules and required request/fence fields match the checked-in CRD. Live API-server validation remains blocked until the cluster cert is valid. |
 | C++ regression | PASS, 36/36 | `ctest --test-dir build --output-on-failure` |
-| Changed Python quality checks | PASS | Ruff 0.15.20 on all three changed Python files; `compileall` on the same files |
-| Changed Kubernetes YAML syntax and contract | PASS | PyYAML parsed the CRD and all 7 RBAC documents; direct check confirmed all 25 execution CEL rules, required fields, and scale-up protocol enum |
+| Changed Python quality checks | PASS | Ruff 0.15.20 and `compileall` on all four changed Python files |
+| Changed YAML and CRD contract | PASS | PyYAML parsed the CRD, all 7 RBAC documents, and the portless Docker fixture; direct check confirmed all 25 execution CEL rules, required fields, and scale-up protocol enum |
 | Supplied DB endpoint | BLOCKED | Credential file parsed without displaying secrets; configured database is `fleetright_test`, but `127.0.0.1:32768` refused connections and `fleetright-isolated-test-db` was absent |
 | Safety-lab live access | BLOCKED | Explicit kubeconfig/context used. Sandbox first denied localhost socket access; one elevated read reached Kubernetes client v1.37.1 but API TLS certificate is not valid until `2026-10-10 18:29:54 UTC`. No TLS bypass or cluster mutation was attempted |
-| Current V2 destructive execution | DISABLED | Source, verifier, current RBAC, ADR-008, and saved API-server race evidence reviewed; no eviction or cordon mutator exists at this HEAD |
-| Docker E2E | NOT RUN | Default sandbox denied the Docker socket. A narrowly escalated read-only `docker ps` was then allowed and showed only the three `fleetright-safety-lab` kind containers; no Docker state was changed |
+| Current V2 destructive execution | DISABLED | Source, verifier, current RBAC, ADR-008, and saved API-server race evidence reviewed; no eviction or cordon mutator exists at committed HEAD |
+| Docker failure coverage | PARTIAL | Real lost-response recovery and controller-thread takeover pass. Actual process kill, target timeout, health-regression compensation, and compensation recovery remain untested. |
 
 The full-suite DB run used a fresh no-volume container bound only to
-`127.0.0.1:32971`, confirmed database name `fleetright_test`, ran the suite,
+`127.0.0.1:32975`, confirmed database name `fleetright_test`, ran the suite,
 then stopped and removed the container. The existing
 `fleetright_fleetright-postgres` volume was not attached or changed.
 
@@ -164,27 +164,30 @@ target protocol resolves these cases.
   live `FleetRightWorkload` target, including process crash and lost response,
   remains NOT RUN in this session because the cluster certificate is not yet
   valid. Recheck only after its `NotBefore` time, with the explicit context.
-- Docker optimize/approve/execute E2E is NOT RUN. The adapter is limited to one
-  replica for the checked-in Compose service because it publishes a fixed host
-  port. Although a read-only Docker listing was authorized, no mutation was
-  attempted; the host-local lock is also not a fence for a remote or independent
-  Docker client.
-- Real Docker optimize/approve/execute state change and compensation remain
-  unqualified. The checked-in Compose services cap at one replica, while the
-  independent verifier rejected the zero-replica test fixture. Do not weaken
-  the verifier to force a pass.
+- The positive Docker API path now passes against a portless isolated Compose
+  fixture: verified 3→4 scaling, authenticated approval/execution, duplicate
+  execute replay, per-container healthchecks, and a fresh SLO window. A target
+  response is deliberately lost after the real scale; the first controller
+  records `OUTCOME_UNKNOWN`, stops, and a new controller takes over after lease
+  expiry and commits from observed state without redispatch. This is a
+  controller-thread restart simulation, not a killed/restarted process.
+- Docker target timeout, process crash/restart, health regression, successful
+  compensation, and compensation failure remain NOT RUN. The checked-in
+  Compose file still publishes fixed ports and remains single-replica; the
+  adapter permits multiple replicas only after Compose confirms no published
+  host ports. Docker's lock is host-local, not a fence against another host.
 - PDB-safe replacement/eviction, bounded drain, partial-drain recovery, and
-  live compensation remain unimplemented. Prompt 3 must not start unless every
-  mandatory Prompt 2B gate passes.
+  V2 evacuation compensation remain unimplemented. The existing scale-up
+  compensation foundation is not live-qualified. Prompt 3 must not start
+  unless every mandatory Prompt 2B gate passes.
 
 **Next executable action:** after `2026-10-10 18:29:54 UTC`, retry only the
 explicitly scoped `kind-fleetright-safety-lab` API access. If TLS and RBAC
 permit, perform bounded API-server validation of the updated workload CRD and
 the currently supported monotonic scale-up path in an isolated namespace. This
-cannot qualify destructive execution. The checked-in Docker service cannot
-scale past one replica because of its fixed host port, so no Docker E2E is
-claimed. Keep destructive execution disabled; do not create milestone 4 or
-start Prompt 3 while any mandatory gate remains incomplete.
+cannot qualify destructive execution. Keep the V2 mutation path disabled; do
+not create milestone 4 or start Prompt 3 while any mandatory gate remains
+incomplete.
 
 ## 2026-10-08 Prompt 2B continuation — Checkpoint A result (historical)
 
