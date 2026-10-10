@@ -15,13 +15,12 @@ worktree was clean at start.
 **Local implementation checkpoint:** `10292a2`
 (`fix: fence workload authority across takeovers`). No tag or push was made.
 
-**Checkpoint recorded:** 2026-10-10 16:38 UTC (about 3 hours 30 minutes elapsed;
-about 5 hours 30 minutes remains to the hard stop).
+**Checkpoint recorded:** 2026-10-10 16:48 UTC (about 3 hours 40 minutes elapsed;
+about 5 hours 20 minutes remains to the hard stop).
 
-**HEAD before this checkpoint update:** `6fc660b`
-(`docs: correct current execution checkpoint`). This update adds a narrow
-reconciler fix for confirmed-applied scale-up readiness timeouts and a live
-Docker regression test.
+**HEAD before this checkpoint update:** `88ddad1`
+(`docs: record readiness-loss recovery evidence`). This update adds a real
+Docker CLI timeout-after-apply scenario and records its full-suite result.
 
 **Current gate:** Prompt 2B remains PARTIAL. Current Kubernetes execution
 admits only monotonic scale-up on a newly created, explicitly marked
@@ -40,7 +39,9 @@ resourceVersion precondition; no safe final-mutation fence has been established.
 | Docker API E2E | PASS, 1 passed (21.31s) | `python/tests/test_prompt2a_control_api.py::test_docker_api_execution_changes_real_compose_state`; authenticated optimize/verify/approve/execute, duplicate request, real Compose 3→4, healthcheck readiness for all four replicas, fresh SLO metrics, then kill a spawned controller process after mutation while the durable action remains `RUNNING`. After lease expiry, a second controller process observes the target and commits with exactly one recorded dispatch. Fresh no-volume `fleetright_test` on `127.0.0.1:32976`; isolated random project removed. |
 | Docker post-scale readiness-loss E2E | PASS, 1 passed (47.46s) | `test_docker_api_health_regression_fails_safe_without_downscaling`; authenticated execution scales 3→4, then the isolated fixture stops one existing container after target response. The controller persists `FAILED` / `replacement-readiness-timeout`, reaches `FAILED_SAFE`, retains target count 4 with 3 Ready, and dispatches no compensation/downscale. |
 | Docker process-crash E2E rerun | PASS, 1 passed (21.57s) | `test_docker_api_execution_changes_real_compose_state`; rerun with `FLEETRIGHT_RUN_DOCKER_E2E=1` after the shared test-controller helper change. Process kill after mutation, lease expiry, takeover, and one dispatch remained passing. |
-| Python/PostgreSQL suite after readiness-timeout fix | PASS, 165 passed, 1 warning (76.53s) | `.venv/bin/python -m pytest -q python/tests` with `FLEETRIGHT_RUN_DOCKER_E2E=1`; fresh no-volume PostgreSQL 16 `fleetright_test` on loopback port 32976. Both process-crash/takeover and post-scale readiness-loss E2Es ran. Temporary DB and Compose resources were removed. |
+| Earlier Python/PostgreSQL suite after readiness-timeout fix | PASS, 165 passed | Superseded by the opt-in target-timeout run below. |
+| Docker target-timeout E2E | PASS | The `target-timeout` parameter runs real Compose scale 3→4, then withholds the CLI response past its 20-second deadline. The adapter records `OUTCOME_UNKNOWN`; reconciliation observes 4 Ready containers, commits, and retains one dispatch. |
+| Python/PostgreSQL suite with target-timeout E2E | PASS, 166 passed, 1 warning (112.55s) | `.venv/bin/python -m pytest -q python/tests` with `FLEETRIGHT_RUN_DOCKER_E2E=1`; fresh no-volume PostgreSQL 16 `fleetright_test` on loopback port 32976. Process-crash/takeover, target-timeout, and post-scale readiness-loss Docker E2Es all ran. Temporary DB and Compose resources were removed. |
 | CRD preflight unit and manifest checks | PASS | 5 focused tests; all 25 required runtime execution rules and required request/fence fields match the checked-in CRD. Live API-server validation remains blocked until the cluster cert is valid. |
 | C++ regression | PASS, 36/36 | `ctest --test-dir build --output-on-failure` |
 | Changed Python quality checks | PASS | Ruff 0.15.20 check and `compileall` pass for `reconciler.py` and the Docker E2E module; test-module format check passes. |
@@ -48,7 +49,7 @@ resourceVersion precondition; no safe final-mutation fence has been established.
 | Supplied DB endpoint | BLOCKED | Credential file parsed without displaying secrets; configured database is `fleetright_test`, but `127.0.0.1:32768` refused connections and `fleetright-isolated-test-db` was absent |
 | Safety-lab live access | BLOCKED | Explicit kubeconfig/context used. Sandbox first denied localhost socket access; one elevated read reached Kubernetes client v1.37.1 but API TLS certificate is not valid until `2026-10-10 18:29:54 UTC`. No TLS bypass or cluster mutation was attempted |
 | Current V2 destructive execution | DISABLED | Source, verifier, current RBAC, ADR-008, and saved API-server race evidence reviewed; no eviction or cordon mutator exists at committed HEAD |
-| Docker failure coverage | PARTIAL | Lost response, takeover, and post-scale readiness-loss fail-safe pass. Target timeout and destructive-operation compensation/recovery remain untested. |
+| Docker failure coverage | PARTIAL | Process-crash takeover, target timeout after real apply, and post-scale readiness-loss fail-safe pass. Destructive-operation compensation/recovery remains untested. |
 
 The full-suite DB run used a fresh no-volume container bound only to
 `127.0.0.1:32976`, confirmed database name `fleetright_test`, ran the suite,
@@ -96,6 +97,10 @@ container on the same port, then also stopped and removed it. The existing
   workload request, takeover fence applied before receipt commit, replay under
   the same pending token, and exactly one authorization; the full Python suite
   passes.
+- Added an opt-in target-timeout E2E. A test-local CLI shim runs the
+  real Compose scale to completion, then withholds only that response
+  past the target deadline. Reconciliation observes and commits the
+  new state after `OUTCOME_UNKNOWN`, with one durable dispatch.
 - A Docker readiness-loss E2E exposed a scale-up timeout path that left a
   durably confirmed action `RUNNING`, so `_fail_safe` correctly refused to
   close the execution without a takeover fence. The reconciler now marks the

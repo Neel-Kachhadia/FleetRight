@@ -4,7 +4,9 @@ import json
 import multiprocessing
 import os
 import secrets
+import shutil
 import subprocess
+import sys
 import threading
 import time
 import urllib.request
@@ -54,10 +56,49 @@ def _run_docker_e2e_controller(
     crash_after_scale_file: str | None = None,
     health_regression_container_id: str | None = None,
     health_regression_file: str | None = None,
+    timeout_after_scale_project: str | None = None,
+    timeout_shim_dir: str | None = None,
+    timeout_marker: str | None = None,
     lease_ttl_ms: int = 5_000,
     readiness_timeout_seconds: int = 90,
 ) -> None:
     target = DockerComposeTarget(compose_file=Path(compose_file), project=project)
+    if timeout_after_scale_project is not None:
+        if timeout_shim_dir is None or timeout_marker is None:
+            raise ValueError("Docker timeout shim directory and marker are required")
+        real_docker = shutil.which("docker")
+        if real_docker is None:
+            raise RuntimeError("Docker CLI is unavailable")
+        shim_dir = Path(timeout_shim_dir)
+        shim_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        shim = shim_dir / "docker"
+        # Let real Compose apply the change, then hold its response past the client timeout.
+        shim.write_text(
+            "#!" + sys.executable + "\n"
+            "import subprocess, sys, time\n"
+            f"real = {json.dumps(real_docker)}\n"
+            f"project = {json.dumps(timeout_after_scale_project)}\n"
+            f"marker = {json.dumps(timeout_marker)}\n"
+            "args = sys.argv[1:]\n"
+            "result = subprocess.run([real, *args])\n"
+            "if (result.returncode == 0 and args[:1] == ['compose'] and\n"
+            "    '--project-name' in args and\n"
+            "    args[args.index('--project-name') + 1] == project and\n"
+            "    'up' in args and '--scale' in args):\n"
+            "    with open(marker, 'w', encoding='ascii') as output:\n"
+            "        output.write('applied')\n"
+            "    time.sleep(30)\n"
+            "sys.exit(result.returncode)\n",
+            encoding="utf-8",
+        )
+        shim.chmod(0o700)
+        os.environ["PATH"] = f"{shim_dir}{os.pathsep}{os.environ['PATH']}"
+        compose = target._compose
+
+        def timeout_after_apply(*args: str, timeout: float = 15):
+            return compose(*args, timeout=20 if args and args[0] == "up" else timeout)
+
+        target._compose = timeout_after_apply  # type: ignore[method-assign]
     if crash_after_scale_file is not None or health_regression_container_id is not None:
         set_replicas = target.set_replicas
 
@@ -1134,8 +1175,12 @@ def test_api_rejects_oversized_request_body(clean_database: Database) -> None:
     os.getenv("FLEETRIGHT_RUN_DOCKER_E2E") != "1",
     reason="set FLEETRIGHT_RUN_DOCKER_E2E=1 to run the isolated Docker execution test",
 )
+@pytest.mark.parametrize("dispatch_fault", ["process-crash", "target-timeout"])
 def test_docker_api_execution_changes_real_compose_state(
-    docker_e2e_database: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    docker_e2e_database: Database,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    dispatch_fault: str,
 ) -> None:
     tokens, raw_tokens = _tokens()
     root = Path(__file__).resolve().parents[2]
@@ -1154,6 +1199,7 @@ def test_docker_api_execution_changes_real_compose_state(
     recovery_start = tmp_path / "recovery.start"
     recovery_stop = tmp_path / "recovery.stop"
     mutation_done = tmp_path / "mutation.done"
+    timeout_marker = tmp_path / "timeout-applied"
     primary: multiprocessing.Process | None = None
     recovery: multiprocessing.Process | None = None
     try:
@@ -1223,6 +1269,15 @@ def test_docker_api_execution_changes_real_compose_state(
         assert baseline_health["healthy"] is True
 
         process_context = multiprocessing.get_context("spawn")
+        primary_kwargs = (
+            {"crash_after_scale_file": str(mutation_done)}
+            if dispatch_fault == "process-crash"
+            else {
+                "timeout_after_scale_project": project,
+                "timeout_shim_dir": str(tmp_path / "docker-shim"),
+                "timeout_marker": str(timeout_marker),
+            }
+        )
         primary = process_context.Process(
             target=_run_docker_e2e_controller,
             args=(
@@ -1233,7 +1288,7 @@ def test_docker_api_execution_changes_real_compose_state(
                 "docker-e2e-controller",
                 str(primary_stop),
             ),
-            kwargs={"crash_after_scale_file": str(mutation_done)},
+            kwargs=primary_kwargs,
         )
         recovery = process_context.Process(
             target=_run_docker_e2e_controller,
@@ -1298,25 +1353,34 @@ def test_docker_api_execution_changes_real_compose_state(
             replayed = client.post(f"/v1/plans/{plan_id}/execute", headers=headers, json={})
             assert accepted.status_code == replayed.status_code == 202
             assert accepted.json() == replayed.json()
-            deadline = time.monotonic() + 60
-            while not mutation_done.exists() and time.monotonic() < deadline:
-                assert primary.is_alive(), f"execution controller exited: {primary.exitcode}"
-                time.sleep(0.1)
-            assert mutation_done.exists(), "controller did not reach the post-mutation boundary"
-            assert target.observe_scale("cpu-api")["replicas"] == 4
-            with docker_e2e_database.repository.transaction() as conn:
-                action_state = conn.execute(
-                    "SELECT execution_state FROM action_intents WHERE plan_id = %s",
-                    (plan_id,),
-                ).fetchone()["execution_state"]
-            assert action_state == "RUNNING"
-            primary.kill()
-            primary.join(timeout=10)
-            assert not primary.is_alive()
-            assert primary.exitcode != 0
+            if dispatch_fault == "process-crash":
+                deadline = time.monotonic() + 60
+                while not mutation_done.exists() and time.monotonic() < deadline:
+                    assert primary.is_alive(), f"execution controller exited: {primary.exitcode}"
+                    time.sleep(0.1)
+                assert mutation_done.exists(), "controller did not reach the post-mutation boundary"
+                assert target.observe_scale("cpu-api")["replicas"] == 4
+                with docker_e2e_database.repository.transaction() as conn:
+                    action_state = conn.execute(
+                        "SELECT execution_state FROM action_intents WHERE plan_id = %s",
+                        (plan_id,),
+                    ).fetchone()["execution_state"]
+                assert action_state == "RUNNING"
+                primary.kill()
+                primary.join(timeout=10)
+                assert not primary.is_alive()
+                assert primary.exitcode != 0
+            else:
+                deadline = time.monotonic() + 120
+                while not timeout_marker.exists() and time.monotonic() < deadline:
+                    assert primary.is_alive(), f"execution controller exited: {primary.exitcode}"
+                    time.sleep(0.1)
+                assert timeout_marker.exists(), "Compose mutation did not reach the timeout shim"
+                assert target.observe_scale("cpu-api")["replicas"] == 4
 
-        time.sleep(5.2)
-        recovery_start.write_text("start", encoding="ascii")
+        if dispatch_fault == "process-crash":
+            time.sleep(5.2)
+            recovery_start.write_text("start", encoding="ascii")
         with TestClient(app) as client:
             detail = client.get(
                 f"/v1/plans/{plan_id}",
