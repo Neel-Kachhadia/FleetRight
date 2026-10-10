@@ -25,7 +25,43 @@ _WORKLOAD_SERVICES = {
     "memory-api": "memory-service",
     "queued-api": "queued-service",
 }
-_WORKLOAD_FENCE_RULES = {
+_WORKLOAD_EXECUTION_RULES = {
+    "self.workloadID == oldSelf.workloadID",
+    "self.podTemplate == oldSelf.podTemplate",
+    "self.placement == oldSelf.placement",
+    "self.availabilityFloor == oldSelf.availabilityFloor",
+    "self.disruption == oldSelf.disruption",
+    "self.surgeBudget == oldSelf.surgeBudget",
+    "self.replicas >= oldSelf.replicas",
+    "!has(self.executionRequest) || self.executionProtocol == 'monotonic-scale-up-v1'",
+    "!has(oldSelf.executionProtocol) || self.executionProtocol == oldSelf.executionProtocol",
+    "has(oldSelf.executionProtocol) || !has(self.executionProtocol)",
+    "!has(oldSelf.executionRequest) || has(self.executionRequest)",
+    (
+        "!has(oldSelf.executionRequest) || !has(self.executionRequest) || "
+        "self.executionRequest.generation >= oldSelf.executionRequest.generation"
+    ),
+    (
+        "!has(oldSelf.executionRequest) || !has(self.executionRequest) || "
+        "(self.executionRequest.planID == oldSelf.executionRequest.planID && "
+        "self.executionRequest.operationID == oldSelf.executionRequest.operationID) || "
+        "self.executionRequest.generation > oldSelf.executionRequest.generation"
+    ),
+    (
+        "!has(oldSelf.executionRequest) || !has(self.executionRequest) || "
+        "self.executionRequest.generation > oldSelf.executionRequest.generation || "
+        "self.executionRequest == oldSelf.executionRequest"
+    ),
+    "!has(self.executionRequest) || self.executionRequest.targetReplicas == self.replicas",
+    (
+        "self.replicas <= oldSelf.replicas || (self.executionProtocol == "
+        "'monotonic-scale-up-v1' && has(self.executionRequest) && "
+        "self.executionRequest.expectedReplicas == oldSelf.replicas && "
+        "self.executionRequest.targetReplicas == self.replicas && "
+        "(!has(oldSelf.executionRequest) || self.executionRequest.generation > "
+        "oldSelf.executionRequest.generation))"
+    ),
+    "self.availabilityFloor <= self.replicas",
     "!has(oldSelf.executionFence) || has(self.executionFence)",
     (
         "!has(oldSelf.executionFence) || !has(self.executionFence) || "
@@ -464,18 +500,23 @@ class FleetRightWorkloadTarget(KubernetesTarget):
         rules = spec.get("x-kubernetes-validations", []) if isinstance(spec, dict) else []
         properties = spec.get("properties", {}) if isinstance(spec, dict) else {}
         fence = properties.get("executionFence", {}) if isinstance(properties, dict) else {}
+        request = properties.get("executionRequest", {}) if isinstance(properties, dict) else {}
+        protocol = properties.get("executionProtocol", {}) if isinstance(properties, dict) else {}
         if not isinstance(rules, list):
             rules = []
         required_fence_fields = fence.get("required", []) if isinstance(fence, dict) else []
+        required_request_fields = request.get("required", []) if isinstance(request, dict) else []
         if not isinstance(required_fence_fields, list):
             required_fence_fields = []
+        if not isinstance(required_request_fields, list):
+            required_request_fields = []
         installed_rules = {
             rule.get("rule")
             for rule in rules
             if isinstance(rule, dict) and isinstance(rule.get("rule"), str)
         }
         if not (
-            _WORKLOAD_FENCE_RULES <= installed_rules
+            _WORKLOAD_EXECUTION_RULES <= installed_rules
             and isinstance(fence, dict)
             and set(required_fence_fields)
             >= {
@@ -486,8 +527,13 @@ class FleetRightWorkloadTarget(KubernetesTarget):
                 "expectedReplicas",
                 "fencedGeneration",
             }
+            and isinstance(request, dict)
+            and set(required_request_fields)
+            >= {"planID", "operationID", "generation", "expectedReplicas", "targetReplicas"}
+            and isinstance(protocol, dict)
+            and protocol.get("enum") == ["monotonic-scale-up-v1"]
         ):
-            raise TargetPreconditionFailed("FleetRightWorkload fencing CRD is not installed")
+            raise TargetPreconditionFailed("FleetRightWorkload execution CRD is not installed")
 
     def observe_scale(self, workload_id: str) -> dict[str, Any]:
         name = _checked_name(workload_id, "workload identifier")

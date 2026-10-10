@@ -47,7 +47,25 @@ certificate is not yet valid at the session time; no TLS verification bypass or 
 attempted. The saved live negative control from 2026-10-08 demonstrates that an unready same-UID Pod
 under `IfHealthyBudget` can be evicted after its resourceVersion changes even when the PDB reports
 zero allowed disruptions. PostgreSQL leases, a Pod UID, and a resourceVersion check do not fence
-that separate final mutation. No eviction or cordon mutator exists in the current target.
+that separate final mutation. In the healthy-Pod path, Kubernetes can update PDB disruption
+bookkeeping before rejecting a stale same-name request on UID mismatch; in the unready-Pod path, it
+can skip that bookkeeping. A PDB status observation therefore cannot prove that old requests are
+fenced. A request already accepted by PDB admission can also delete its source after a later
+readiness regression. No eviction or cordon mutator exists in the current target.
+
+An irrevocable exact-UID retirement could tolerate delayed duplicate Evictions in principle only if
+all states during `OUTCOME_UNKNOWN` preserve the availability floor, capacity, topology, and allowed
+failure reserve. The current verifier/runtime does not establish those conditions. More directly,
+FleetRightWorkload reconciliation normally recreates an evicted ordinal while that ordinal remains
+below desired replicas, using the immutable old allowed-node set; a stale in-flight CREATE can do the
+same after the source UID is observed absent. The replacement may return to the source node. This
+prevents the current V2 source-exclusion and node-drain postconditions.
+
+The V2 inventory verifier binds source Pods to a Deployment and one active ReplicaSet UID, while the
+current execution target uses FleetRightWorkload-owned Pods. The existing V2 contract cannot bind to
+that target. The FleetRightWorkload PDB also uses `replicas - availabilityFloor` for `maxUnavailable`;
+it does not encode the profile-derived minimum replicas or N-1 reserve required by V2. Keep staged
+replacement, Eviction, and node drain disabled.
 
 V2 `MOVE_REPLICA`, `DEACTIVATE_NODE`, and resource resizing are rejected during planning admission
 and again before execution-journal creation. Durable staged replacement, PDB-safe eviction,

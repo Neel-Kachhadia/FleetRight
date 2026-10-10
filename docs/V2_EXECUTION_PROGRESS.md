@@ -15,8 +15,13 @@ worktree was clean at start.
 **Local implementation checkpoint:** `10292a2`
 (`fix: fence workload authority across takeovers`). No tag or push was made.
 
-**Checkpoint recorded:** 2026-10-10 14:29 UTC (about 1 hour 21 minutes elapsed;
-about 7 hours 39 minutes remain to the hard stop).
+**Checkpoint recorded:** 2026-10-10 15:16 UTC (about 2 hours 9 minutes elapsed;
+about 6 hours 51 minutes remains to the hard stop).
+
+**Current committed HEAD:** `6abf694` (`docs: record Prompt 2B fencing evidence and limits`).
+The worktree contains this follow-up safety review, a stricter CRD preflight,
+updated evidence, and takeover replay regression tests; these changes are not
+yet committed.
 
 **Current gate:** Prompt 2B remains PARTIAL. Current Kubernetes execution
 admits only monotonic scale-up on a newly created, explicitly marked
@@ -30,32 +35,37 @@ resourceVersion precondition; no safe final-mutation fence has been established.
 | Check | Result | Evidence |
 |---|---|---|
 | Initial repository audit | PASS | Expected root and branch; clean worktree; `git diff --check` clean; HEAD `d70c276`; no milestone-4 or release tag |
-| Python and PostgreSQL suite | PASS, 155 passed, 1 warning | `.venv/bin/python -m pytest -q python/tests`; `fleetright_test`; temporary no-volume PostgreSQL 16 container bound to loopback because the named container was absent; stopped and removed after the run |
+| Python and PostgreSQL suite | PASS, 160 passed, 1 warning (7.93s) | `.venv/bin/python -m pytest -q python/tests`; fresh no-volume PostgreSQL 16 `fleetright_test`, trust auth bound to `127.0.0.1:32971`; temporary container stopped and removed. |
+| Targeted takeover replay regression | PASS | Included in the 160-test suite; injects response loss after fake target authorization has published the request, then checks takeover replay and one authorization. |
+| CRD preflight unit and manifest checks | PASS | 5 focused tests; all 25 required runtime execution rules and required request/fence fields match the checked-in CRD. Live API-server validation remains blocked until the cluster cert is valid. |
 | C++ regression | PASS, 36/36 | `ctest --test-dir build --output-on-failure` |
-| Changed Python quality checks | PASS | `ruff check` on changed Python files; `python3 -m compileall -q` on changed Python source files |
-| Changed Kubernetes YAML syntax | PASS | PyYAML parsed the modified FleetRightWorkload CRD and RBAC manifests |
+| Changed Python quality checks | PASS | Ruff 0.15.20 on all three changed Python files; `compileall` on the same files |
+| Changed Kubernetes YAML syntax and contract | PASS | PyYAML parsed the CRD and all 7 RBAC documents; direct check confirmed all 25 execution CEL rules, required fields, and scale-up protocol enum |
 | Supplied DB endpoint | BLOCKED | Credential file parsed without displaying secrets; configured database is `fleetright_test`, but `127.0.0.1:32768` refused connections and `fleetright-isolated-test-db` was absent |
 | Safety-lab live access | BLOCKED | Explicit kubeconfig/context used. Sandbox first denied localhost socket access; one elevated read reached Kubernetes client v1.37.1 but API TLS certificate is not valid until `2026-10-10 18:29:54 UTC`. No TLS bypass or cluster mutation was attempted |
 | Current V2 destructive execution | DISABLED | Source, verifier, current RBAC, ADR-008, and saved API-server race evidence reviewed; no eviction or cordon mutator exists at this HEAD |
 | Docker E2E | NOT RUN | Default sandbox denied the Docker socket. A narrowly escalated read-only `docker ps` was then allowed and showed only the three `fleetright-safety-lab` kind containers; no Docker state was changed |
 
-The test DB run used a fresh no-volume container bound only to
-`127.0.0.1:32768`, generated a temporary password, confirmed the database name,
-ran the full suite, then stopped and removed the container. The existing
+The full-suite DB run used a fresh no-volume container bound only to
+`127.0.0.1:32971`, confirmed database name `fleetright_test`, ran the suite,
+then stopped and removed the container. The existing
 `fleetright_fleetright-postgres` volume was not attached or changed.
 
 ### Current-session fence changes and review
 
-- The FleetRightWorkload CRD now binds authorization to a
-  `fencedGeneration`; admission rules require generation advancement and
-  prevent removing, decreasing, or reusing the authority token with a changed
-  fence. Target observations fail closed when the recorded generation does not
-  match the object generation.
-- Takeover receipt validation now checks the latest dispatch against the live
-  target fence. A late request that wins after a takeover has recorded a
-  `PENDING` precondition is rejected as stale, observed, and re-fenced before
-  authorization continues. Repeated takeover replay reconstructs the prior
-  fenced generation instead of assuming a single-generation step.
+- The FleetRightWorkload target preflight now requires the immutable and
+  monotonic execution CEL rules, request/fence fields, and protocol enum before
+  it patches the target. This closes the defense-in-depth gap where an
+  incomplete CRD could pass the fence-only preflight. Target observations also
+  fail closed unless `fencedGeneration` equals `metadata.generation`; CEL does
+  not directly compare those metadata fields.
+- Takeover receipt validation checks the latest dispatch against the live
+  target fence. If a delayed old authorization wins before the takeover fence
+  is written, the controller re-observes and adopts that exact published
+  request before recording the new fence; the old request is not rejected in
+  that ordering. An authorization arriving after a newer fence is rejected,
+  and an old receipt cannot close a later dispatch. Repeated takeover replay
+  reconstructs the prior fenced generation.
 - Added direct target and PostgreSQL journal race coverage for stale
   preconditions, same-token replay, repeated takeover, delayed old authorization,
   and an old receipt arriving after a newer dispatch.
@@ -66,6 +76,76 @@ ran the full suite, then stopped and removed the container. The existing
   subscription failed before inference because DNS could not reach its API
   (`EAI_AGAIN`); `ANTHROPIC_API_KEY` was absent, and no pay-as-you-go API was
   used.
+- Claude Opus 5.5 Medium completed a read-only principal review through the
+  first-party Pro subscription. It confirmed the destructive path must remain
+  disabled and found additional contract mismatches: V2 binds Deployment and
+  ReplicaSet identities, not FleetRightWorkload-owned Pods; the managed FRW
+  PDB protects `availabilityFloor`, not the profile-required replica count and
+  N-1 reserve. Review conclusions are advisory; source checks and tests are
+  recorded separately. The wrapper reported the two `--conclusion` arguments
+  as excluded file paths, but the Sol findings were present in the supplied
+  evidence file.
+- The scale-up review's possible fake-ordering finding was withdrawn after
+  confirming the current fake already handles same-fence replay before the
+  changed-precondition rejection. A regression test now covers a published
+  workload request, takeover fence applied before receipt commit, replay under
+  the same pending token, and exactly one authorization; the full Python suite
+  passes.
+
+### Independent destructive-action race review
+
+GPT-6.1 Sol High and Sol Max reviewed whether an irrevocable authorization to
+evict one exact Pod UID could make a delayed Eviction safe. They found this is
+viable in principle only if the intent stays irrevocable while that UID exists,
+every request targets that UID, and every state reachable during
+`OUTCOME_UNKNOWN` preserves the availability floor, capacity, topology, and
+allowed failure reserve. The current V2 runtime does not establish those
+conditions, and that narrow retirement promise still does not meet V2's
+source-excluding placement or node-drain postconditions.
+
+The FleetRightWorkload controller can have a stale Pod CREATE in flight after
+it observed a logical ordinal absent. Another reconcile can create UID `U`, a
+staged operation can replace and evict `U`, and the old CREATE can then be
+accepted under the same deterministic Pod name, producing UID `U2` from the
+old workload placement. `reconcile_workload` separates GET and CREATE at
+`python/fleetright/workload_controller.py:984-1020`; the existing
+`test_delayed_old_create_after_takeover_remains_a_valid_deterministic_slot`
+demonstrates a delayed CREATE crossing a takeover, and
+`test_terminal_pod_replacement_uses_same_deterministic_slot_after_removal`
+demonstrates same-name reuse after removal. `U2` may be placed back on the
+source node, so source absence observed once is not a durable drain proof.
+
+The current controller's independent Pod CREATE path has no cross-resource
+atomic fence with workload authority, so it cannot prove source exclusion or
+durable drain against this ordering. Keep Pod eviction, staged replacement,
+and node drain disabled until a target-side protocol proves the complete
+permitted outcome set safe. This is a material Prompt 2B blocker; no milestone
+tag or Prompt 3 qualification is authorized.
+
+The normal reconciliation path recreates the same logical ordinal after it is
+evicted while that ordinal remains below the immutable desired count. The
+deterministic replacement can use the old allowed-node set and may return to
+the source node even without a stale request. V2's independent verifier also
+requires each source Pod's controller UID to equal the active ReplicaSet UID;
+FleetRightWorkload Pods are instead owned by the FleetRightWorkload UID. The
+current V2 contract therefore cannot bind to this execution target. Its
+managed PDB computes `maxUnavailable` from `availabilityFloor` and does not
+encode the verifier's profile-required replica floor or N-1 reserve. These
+are additional Prompt 2B blockers, not gates that can be closed by the current
+scale-up path.
+
+The review also identified two Eviction API subtleties in pinned Kubernetes
+v1.37.0 source. An accepted Eviction can delete its source after a later
+replacement-readiness regression; a PDB check at admission does not reserve
+future readiness. In the healthy-Pod path, a stale same-name request may
+decrement disruption allowance and record `disruptedPods` before the final UID
+mismatch prevents Pod mutation. In the unready-Pod path, the handler may
+replace the caller's resourceVersion and skip that PDB bookkeeping entirely.
+Thus neither UID mismatch, resourceVersion, nor PDB status alone proves that a
+stale request had no side effects or that no request remains in flight.
+Finally, refusing every resend can remain `OUTCOME_UNKNOWN` forever after a
+crash between durable dispatch recording and HTTP transmission. No current
+target protocol resolves these cases.
 
 ### Source findings and remaining Prompt 2B gates
 
@@ -98,12 +178,13 @@ ran the full suite, then stopped and removed the container. The existing
   mandatory Prompt 2B gate passes.
 
 **Next executable action:** after `2026-10-10 18:29:54 UTC`, retry only the
-explicitly scoped `kind-fleetright-safety-lab` API access and, if TLS and RBAC
-permit, qualify the updated `FleetRightWorkload` CRD/controller scale-up path
-through the authenticated API. The checked-in Docker service cannot scale past
-one replica because of its fixed host port, so no Docker E2E is claimed. Keep
-destructive execution disabled; do not create milestone 4 or start Prompt 3
-while any mandatory gate remains incomplete.
+explicitly scoped `kind-fleetright-safety-lab` API access. If TLS and RBAC
+permit, perform bounded API-server validation of the updated workload CRD and
+the currently supported monotonic scale-up path in an isolated namespace. This
+cannot qualify destructive execution. The checked-in Docker service cannot
+scale past one replica because of its fixed host port, so no Docker E2E is
+claimed. Keep destructive execution disabled; do not create milestone 4 or
+start Prompt 3 while any mandatory gate remains incomplete.
 
 ## 2026-10-08 Prompt 2B continuation — Checkpoint A result (historical)
 
@@ -147,8 +228,10 @@ milestone tag was made.
   placement, availability floor, disruption policy, or surge budget.
 - One Kubernetes Merge Patch, guarded by the object's current
   `metadata.resourceVersion`, writes the durable plan/action identity,
-  execution generation, expected/target replica counts, and new replica
-  high-water mark. A losing concurrent writer receives a Kubernetes 409. The
+  execution generation, expected/target replica counts, and raises
+  `spec.replicas` in the same update. That value is the monotonic high-water
+  value; no separate high-water field exists. A losing concurrent writer
+  receives a Kubernetes 409. The
   generation uses the durable SQL execution fencing token. A new action is
   blocked until the previous action is `APPLIED`, the current generation is
   observed with `Reconciled=True`, and its replica count matches the journal.

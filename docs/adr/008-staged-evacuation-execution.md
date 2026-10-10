@@ -74,9 +74,11 @@ FleetRightWorkload is exposed through the Kubernetes API target. Direct
 Deployment execution is rejected by application configuration and the executor
 Role has no Deployment, Pod, Eviction, PDB, or Node mutation permission. The
 executor atomically publishes its durable plan/action identity, SQL fencing
-generation, expected replica count, target count, and new replica high-water
-mark using a resourceVersion-guarded write to the FleetRightWorkload object.
-The existing FleetRightWorkload controller remains the only Pod creator.
+generation, expected and target replica counts, and the increase to
+`spec.replicas` in one resourceVersion-guarded write to the
+FleetRightWorkload object. `spec.replicas` is the monotonic high-water value;
+there is no separate high-water field. The existing FleetRightWorkload
+controller remains the only Pod creator.
 
 This is a narrow monotonic scale-up guarantee, not a general stale-request
 fence: an old Pod CREATE can arrive after takeover. It remains compatible only
@@ -273,3 +275,77 @@ mathematical acceptance separately and always sets
 bounded destination set and anti-affinity, bind eviction atomically to the
 durable fencing token, recheck Deployment/ReplicaSet ownership, or resume the
 staged protocol after restart. No live drain or eviction was attempted.
+
+## 2026-10-10 delayed CREATE review
+
+Sol High and Sol Max reviewed whether permanent authorization to evict one
+exact source Pod UID could make delayed Eviction requests safe. Exact-UID
+retirement is viable in principle only if every state reachable while the
+outcome is unknown still preserves availability, capacity, topology, and the
+complete allowed failure reserve. Retaining the replacement object does not
+prove this. For example, with source `S`, survivor `B`, and replacement `R`
+all Ready at floor two, an Eviction can pass PDB admission; if `R` becomes
+unready before the already-accepted request deletes `S`, only `B` remains
+Ready. The current proof/runtime does not bound or preserve all such
+interleavings. Even a safe retirement-only promise would not satisfy the
+current V2 contract's source-excluding allowed-node set and final placement.
+
+The current FleetRightWorkload reconciler has a separate delayed CREATE race.
+It derives a deterministic Pod name and placement from its workload snapshot,
+then performs GET followed by CREATE in separate API calls
+(`python/fleetright/workload_controller.py:302-304,342-435,984-1020`). A stale
+reconcile can observe an ordinal absent and pause; another reconcile can
+create UID `U`; a staged operation can retain its replacement, evict `U`, and
+observe `U` absent; then the old CREATE can be accepted under the same name
+with UID `U2` and the old placement. `U2` may return to the source node. The
+existing delayed-create/takeover and same-name-after-removal tests
+(`python/tests/test_workload_controller.py`,
+`test_delayed_old_create_after_takeover_remains_a_valid_deterministic_slot`
+and `test_terminal_pod_replacement_uses_same_deterministic_slot_after_removal`)
+confirm the component behaviors that make this ordering possible.
+
+Kubernetes exposes no atomic transaction between updating workload authority
+and persisting a separate Pod CREATE. The current controller therefore cannot
+prove source exclusion or durable node drain against a paused old CREATE. Do
+not implement V2 eviction, staged replacement, or node drain on top of this
+controller unless a target-side protocol proves all stale CREATE orderings
+safe while preserving the current V2 placement contract. These actions remain
+disabled; the V2 verifier continues to set `execution_admitted=false`.
+
+The Kubernetes v1.37.0 handler also makes PDB status unsuitable as a request
+fence. On the healthy path, a stale same-name request can decrement the PDB
+and register `disruptedPods[name]` before the final UID mismatch rejects Pod
+mutation ([handler ordering](https://github.com/kubernetes/kubernetes/blob/v1.37.0/pkg/registry/core/pod/storage/eviction.go#L246),
+[PDB update](https://github.com/kubernetes/kubernetes/blob/v1.37.0/pkg/registry/core/pod/storage/eviction.go#L432-L450),
+[UID check](https://github.com/kubernetes/kubernetes/blob/v1.37.0/pkg/registry/core/pod/storage/eviction.go#L297-L302)). On the unready path, the handler can replace the caller's resourceVersion and skip that bookkeeping, as recorded in [the live negative control](../evidence/execution-authority-race-2026-10-08.txt). Thus a UID mismatch does not imply zero side effects, while absence from `disruptedPods` does not prove that no delayed request remains.
+
+A rule that forbids every resend can remain `OUTCOME_UNKNOWN` indefinitely after
+a crash between the durable dispatch record and the HTTP send. The current
+target has no idempotent target-side dispatch record that resolves this gap.
+Together with the stale CREATE and readiness races, this keeps the required
+V2 mutation path disabled; no milestone 4 or Prompt 3 qualification is
+authorized.
+
+## V2 and FleetRightWorkload contract mismatch
+
+The independent V2 verifier's snapshot inventory binds every workload to a
+Deployment and one active ReplicaSet, and requires each source Pod's owner UID
+to equal that ReplicaSet UID (`cpp/src/verifier_v2.cpp`,
+`SnapshotIdentityValid` and `v2_source_pod_owner_and_node_uid`). The current
+execution target instead uses Pods owned by a FleetRightWorkload. V2 therefore
+cannot verify a source object from the current execution target without a
+contract change; the current API correctly rejects V2 execution.
+
+The FleetRightWorkload PDB is also weaker than V2's proof. Its
+`maxUnavailable` is bounded by `replicas - availabilityFloor` and
+`maxConcurrentDisruptions`; it does not encode the profile-derived required
+replica count or N-1 recovery reserve that V2 verifies. No Eviction is exposed,
+so this PDB is not currently an execution authorization. It cannot serve as
+the sole disruption proof for V2.
+
+The current target's CRD preflight now checks all 25 required immutable,
+monotonic, request, and fence validation rules, plus required request/fence
+fields and the scale-up protocol enum. The check is covered by unit tests and
+the checked-in manifest; API-server validation of these CEL rules remains
+unverified for the current checkpoint because the safety-lab certificate is
+not yet valid.

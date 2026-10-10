@@ -941,6 +941,78 @@ def test_workload_second_controller_recovers_fence_written_before_first_claim(
     assert receipt["fence_precondition"]["generation"] + 1 == receipt["generation"]
 
 
+def test_workload_takeover_replays_published_request_after_fence_response_loss(
+    clean_database: Database,
+) -> None:
+    repo = clean_database.repository
+    controller_a, _legacy_target, _health = _prepare_controller(
+        repo, "workload-published-fence-replay", 2, 3
+    )
+    target = FakeFleetRightWorkloadTarget(2)
+    authorize_scale = target.authorize_scale
+
+    def lose_authorization_response(*args: object, **kwargs: object) -> dict[str, object]:
+        authorize_scale(*args, **kwargs)  # type: ignore[arg-type]
+        raise OutcomeUnknown("injected lost workload authorization response")
+
+    target.authorize_scale = lose_authorization_response  # type: ignore[method-assign]
+    controller_a.target = target
+    controller_a.run_once()
+
+    assert target.replicas == 3
+    assert target.authorizations == 1
+    assert target.execution_request is not None
+    published_generation = target.execution_request["generation"]
+
+    with repo.transaction() as conn:
+        conn.execute(
+            "UPDATE plan_executions SET controller_lease_expires_at = clock_timestamp() "
+            "WHERE plan_id = 'workload-published-fence-replay'"
+        )
+    controller_b = ExecutionController(repo, target, FakeHealth(), "controller-b")
+    target.crash_after_fence = True
+    with pytest.raises(SystemExit, match="crash after target fence"):
+        controller_b.run_once()
+
+    with repo.transaction() as conn:
+        pending_token = conn.execute(
+            "SELECT pending_controller_fencing_token FROM plan_executions "
+            "WHERE plan_id = 'workload-published-fence-replay'"
+        ).fetchone()["pending_controller_fencing_token"]
+        pending = Repository.execution_fence_receipt(
+            conn, "workload-published-fence-replay", "scale", pending_token
+        )
+    assert pending is not None and pending["state"] == "PENDING"
+    assert target.execution_fence is not None
+    assert target.execution_fence["generation"] == pending_token
+    assert target.execution_request["generation"] == published_generation
+
+    target.mark_applied()
+    for _ in range(5):
+        controller_b.run_once()
+
+    with repo.transaction() as conn:
+        action = conn.execute(
+            "SELECT execution_state FROM action_intents "
+            "WHERE plan_id = 'workload-published-fence-replay'"
+        ).fetchone()
+        execution = conn.execute(
+            "SELECT status FROM plan_executions "
+            "WHERE plan_id = 'workload-published-fence-replay'"
+        ).fetchone()
+        receipt = Repository.execution_fence_receipt(
+            conn, "workload-published-fence-replay", "scale", pending_token
+        )
+    assert action["execution_state"] == "SUCCEEDED"
+    assert execution["status"] == "COMMITTED"
+    assert receipt is not None and receipt["state"] == "COMPLETE"
+    assert receipt["fence_replayed"] is True
+    assert receipt["operation_applied_before_fence"] is True
+    assert target.execution_request["generation"] == published_generation
+    assert target.replicas == 3
+    assert target.authorizations == 1
+
+
 def test_old_takeover_receipt_cannot_close_or_unfence_a_new_dispatch(
     clean_database: Database,
 ) -> None:

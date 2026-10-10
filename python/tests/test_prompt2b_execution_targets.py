@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 from fleetright.api import create_app
 from fleetright.execution import (
-    _WORKLOAD_FENCE_RULES,
+    _WORKLOAD_EXECUTION_RULES,
     ActionBlocked,
     DockerComposeTarget,
     FleetRightWorkloadTarget,
@@ -385,17 +385,8 @@ def test_workload_request_cas_binds_identity_generation_and_replica_target(
     }
 
 
-def test_workload_preflight_requires_old_fence_advance_rule(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    target = FleetRightWorkloadTarget(namespace="fleetright-v2")
-    advance_rule = (
-        "!has(oldSelf.executionFence) || !has(self.executionRequest) || "
-        "(has(oldSelf.executionRequest) && self.executionRequest == oldSelf.executionRequest) || "
-        "self.executionRequest.generation > oldSelf.executionFence.generation"
-    )
-    assert advance_rule in _WORKLOAD_FENCE_RULES
-    crd = {
+def _execution_crd(rules: set[str]) -> dict[str, object]:
+    return {
         "spec": {
             "versions": [
                 {
@@ -405,6 +396,18 @@ def test_workload_preflight_requires_old_fence_advance_rule(
                             "properties": {
                                 "spec": {
                                     "properties": {
+                                        "executionProtocol": {
+                                            "enum": ["monotonic-scale-up-v1"]
+                                        },
+                                        "executionRequest": {
+                                            "required": [
+                                                "planID",
+                                                "operationID",
+                                                "generation",
+                                                "expectedReplicas",
+                                                "targetReplicas",
+                                            ]
+                                        },
                                         "executionFence": {
                                             "required": [
                                                 "planID",
@@ -414,12 +417,10 @@ def test_workload_preflight_requires_old_fence_advance_rule(
                                                 "expectedReplicas",
                                                 "fencedGeneration",
                                             ]
-                                        }
+                                        },
                                     },
                                     "x-kubernetes-validations": [
-                                        {"rule": rule}
-                                        for rule in _WORKLOAD_FENCE_RULES
-                                        if rule != advance_rule
+                                        {"rule": rule} for rule in rules
                                     ],
                                 }
                             }
@@ -429,9 +430,56 @@ def test_workload_preflight_requires_old_fence_advance_rule(
             ]
         }
     }
+
+
+def test_workload_preflight_requires_old_fence_advance_rule(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = FleetRightWorkloadTarget(namespace="fleetright-v2")
+    advance_rule = (
+        "!has(oldSelf.executionFence) || !has(self.executionRequest) || "
+        "(has(oldSelf.executionRequest) && self.executionRequest == oldSelf.executionRequest) || "
+        "self.executionRequest.generation > oldSelf.executionFence.generation"
+    )
+    assert advance_rule in _WORKLOAD_EXECUTION_RULES
+    crd = _execution_crd(_WORKLOAD_EXECUTION_RULES - {advance_rule})
     monkeypatch.setattr(target, "_json", lambda *_args: crd)
 
-    with pytest.raises(TargetPreconditionFailed, match="fencing CRD is not installed"):
+    with pytest.raises(TargetPreconditionFailed, match="execution CRD is not installed"):
+        target._require_fencing_schema()
+
+
+@pytest.mark.parametrize(
+    "missing_rule",
+    [
+        "self.replicas >= oldSelf.replicas",
+        "self.placement == oldSelf.placement",
+        "self.podTemplate == oldSelf.podTemplate",
+    ],
+)
+def test_workload_preflight_requires_immutable_monotonic_contract_rules(
+    monkeypatch: pytest.MonkeyPatch, missing_rule: str
+) -> None:
+    target = FleetRightWorkloadTarget(namespace="fleetright-v2")
+    assert missing_rule in _WORKLOAD_EXECUTION_RULES
+    crd = _execution_crd(_WORKLOAD_EXECUTION_RULES - {missing_rule})
+    monkeypatch.setattr(target, "_json", lambda *_args: crd)
+
+    with pytest.raises(TargetPreconditionFailed, match="execution CRD is not installed"):
+        target._require_fencing_schema()
+
+
+def test_workload_preflight_requires_complete_execution_request_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = FleetRightWorkloadTarget(namespace="fleetright-v2")
+    crd = _execution_crd(_WORKLOAD_EXECUTION_RULES)
+    version = crd["spec"]["versions"][0]
+    spec = version["schema"]["openAPIV3Schema"]["properties"]["spec"]
+    spec["properties"]["executionRequest"]["required"].remove("targetReplicas")
+    monkeypatch.setattr(target, "_json", lambda *_args: crd)
+
+    with pytest.raises(TargetPreconditionFailed, match="execution CRD is not installed"):
         target._require_fencing_schema()
 
 
@@ -685,7 +733,7 @@ def test_workload_mutation_fails_closed_when_fencing_crd_is_old(
 
     monkeypatch.setattr(target, "_json", apply)
     before = target.observe_scale("cpu-api")
-    with pytest.raises(TargetPreconditionFailed, match="fencing CRD is not installed"):
+    with pytest.raises(TargetPreconditionFailed, match="execution CRD is not installed"):
         target.authorize_scale(
             "cpu-api",
             12,
