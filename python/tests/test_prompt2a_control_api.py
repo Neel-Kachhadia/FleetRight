@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
 import secrets
 import subprocess
@@ -27,7 +28,8 @@ from fleetright.control import (
     Repository,
     transition_allowed,
 )
-from fleetright.execution import DockerComposeTarget, OutcomeUnknown, WorkloadHealthObserver
+from fleetright.execution import DockerComposeTarget, WorkloadHealthObserver
+from fleetright.reconciler import ExecutionController
 from fleetright.scenario import oracle_snapshot_fields
 from psycopg import sql
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
@@ -38,6 +40,60 @@ from psycopg.types.json import Jsonb
 class Database:
     repository: Repository
     dsn: str = field(repr=False)
+
+
+def _run_docker_e2e_controller(
+    dsn: str,
+    compose_file: str,
+    project: str,
+    health_url: str,
+    controller_id: str,
+    stop_file: str,
+    *,
+    start_file: str | None = None,
+    crash_after_scale_file: str | None = None,
+) -> None:
+    target = DockerComposeTarget(compose_file=Path(compose_file), project=project)
+    if crash_after_scale_file is not None:
+        set_replicas = target.set_replicas
+
+        def block_after_scale(
+            workload_id: str,
+            replicas: int,
+            observed: dict[str, object],
+            *,
+            expected_replicas: int,
+            fencing_token: int,
+        ) -> dict[str, object]:
+            result = set_replicas(
+                workload_id,
+                replicas,
+                observed,
+                expected_replicas=expected_replicas,
+                fencing_token=fencing_token,
+            )
+            Path(crash_after_scale_file).write_text("applied", encoding="ascii")
+            threading.Event().wait(3_600)
+            return result
+
+        target.set_replicas = block_after_scale  # type: ignore[method-assign]
+
+    if start_file is not None:
+        while not Path(start_file).exists() and not Path(stop_file).exists():
+            time.sleep(0.05)
+    controller = ExecutionController(
+        Repository(dsn),
+        target,
+        WorkloadHealthObserver({"cpu-api": health_url}),
+        controller_id,
+        lease_ttl_ms=5_000,
+        max_attempts=2,
+        readiness_timeout_seconds=90,
+        poll_seconds=0.1,
+    )
+    while not Path(stop_file).exists():
+        controller.run_once()
+        time.sleep(0.1)
 
 
 @pytest.fixture(scope="module")
@@ -1074,40 +1130,16 @@ def test_docker_api_execution_changes_real_compose_state(
     monkeypatch.setenv("FLEETRIGHT_EXECUTION_LEASE_TTL_MS", "5000")
     monkeypatch.setenv("FLEETRIGHT_RECONCILE_POLL_SECONDS", "5")
 
-    class LostResponseComposeTarget(DockerComposeTarget):
-        def __init__(self) -> None:
-            super().__init__(compose_file=compose_file, project=project)
-            self.set_calls = 0
-            self.mutation_done = threading.Event()
-            self.allow_response = threading.Event()
-
-        def set_replicas(
-            self,
-            workload_id: str,
-            replicas: int,
-            observed: dict[str, object],
-            *,
-            expected_replicas: int,
-            fencing_token: int,
-        ) -> dict[str, object]:
-            self.set_calls += 1
-            result = super().set_replicas(
-                workload_id,
-                replicas,
-                observed,
-                expected_replicas=expected_replicas,
-                fencing_token=fencing_token,
-            )
-            if self.set_calls == 1:
-                self.mutation_done.set()
-                self.allow_response.wait(30)
-                raise OutcomeUnknown("injected lost Compose response after replica change")
-            return result
-
-    target = LostResponseComposeTarget()
+    target = DockerComposeTarget(compose_file=compose_file, project=project)
     traffic_stop = threading.Event()
     traffic_errors: list[str] = []
     traffic_thread: threading.Thread | None = None
+    primary_stop = tmp_path / "primary.stop"
+    recovery_start = tmp_path / "recovery.start"
+    recovery_stop = tmp_path / "recovery.stop"
+    mutation_done = tmp_path / "mutation.done"
+    primary: multiprocessing.Process | None = None
+    recovery: multiprocessing.Process | None = None
     try:
         target._compose(
             "up",
@@ -1174,6 +1206,34 @@ def test_docker_api_execution_changes_real_compose_state(
         assert baseline_health["fresh_sample"] is True
         assert baseline_health["healthy"] is True
 
+        process_context = multiprocessing.get_context("spawn")
+        primary = process_context.Process(
+            target=_run_docker_e2e_controller,
+            args=(
+                docker_e2e_database.dsn,
+                str(compose_file),
+                project,
+                health_url,
+                "docker-e2e-controller",
+                str(primary_stop),
+            ),
+            kwargs={"crash_after_scale_file": str(mutation_done)},
+        )
+        recovery = process_context.Process(
+            target=_run_docker_e2e_controller,
+            args=(
+                docker_e2e_database.dsn,
+                str(compose_file),
+                project,
+                health_url,
+                "docker-e2e-controller-recovery",
+                str(recovery_stop),
+            ),
+            kwargs={"start_file": str(recovery_start)},
+        )
+        primary.start()
+        recovery.start()
+
         app = create_app(
             docker_e2e_database.repository,
             tokens=tokens,
@@ -1181,8 +1241,7 @@ def test_docker_api_execution_changes_real_compose_state(
             execution_target="docker",
             target_adapter=target,
             health_observer=health,
-            controller_id="docker-e2e-controller",
-            start_execution_worker=True,
+            start_execution_worker=False,
         )
         with TestClient(app) as client:
             now_ms = time.time_ns() // 1_000_000
@@ -1223,42 +1282,26 @@ def test_docker_api_execution_changes_real_compose_state(
             replayed = client.post(f"/v1/plans/{plan_id}/execute", headers=headers, json={})
             assert accepted.status_code == replayed.status_code == 202
             assert accepted.json() == replayed.json()
-            assert target.mutation_done.wait(60)
+            deadline = time.monotonic() + 60
+            while not mutation_done.exists() and time.monotonic() < deadline:
+                assert primary.is_alive(), f"execution controller exited: {primary.exitcode}"
+                time.sleep(0.1)
+            assert mutation_done.exists(), "controller did not reach the post-mutation boundary"
             assert target.observe_scale("cpu-api")["replicas"] == 4
-            target.allow_response.set()
-
-            deadline = time.monotonic() + 10
             with docker_e2e_database.repository.transaction() as conn:
                 action_state = conn.execute(
                     "SELECT execution_state FROM action_intents WHERE plan_id = %s",
                     (plan_id,),
                 ).fetchone()["execution_state"]
-            while action_state != "OUTCOME_UNKNOWN" and time.monotonic() < deadline:
-                time.sleep(0.1)
-                with docker_e2e_database.repository.transaction() as conn:
-                    action_state = conn.execute(
-                        "SELECT execution_state FROM action_intents WHERE plan_id = %s",
-                        (plan_id,),
-                    ).fetchone()["execution_state"]
-            assert action_state == "OUTCOME_UNKNOWN"
-            app.state.execution_stop.set()
-            app.state.execution_thread.join(timeout=5)
-            assert not app.state.execution_thread.is_alive()
+            assert action_state == "RUNNING"
+            primary.kill()
+            primary.join(timeout=10)
+            assert not primary.is_alive()
+            assert primary.exitcode != 0
 
         time.sleep(5.2)
-        monkeypatch.setenv("FLEETRIGHT_RECONCILE_POLL_SECONDS", "0.2")
-        recovery_target = DockerComposeTarget(compose_file=compose_file, project=project)
-        recovery_app = create_app(
-            docker_e2e_database.repository,
-            tokens=tokens,
-            mode="EXECUTE",
-            execution_target="docker",
-            target_adapter=recovery_target,
-            health_observer=health,
-            controller_id="docker-e2e-controller-recovery",
-            start_execution_worker=True,
-        )
-        with TestClient(recovery_app) as client:
+        recovery_start.write_text("start", encoding="ascii")
+        with TestClient(app) as client:
             detail = client.get(
                 f"/v1/plans/{plan_id}",
                 headers={"Authorization": f"Bearer {raw_tokens['viewer']}"},
@@ -1278,7 +1321,7 @@ def test_docker_api_execution_changes_real_compose_state(
                     headers={"Authorization": f"Bearer {raw_tokens['viewer']}"},
                 )
             assert detail.status_code == 200
-            final_target = recovery_target.observe_scale("cpu-api")
+            final_target = target.observe_scale("cpu-api")
             assert final_target["replicas"] == final_target["ready_replicas"] == 4
             with docker_e2e_database.repository.transaction() as conn:
                 execution = conn.execute(
@@ -1293,9 +1336,23 @@ def test_docker_api_execution_changes_real_compose_state(
             assert action["execution_state"] == "SUCCEEDED"
             assert action["execution_result"]["target_observation"]["replicas"] == 4
             assert action["execution_result"]["unknown_resolutions"]
-            assert target.set_calls == 1
+            dispatches = [
+                item
+                for item in action["execution_result"]["progress"]
+                if isinstance(item, dict)
+                and isinstance(item.get("result"), dict)
+                and "dispatch_target_replicas" in item["result"]
+            ]
+            assert len(dispatches) == 1
     finally:
-        target.allow_response.set()
+        primary_stop.write_text("stop", encoding="ascii")
+        recovery_start.write_text("start", encoding="ascii")
+        recovery_stop.write_text("stop", encoding="ascii")
+        for process in (primary, recovery):
+            if process is not None and process.pid is not None and process.is_alive():
+                process.kill()
+            if process is not None and process.pid is not None:
+                process.join(timeout=10)
         traffic_stop.set()
         if traffic_thread is not None:
             traffic_thread.join(timeout=5)
