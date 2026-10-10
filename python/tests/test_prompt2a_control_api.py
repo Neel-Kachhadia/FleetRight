@@ -52,9 +52,13 @@ def _run_docker_e2e_controller(
     *,
     start_file: str | None = None,
     crash_after_scale_file: str | None = None,
+    health_regression_container_id: str | None = None,
+    health_regression_file: str | None = None,
+    lease_ttl_ms: int = 5_000,
+    readiness_timeout_seconds: int = 90,
 ) -> None:
     target = DockerComposeTarget(compose_file=Path(compose_file), project=project)
-    if crash_after_scale_file is not None:
+    if crash_after_scale_file is not None or health_regression_container_id is not None:
         set_replicas = target.set_replicas
 
         def block_after_scale(
@@ -72,8 +76,20 @@ def _run_docker_e2e_controller(
                 expected_replicas=expected_replicas,
                 fencing_token=fencing_token,
             )
-            Path(crash_after_scale_file).write_text("applied", encoding="ascii")
-            threading.Event().wait(3_600)
+            if health_regression_container_id is not None:
+                if health_regression_file is None:
+                    raise ValueError("health-regression marker is required")
+                subprocess.run(
+                    ["docker", "kill", health_regression_container_id],
+                    capture_output=True,
+                    check=True,
+                    text=True,
+                    timeout=15,
+                )
+                Path(health_regression_file).write_text("applied", encoding="ascii")
+            if crash_after_scale_file is not None:
+                Path(crash_after_scale_file).write_text("applied", encoding="ascii")
+                threading.Event().wait(3_600)
             return result
 
         target.set_replicas = block_after_scale  # type: ignore[method-assign]
@@ -86,9 +102,9 @@ def _run_docker_e2e_controller(
         target,
         WorkloadHealthObserver({"cpu-api": health_url}),
         controller_id,
-        lease_ttl_ms=5_000,
+        lease_ttl_ms=lease_ttl_ms,
         max_attempts=2,
-        readiness_timeout_seconds=90,
+        readiness_timeout_seconds=readiness_timeout_seconds,
         poll_seconds=0.1,
     )
     while not Path(stop_file).exists():
@@ -1356,5 +1372,188 @@ def test_docker_api_execution_changes_real_compose_state(
         traffic_stop.set()
         if traffic_thread is not None:
             traffic_thread.join(timeout=5)
+        target._compose("down", "--remove-orphans", timeout=120)
+    assert not traffic_errors
+
+
+@pytest.mark.skipif(
+    os.getenv("FLEETRIGHT_RUN_DOCKER_E2E") != "1",
+    reason="set FLEETRIGHT_RUN_DOCKER_E2E=1 to run the isolated Docker health-regression test",
+)
+def test_docker_api_health_regression_fails_safe_without_downscaling(
+    docker_e2e_database: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tokens, raw_tokens = _tokens()
+    root = Path(__file__).resolve().parents[2]
+    compose_file = root / "tests/fixtures/docker-execution/compose.yml"
+    project = f"fleetright-regression-{uuid.uuid4().hex[:8]}"
+    monkeypatch.setenv("FLEETRIGHT_DOCKER_FENCE_DIR", str(tmp_path / "docker-fences"))
+    monkeypatch.setenv("FLEETRIGHT_EXECUTION_LEASE_TTL_MS", "30000")
+    target = DockerComposeTarget(compose_file=compose_file, project=project)
+    traffic_stop = threading.Event()
+    traffic_errors: list[str] = []
+    traffic_thread: threading.Thread | None = None
+    controller_stop = tmp_path / "controller.stop"
+    regression_done = tmp_path / "regression.done"
+    controller: multiprocessing.Process | None = None
+    try:
+        target._compose(
+            "up",
+            "--detach",
+            "--build",
+            "--scale",
+            "cpu-service=3",
+            "cpu-service",
+            timeout=900,
+        )
+        deadline = time.monotonic() + 120
+        observed = target.observe_scale("cpu-api")
+        while (
+            observed["replicas"] != 3 or observed["ready_replicas"] != 3
+        ) and time.monotonic() < deadline:
+            time.sleep(1)
+            observed = target.observe_scale("cpu-api")
+        assert observed["replicas"] == observed["ready_replicas"] == 3
+
+        inspect = subprocess.run(
+            [
+                "docker",
+                "inspect",
+                "--format",
+                "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+                observed["container_ids"][0],
+            ],
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=10,
+        )
+        health_url = f"http://{inspect.stdout.strip()}:8080"
+        health = WorkloadHealthObserver({"cpu-api": health_url})
+
+        def send_traffic() -> None:
+            while not traffic_stop.is_set():
+                try:
+                    with urllib.request.urlopen(f"{health_url}/work", timeout=2):
+                        pass
+                except OSError as error:
+                    traffic_errors.append(str(error))
+                traffic_stop.wait(0.05)
+
+        traffic_thread = threading.Thread(target=send_traffic, daemon=True)
+        traffic_thread.start()
+        time.sleep(1)
+        health.observe("cpu-api", p99_limit_ms=120, error_slo_ppm=1_000)
+        time.sleep(0.2)
+        baseline = health.observe("cpu-api", p99_limit_ms=120, error_slo_ppm=1_000)
+        assert baseline["ready"] is True and baseline["fresh_sample"] is True
+        assert baseline["healthy"] is True
+        traffic_stop.set()
+        traffic_thread.join(timeout=5)
+
+        process_context = multiprocessing.get_context("spawn")
+        controller = process_context.Process(
+            target=_run_docker_e2e_controller,
+            args=(
+                docker_e2e_database.dsn,
+                str(compose_file),
+                project,
+                health_url,
+                "docker-e2e-regression-controller",
+                str(controller_stop),
+            ),
+            kwargs={
+                "health_regression_container_id": observed["container_ids"][0],
+                "health_regression_file": str(regression_done),
+                "lease_ttl_ms": 30_000,
+                "readiness_timeout_seconds": 8,
+            },
+        )
+        controller.start()
+        app = create_app(
+            docker_e2e_database.repository,
+            tokens=tokens,
+            mode="EXECUTE",
+            execution_target="docker",
+            target_adapter=target,
+            health_observer=health,
+            start_execution_worker=False,
+        )
+        with TestClient(app) as client:
+            plan = _create_verified_plan(client, raw_tokens)
+            plan_id = plan["plan_id"]
+            approved = client.post(
+                f"/v1/plans/{plan_id}/approve",
+                headers={
+                    "Authorization": f"Bearer {raw_tokens['operator']}",
+                    "Idempotency-Key": "docker-regression-approve",
+                },
+                json={},
+            )
+            assert approved.status_code == 200, approved.text
+            accepted = client.post(
+                f"/v1/plans/{plan_id}/execute",
+                headers={
+                    "Authorization": f"Bearer {raw_tokens['operator']}",
+                    "Idempotency-Key": "docker-regression-execute",
+                },
+                json={},
+            )
+            assert accepted.status_code == 202, accepted.text
+            deadline = time.monotonic() + 60
+            while not regression_done.exists() and time.monotonic() < deadline:
+                assert controller.is_alive(), f"controller exited: {controller.exitcode}"
+                time.sleep(0.1)
+            assert regression_done.exists(), "controller did not induce the post-scale failure"
+            traffic_stop.set()
+            if traffic_thread is not None:
+                traffic_thread.join(timeout=5)
+
+            deadline = time.monotonic() + 60
+            detail = client.get(
+                f"/v1/plans/{plan_id}",
+                headers={"Authorization": f"Bearer {raw_tokens['viewer']}"},
+            )
+            while detail.json().get("execution", {}).get("status") != "FAILED_SAFE":
+                assert controller.is_alive(), f"controller exited: {controller.exitcode}"
+                assert time.monotonic() < deadline, detail.text
+                time.sleep(0.2)
+                detail = client.get(
+                    f"/v1/plans/{plan_id}",
+                    headers={"Authorization": f"Bearer {raw_tokens['viewer']}"},
+                )
+            assert detail.status_code == 200
+            final_target = target.observe_scale("cpu-api")
+            assert final_target["replicas"] == 4
+            assert final_target["ready_replicas"] == 3
+            with docker_e2e_database.repository.transaction() as conn:
+                execution = conn.execute(
+                    "SELECT status FROM plan_executions WHERE plan_id = %s", (plan_id,)
+                ).fetchone()
+                action = conn.execute(
+                    "SELECT execution_state, execution_error FROM action_intents "
+                    "WHERE plan_id = %s",
+                    (plan_id,),
+                ).fetchone()
+                compensation_count = conn.execute(
+                    "SELECT count(*) AS count FROM action_intents "
+                    "WHERE plan_id = %s AND compensates_intent_id IS NOT NULL",
+                    (plan_id,),
+                ).fetchone()["count"]
+            assert execution["status"] == "FAILED_SAFE"
+            assert action == {
+                "execution_state": "FAILED",
+                "execution_error": "replacement-readiness-timeout",
+            }
+            assert compensation_count == 0
+    finally:
+        traffic_stop.set()
+        if traffic_thread is not None:
+            traffic_thread.join(timeout=5)
+        controller_stop.write_text("stop", encoding="ascii")
+        if controller is not None and controller.pid is not None:
+            if controller.is_alive():
+                controller.terminate()
+            controller.join(timeout=10)
         target._compose("down", "--remove-orphans", timeout=120)
     assert not traffic_errors

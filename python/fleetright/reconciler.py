@@ -971,6 +971,15 @@ class ExecutionController:
                 elif desired < original:
                     self._compensate(plan_id, token, action, observed)
                 else:
+                    if dispatch_response_recorded and current == desired:
+                        self._finish_action(
+                            plan_id,
+                            token,
+                            action,
+                            "FAILED",
+                            observed,
+                            "replacement-readiness-timeout",
+                        )
                     self._fail_safe(plan_id, token, "replacement-readiness-timeout")
             return
         health = self._health_observation(action)
@@ -988,6 +997,15 @@ class ExecutionController:
                 elif desired < original:
                     self._compensate(plan_id, token, action, observed)
                 else:
+                    if dispatch_response_recorded and current == desired:
+                        self._finish_action(
+                            plan_id,
+                            token,
+                            action,
+                            "FAILED",
+                            observed,
+                            "replacement-warmup-timeout",
+                        )
                     self._fail_safe(plan_id, token, "replacement-warmup-timeout")
             return
         if not health.get("healthy"):
