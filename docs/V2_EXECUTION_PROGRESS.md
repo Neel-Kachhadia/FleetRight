@@ -15,13 +15,13 @@ worktree was clean at start.
 **Local implementation checkpoint:** `10292a2`
 (`fix: fence workload authority across takeovers`). No tag or push was made.
 
-**Checkpoint recorded:** 2026-10-10 16:18 UTC (about 3 hours 10 minutes elapsed;
-about 5 hours 50 minutes remains to the hard stop).
+**Checkpoint recorded:** 2026-10-10 16:38 UTC (about 3 hours 30 minutes elapsed;
+about 5 hours 30 minutes remains to the hard stop).
 
-**Current committed HEAD:** `31f2fd2`
-(`docs: record Docker process crash recovery evidence`). The process-crash test
-is in `27df715`; this follow-up commit records its evidence. The worktree is
-clean.
+**HEAD before this checkpoint update:** `6fc660b`
+(`docs: correct current execution checkpoint`). This update adds a narrow
+reconciler fix for confirmed-applied scale-up readiness timeouts and a live
+Docker regression test.
 
 **Current gate:** Prompt 2B remains PARTIAL. Current Kubernetes execution
 admits only monotonic scale-up on a newly created, explicitly marked
@@ -35,17 +35,20 @@ resourceVersion precondition; no safe final-mutation fence has been established.
 | Check | Result | Evidence |
 |---|---|---|
 | Initial repository audit | PASS | Expected root and branch; clean worktree; `git diff --check` clean; HEAD `d70c276`; no milestone-4 or release tag |
-| Python and PostgreSQL suite | PASS, 163 passed, 1 skipped, 1 warning (7.80s) | `.venv/bin/python -m pytest -q python/tests`; fresh no-volume PostgreSQL 16 `fleetright_test`, trust auth bound to `127.0.0.1:32976`; temporary container stopped and removed. The opt-in Docker E2E is the one skip. |
+| Earlier Python and PostgreSQL suite | PASS, 163 passed, 1 skipped, 1 warning (7.80s) | Preceded the new Docker recovery case and readiness-timeout fix; fresh no-volume PostgreSQL 16 `fleetright_test` on loopback port 32976. |
 | Targeted takeover replay regression | PASS | Included in the 163-passed Python suite; injects response loss after fake target authorization has published the request, then checks takeover replay and one authorization. |
 | Docker API E2E | PASS, 1 passed (21.31s) | `python/tests/test_prompt2a_control_api.py::test_docker_api_execution_changes_real_compose_state`; authenticated optimize/verify/approve/execute, duplicate request, real Compose 3→4, healthcheck readiness for all four replicas, fresh SLO metrics, then kill a spawned controller process after mutation while the durable action remains `RUNNING`. After lease expiry, a second controller process observes the target and commits with exactly one recorded dispatch. Fresh no-volume `fleetright_test` on `127.0.0.1:32976`; isolated random project removed. |
+| Docker post-scale readiness-loss E2E | PASS, 1 passed (47.46s) | `test_docker_api_health_regression_fails_safe_without_downscaling`; authenticated execution scales 3→4, then the isolated fixture stops one existing container after target response. The controller persists `FAILED` / `replacement-readiness-timeout`, reaches `FAILED_SAFE`, retains target count 4 with 3 Ready, and dispatches no compensation/downscale. |
+| Docker process-crash E2E rerun | PASS, 1 passed (21.57s) | `test_docker_api_execution_changes_real_compose_state`; rerun with `FLEETRIGHT_RUN_DOCKER_E2E=1` after the shared test-controller helper change. Process kill after mutation, lease expiry, takeover, and one dispatch remained passing. |
+| Python/PostgreSQL suite after readiness-timeout fix | PASS, 165 passed, 1 warning (76.53s) | `.venv/bin/python -m pytest -q python/tests` with `FLEETRIGHT_RUN_DOCKER_E2E=1`; fresh no-volume PostgreSQL 16 `fleetright_test` on loopback port 32976. Both process-crash/takeover and post-scale readiness-loss E2Es ran. Temporary DB and Compose resources were removed. |
 | CRD preflight unit and manifest checks | PASS | 5 focused tests; all 25 required runtime execution rules and required request/fence fields match the checked-in CRD. Live API-server validation remains blocked until the cluster cert is valid. |
 | C++ regression | PASS, 36/36 | `ctest --test-dir build --output-on-failure` |
-| Changed Python quality checks | PASS | Ruff 0.15.20 and `compileall` on all four changed Python files |
+| Changed Python quality checks | PASS | Ruff 0.15.20 check and `compileall` pass for `reconciler.py` and the Docker E2E module; test-module format check passes. |
 | Changed YAML and CRD contract | PASS | PyYAML parsed the CRD, all 7 RBAC documents, and the portless Docker fixture; direct check confirmed all 25 execution CEL rules, required fields, and scale-up protocol enum |
 | Supplied DB endpoint | BLOCKED | Credential file parsed without displaying secrets; configured database is `fleetright_test`, but `127.0.0.1:32768` refused connections and `fleetright-isolated-test-db` was absent |
 | Safety-lab live access | BLOCKED | Explicit kubeconfig/context used. Sandbox first denied localhost socket access; one elevated read reached Kubernetes client v1.37.1 but API TLS certificate is not valid until `2026-10-10 18:29:54 UTC`. No TLS bypass or cluster mutation was attempted |
 | Current V2 destructive execution | DISABLED | Source, verifier, current RBAC, ADR-008, and saved API-server race evidence reviewed; no eviction or cordon mutator exists at committed HEAD |
-| Docker failure coverage | PARTIAL | Lost response, actual process kill at the post-mutation/pre-response boundary, and process takeover from observed state pass. Target timeout, health-regression compensation, and compensation recovery remain untested. |
+| Docker failure coverage | PARTIAL | Lost response, takeover, and post-scale readiness-loss fail-safe pass. Target timeout and destructive-operation compensation/recovery remain untested. |
 
 The full-suite DB run used a fresh no-volume container bound only to
 `127.0.0.1:32976`, confirmed database name `fleetright_test`, ran the suite,
@@ -93,6 +96,13 @@ container on the same port, then also stopped and removed it. The existing
   workload request, takeover fence applied before receipt commit, replay under
   the same pending token, and exactly one authorization; the full Python suite
   passes.
+- A Docker readiness-loss E2E exposed a scale-up timeout path that left a
+  durably confirmed action `RUNNING`, so `_fail_safe` correctly refused to
+  close the execution without a takeover fence. The reconciler now marks the
+  action `FAILED` first only when the dispatch response is durably recorded and
+  the target still reports the requested replica count; ambiguous outcomes
+  remain unresolved and fence-gated. The live test now reaches `FAILED_SAFE`
+  after one replica stops, while keeping target count 4 and issuing no downscale.
 
 ### Independent destructive-action race review
 

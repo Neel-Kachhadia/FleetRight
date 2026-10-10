@@ -4,7 +4,8 @@ Repository: `/home/neel/Projects/FleetRight`
 Branch: `phase4/safe-execution-reconciliation`
 Starting commit: `d70c276` (`fix: bound Kubernetes execution to workload authority`)
 Local implementation checkpoint: `10292a2` (`fix: fence workload authority across takeovers`)
-Current committed HEAD: `31f2fd2` (`docs: record Docker process crash recovery evidence`)
+HEAD before this evidence update: `6fc660b` (`docs: correct current execution checkpoint`)
+Production starting checkpoint: `27df715`; this checkpoint also fixes confirmed-applied scale-up readiness timeouts in `reconciler.py`.
 Session start: 2026-10-10 13:07:50 UTC; hard stop: 2026-10-10 22:07:50 UTC.
 
 ## Executed checks
@@ -12,19 +13,22 @@ Session start: 2026-10-10 13:07:50 UTC; hard stop: 2026-10-10 22:07:50 UTC.
 | Command / check | Result | Notes |
 |---|---|---|
 | `git diff --check` at start | PASS | Worktree was clean before this session. |
-| `.venv/bin/python -m pytest -q python/tests` | PASS, 163 passed, 1 skipped, 1 warning (7.80s) | Fresh PostgreSQL 16 `fleetright_test`, trust auth, loopback-only port 32976, and no mounted volume. The opt-in Docker E2E was the one skipped test. Temporary container was stopped and removed; existing `fleetright_fleetright-postgres` volume was not attached or modified. |
+| Earlier `.venv/bin/python -m pytest -q python/tests` | PASS, 163 passed, 1 skipped, 1 warning (7.80s) | Run before the new E2E and readiness-timeout fix with a fresh no-volume PostgreSQL 16 `fleetright_test` on loopback port 32976. |
 | `test_workload_takeover_replays_published_request_after_fence_response_loss` | PASS | Replays a published workload request after takeover fence persistence and crash before receipt commit; exactly one authorization and eventual commit. Included in the 163-test full-suite run. |
-| `test_docker_api_execution_changes_real_compose_state` | PASS, 1 passed (21.31s) | Fresh `fleetright_test` PostgreSQL on loopback port 32976; unique portless Compose project. Authenticated optimize/approval/execute, unauthorized execute denial, duplicate execute replay, real 3→4 Compose scale, four healthy Docker healthchecks, fresh SLO metrics, then kill the spawned controller after mutation while the journal is `RUNNING`. After lease expiry a second process commits from observed state; the journal contains one dispatch. Target timeout and health-regression compensation were not exercised. Project and DB container were cleaned up. |
+| `test_docker_api_execution_changes_real_compose_state` | PASS, 1 passed (21.31s) | Fresh `fleetright_test` PostgreSQL on loopback port 32976; unique portless Compose project. Authenticated optimize/approval/execute, unauthorized execute denial, duplicate execute replay, real 3→4 Compose scale, four healthy Docker healthchecks, fresh SLO metrics, then kill the spawned controller after mutation while the journal is `RUNNING`. After lease expiry a second process commits from observed state; the journal contains one dispatch. Target timeout and destructive-operation compensation were not exercised; readiness-loss is covered separately. Project and DB container were cleaned up. |
+| `test_docker_api_health_regression_fails_safe_without_downscaling` | PASS, 1 passed (47.46s) | Authenticated execution scales a real portless Compose project 3→4; after the response is recorded, the test stops one existing container. The controller records `FAILED` / `replacement-readiness-timeout`, reaches `FAILED_SAFE`, retains target count 4 with 3 Ready, and dispatches no compensation/downscale. |
+| `test_docker_api_execution_changes_real_compose_state` after helper change | PASS, 1 passed (21.57s) | Explicit opt-in `FLEETRIGHT_RUN_DOCKER_E2E=1`; process kill after mutation and lease-based takeover still commit with a single durable dispatch. |
+| `.venv/bin/python -m pytest -q python/tests` with `FLEETRIGHT_RUN_DOCKER_E2E=1` after fix | PASS, 165 passed, 1 warning (76.53s) | Fresh no-volume PostgreSQL 16 `fleetright_test` on `127.0.0.1:32976`; process-crash/takeover and post-scale readiness-loss Docker E2Es both ran. Temporary DB and Compose resources were removed. |
 | `ctest --test-dir build --output-on-failure` | PASS, 36/36 | Existing C++ build; no C++ source changes in this checkpoint. |
-| Ruff and `compileall` on changed Python files | PASS | Ruff 0.15.20 and Python compilation for `execution.py`, `test_prompt2a_control_api.py`, `test_prompt2b_execution_targets.py`, and `test_prompt2b_journal.py`. |
+| Ruff and `compileall` on changed Python files | PASS | Ruff 0.15.20 check and Python compilation for `reconciler.py` and `test_prompt2a_control_api.py`; test-module format check passes. |
 | PyYAML parse and CRD contract check | PASS | CRD, all 7 RBAC documents, and Docker fixture parsed; all 25 required runtime CEL rules, request/fence fields, and protocol enum match the manifest. API-server/CEL validation remains unrun for the current edits. |
 | `git diff --check` | PASS | Checked after the current fencing and evidence updates. |
 | Explicit safety-lab read using `/home/neel/.cache/fleetright/safety-lab.kubeconfig`, context `kind-fleetright-safety-lab` | BLOCKED | Sandbox denied the first localhost API socket request. One authorized elevated read reached Kubernetes client v1.37.1, but TLS rejected the API certificate as not yet valid (`NotBefore=2026-10-10T18:29:54Z`; request time was before then). No verification bypass or cluster mutation was attempted. |
-| Docker timeout, health-regression compensation | NOT RUN | Process crash recovery at one post-mutation/pre-response boundary now passes. This does not prove timeout recovery, regression compensation, or other crash boundaries. |
+| Docker target timeout and compensation/recovery | NOT RUN | Process crash recovery at one post-mutation/pre-response boundary and a separate post-scale readiness-loss fail-safe pass. Neither proves target-timeout recovery or destructive-operation compensation. |
 
 The test database URL was sourced from the private environment file and overridden for a fresh no-volume `fleetright_test` container at `127.0.0.1:32976`; no credentials were printed. The full Python suite and Docker E2E each used the isolated endpoint, and each temporary container was stopped and removed. The existing `fleetright_fleetright-postgres` volume was not attached or modified.
 
-## Current safety boundary at committed HEAD `31f2fd2`
+## Kubernetes safety boundary (unchanged by this scale-up fix)
 
 - The Kubernetes API target admits only monotonic scale-up for a newly created `FleetRightWorkload` marked `monotonic-scale-up-v1`. Workload UID, template, placement, and policy are immutable; `spec.replicas` is the high-water value and growth is bound to a durable request. There is no separate high-water field.
 - The controller's `APPLIED` status means desired deterministic Pod ordinals exist and pass identity/template/placement checks. It does not mean they are Ready. The API reconciler separately checks the matching operation, observed generation/count, readiness/availability, and a healthy metrics window.
@@ -33,7 +37,7 @@ The test database URL was sourced from the private environment file and overridd
 - The saved live negative control in `execution-authority-race-2026-10-08.txt` shows Kubernetes v1.37.0 can accept a delayed same-UID unready-Pod Eviction under `IfHealthyBudget` after the caller's resourceVersion changes. PostgreSQL leases and the workload-object CAS do not fence that separate mutation.
 - This continuation strengthens only scale-up authority. The target checks `fencedGeneration == metadata.generation` after observing the CR; CEL does not directly compare metadata generation. A delayed old authorization that wins before the new target fence is observed and adopted as the current request before re-fencing. An old authorization arriving after a newer target fence is rejected; stale receipts cannot close later dispatches.
 - GPT-6.1 Sol High and Sol Max re-reviewed the scale-up fencing changes and reported no remaining production blockers in the reviewed path. They did not supply runtime evidence. The read-only Claude Sonnet request through the signed-in Claude Code subscription failed before inference because DNS could not reach its API (`EAI_AGAIN`); `ANTHROPIC_API_KEY` was absent, and no pay-as-you-go API was used.
-- Durable staged replacement, PDB-safe eviction, node drain, partial-drain recovery, and live compensation remain unqualified. Docker's positive API path and one actual process-crash takeover boundary pass; target timeout and health-regression compensation remain unqualified. Prompt 3 and release qualification have not started.
+- Durable staged replacement, PDB-safe eviction, node drain, partial-drain recovery, and live compensation remain unqualified. Docker's positive API path and one actual process-crash takeover boundary pass; target timeout and destructive-operation compensation remain unqualified. The post-scale readiness-loss case reaches `FAILED_SAFE` while leaving the observed target at 4 total / 3 Ready replicas; Prompt 3 and release qualification have not started.
 
 ## Current-session review
 
