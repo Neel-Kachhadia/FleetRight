@@ -959,7 +959,7 @@ class FleetRightWorkloadTarget(KubernetesTarget):
 
 
 class DockerComposeTarget:
-    """Single-replica Compose adapter with a host-local process fence."""
+    """Compose adapter with a host-local process fence."""
 
     def __init__(self, *, compose_file: Path | None = None, project: str | None = None):
         self.compose_file = compose_file or Path(
@@ -1082,20 +1082,23 @@ class DockerComposeTarget:
             raise TargetError("Docker returned invalid container state") from error
         if not isinstance(containers, list) or len(containers) != len(ids):
             raise TargetError("Docker container state is incomplete")
-        running = sum(
-            1
-            for item in containers
-            if isinstance(item, dict)
-            and isinstance(item.get("State"), dict)
-            and item["State"].get("Running") is True
-        )
+        ready = 0
+        for item in containers:
+            state = item.get("State") if isinstance(item, dict) else None
+            if not isinstance(state, dict) or state.get("Running") is not True:
+                continue
+            health = state.get("Health")
+            if health is None or (
+                isinstance(health, dict) and health.get("Status") == "healthy"
+            ):
+                ready += 1
         return {
             "uid": identity,
             "generation": generation,
             "observed_generation": generation,
             "replicas": len(ids),
             "container_ids": ids,
-            "ready_replicas": running,
+            "ready_replicas": ready,
         }
 
     def set_replicas(
@@ -1109,10 +1112,22 @@ class DockerComposeTarget:
     ) -> dict[str, Any]:
         if not isinstance(replicas, int) or replicas < 0 or replicas > 100:
             raise TargetPreconditionFailed("replica target is outside the supported range")
+        service = self._service(workload_id)
         if replicas > 1:
-            raise TargetPreconditionFailed(
-                "the checked-in Compose service has a fixed published port and supports one replica"
-            )
+            try:
+                output = self._compose(
+                    "config", "--no-interpolate", "--format", "json"
+                ).stdout
+                config = json.loads(output)
+                ports = config["services"][service].get("ports", [])
+            except (AttributeError, json.JSONDecodeError, KeyError, TypeError) as error:
+                raise TargetPreconditionFailed(
+                    "cannot verify Compose service ports for multiple replicas"
+                ) from error
+            if not isinstance(ports, list) or ports:
+                raise TargetPreconditionFailed(
+                    "multiple Compose replicas require a service without published host ports"
+                )
         with self._fence(fencing_token) as active_token:
             if active_token != fencing_token:
                 raise TargetPreconditionFailed("Docker fencing token changed before mutation")
@@ -1125,7 +1140,6 @@ class DockerComposeTarget:
                 return {**current, "fencing_token": fencing_token, "already_applied": True}
             if current["replicas"] != expected_replicas:
                 raise TargetPreconditionFailed("Compose service replica precondition changed")
-            service = self._service(workload_id)
             try:
                 self._compose(
                     "up",

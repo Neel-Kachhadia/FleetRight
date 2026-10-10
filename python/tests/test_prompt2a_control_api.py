@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import subprocess
+import threading
 import time
+import urllib.request
 import uuid
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -24,9 +27,10 @@ from fleetright.control import (
     Repository,
     transition_allowed,
 )
+from fleetright.execution import DockerComposeTarget, OutcomeUnknown, WorkloadHealthObserver
 from fleetright.scenario import oracle_snapshot_fields
 from psycopg import sql
-from psycopg.conninfo import make_conninfo
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg.types.json import Jsonb
 
 
@@ -49,6 +53,26 @@ def control_database() -> Iterator[Database]:
     repo.migrate()
     assert repo.readiness() == (True, "ready")
     try:
+        yield Database(repo, dsn)
+    finally:
+        with psycopg.connect(admin_dsn, autocommit=True) as conn:
+            conn.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))
+
+
+@pytest.fixture
+def docker_e2e_database() -> Iterator[Database]:
+    admin_dsn = os.getenv("FLEETRIGHT_TEST_DATABASE_URL")
+    if not admin_dsn:
+        pytest.skip("FLEETRIGHT_TEST_DATABASE_URL is required for Docker E2E")
+    if conninfo_to_dict(admin_dsn).get("dbname") != "fleetright_test":
+        pytest.fail("Docker E2E requires the isolated fleetright_test database")
+    schema = f"docker_e2e_{uuid.uuid4().hex}"
+    with psycopg.connect(admin_dsn, autocommit=True) as conn:
+        conn.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
+    dsn = make_conninfo(admin_dsn, options=f"-csearch_path={schema}")
+    repo = Repository(dsn)
+    try:
+        repo.migrate()
         yield Database(repo, dsn)
     finally:
         with psycopg.connect(admin_dsn, autocommit=True) as conn:
@@ -1032,3 +1056,248 @@ def test_api_rejects_oversized_request_body(clean_database: Database) -> None:
         response = client.post("/v1/optimize", content=b"x" * (MAX_REQUEST_BYTES + 1))
     assert response.status_code == 413
     assert response.json()["detail"] == "request body exceeds 2 MiB"
+
+
+@pytest.mark.skipif(
+    os.getenv("FLEETRIGHT_RUN_DOCKER_E2E") != "1",
+    reason="set FLEETRIGHT_RUN_DOCKER_E2E=1 to run the isolated Docker execution test",
+)
+def test_docker_api_execution_changes_real_compose_state(
+    docker_e2e_database: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tokens, raw_tokens = _tokens()
+    root = Path(__file__).resolve().parents[2]
+    compose_file = root / "tests/fixtures/docker-execution/compose.yml"
+    project = f"fleetright-e2e-{uuid.uuid4().hex[:8]}"
+    monkeypatch.setenv("FLEETRIGHT_DOCKER_FENCE_DIR", str(tmp_path / "docker-fences"))
+    monkeypatch.setenv("FLEETRIGHT_READINESS_TIMEOUT_SECONDS", "90")
+    monkeypatch.setenv("FLEETRIGHT_EXECUTION_LEASE_TTL_MS", "5000")
+    monkeypatch.setenv("FLEETRIGHT_RECONCILE_POLL_SECONDS", "5")
+
+    class LostResponseComposeTarget(DockerComposeTarget):
+        def __init__(self) -> None:
+            super().__init__(compose_file=compose_file, project=project)
+            self.set_calls = 0
+            self.mutation_done = threading.Event()
+            self.allow_response = threading.Event()
+
+        def set_replicas(
+            self,
+            workload_id: str,
+            replicas: int,
+            observed: dict[str, object],
+            *,
+            expected_replicas: int,
+            fencing_token: int,
+        ) -> dict[str, object]:
+            self.set_calls += 1
+            result = super().set_replicas(
+                workload_id,
+                replicas,
+                observed,
+                expected_replicas=expected_replicas,
+                fencing_token=fencing_token,
+            )
+            if self.set_calls == 1:
+                self.mutation_done.set()
+                self.allow_response.wait(30)
+                raise OutcomeUnknown("injected lost Compose response after replica change")
+            return result
+
+    target = LostResponseComposeTarget()
+    traffic_stop = threading.Event()
+    traffic_errors: list[str] = []
+    traffic_thread: threading.Thread | None = None
+    try:
+        target._compose(
+            "up",
+            "--detach",
+            "--build",
+            "--scale",
+            "cpu-service=3",
+            "cpu-service",
+            timeout=900,
+        )
+        deadline = time.monotonic() + 120
+        observed = target.observe_scale("cpu-api")
+        while (
+            observed["replicas"] != 3 or observed["ready_replicas"] != 3
+        ) and time.monotonic() < deadline:
+            time.sleep(1)
+            observed = target.observe_scale("cpu-api")
+        assert observed["replicas"] == observed["ready_replicas"] == 3
+
+        inspect = subprocess.run(
+            [
+                "docker",
+                "inspect",
+                "--format",
+                "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+                observed["container_ids"][0],
+            ],
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=10,
+        )
+        address = inspect.stdout.strip()
+        assert address
+        health_url = f"http://{address}:8080"
+        health = WorkloadHealthObserver({"cpu-api": health_url})
+
+        def send_workload_traffic() -> None:
+            while not traffic_stop.is_set():
+                try:
+                    with urllib.request.urlopen(f"{health_url}/work", timeout=2):
+                        pass
+                except OSError as error:
+                    traffic_errors.append(str(error))
+                traffic_stop.wait(0.1)
+
+        traffic_thread = threading.Thread(target=send_workload_traffic, daemon=True)
+        traffic_thread.start()
+        time.sleep(1)
+        health.observe(
+            "cpu-api",
+            p99_limit_ms=120,
+            error_slo_ppm=1_000,
+            max_queue_growth_milli=0,
+        )
+        time.sleep(0.2)
+        baseline_health = health.observe(
+            "cpu-api",
+            p99_limit_ms=120,
+            error_slo_ppm=1_000,
+            max_queue_growth_milli=0,
+        )
+        assert baseline_health["ready"] is True
+        assert baseline_health["fresh_sample"] is True
+        assert baseline_health["healthy"] is True
+
+        app = create_app(
+            docker_e2e_database.repository,
+            tokens=tokens,
+            mode="EXECUTE",
+            execution_target="docker",
+            target_adapter=target,
+            health_observer=health,
+            controller_id="docker-e2e-controller",
+            start_execution_worker=True,
+        )
+        with TestClient(app) as client:
+            now_ms = time.time_ns() // 1_000_000
+            optimized = client.post(
+                "/v1/optimize",
+                headers={
+                    "Authorization": f"Bearer {raw_tokens['recommender']}",
+                    "Idempotency-Key": "docker-e2e-optimize",
+                },
+                json=_supported_scale_out_request(now_ms),
+            )
+            assert optimized.status_code == 201, optimized.text
+            plan = optimized.json()
+            assert plan["state"] == "VERIFIED"
+            plan_id = plan["plan_id"]
+
+            approved = client.post(
+                f"/v1/plans/{plan_id}/approve",
+                headers={
+                    "Authorization": f"Bearer {raw_tokens['operator']}",
+                    "Idempotency-Key": "docker-e2e-approve",
+                },
+                json={},
+            )
+            assert approved.status_code == 200, approved.text
+            denied = client.post(
+                f"/v1/plans/{plan_id}/execute",
+                headers={"Idempotency-Key": "docker-e2e-anonymous"},
+                json={},
+            )
+            assert denied.status_code == 401
+
+            headers = {
+                "Authorization": f"Bearer {raw_tokens['operator']}",
+                "Idempotency-Key": "docker-e2e-execute",
+            }
+            accepted = client.post(f"/v1/plans/{plan_id}/execute", headers=headers, json={})
+            replayed = client.post(f"/v1/plans/{plan_id}/execute", headers=headers, json={})
+            assert accepted.status_code == replayed.status_code == 202
+            assert accepted.json() == replayed.json()
+            assert target.mutation_done.wait(60)
+            assert target.observe_scale("cpu-api")["replicas"] == 4
+            target.allow_response.set()
+
+            deadline = time.monotonic() + 10
+            with docker_e2e_database.repository.transaction() as conn:
+                action_state = conn.execute(
+                    "SELECT execution_state FROM action_intents WHERE plan_id = %s",
+                    (plan_id,),
+                ).fetchone()["execution_state"]
+            while action_state != "OUTCOME_UNKNOWN" and time.monotonic() < deadline:
+                time.sleep(0.1)
+                with docker_e2e_database.repository.transaction() as conn:
+                    action_state = conn.execute(
+                        "SELECT execution_state FROM action_intents WHERE plan_id = %s",
+                        (plan_id,),
+                    ).fetchone()["execution_state"]
+            assert action_state == "OUTCOME_UNKNOWN"
+            app.state.execution_stop.set()
+            app.state.execution_thread.join(timeout=5)
+            assert not app.state.execution_thread.is_alive()
+
+        time.sleep(5.2)
+        monkeypatch.setenv("FLEETRIGHT_RECONCILE_POLL_SECONDS", "0.2")
+        recovery_target = DockerComposeTarget(compose_file=compose_file, project=project)
+        recovery_app = create_app(
+            docker_e2e_database.repository,
+            tokens=tokens,
+            mode="EXECUTE",
+            execution_target="docker",
+            target_adapter=recovery_target,
+            health_observer=health,
+            controller_id="docker-e2e-controller-recovery",
+            start_execution_worker=True,
+        )
+        with TestClient(recovery_app) as client:
+            detail = client.get(
+                f"/v1/plans/{plan_id}",
+                headers={"Authorization": f"Bearer {raw_tokens['viewer']}"},
+            )
+            deadline = time.monotonic() + 120
+            while detail.json().get("execution", {}).get("status") != "COMMITTED":
+                assert detail.json().get("execution", {}).get("status") not in {
+                    "FAILED_SAFE",
+                    "COMPENSATING",
+                    "COMPENSATED",
+                    "STALE",
+                }, detail.text
+                assert time.monotonic() < deadline, detail.text
+                time.sleep(0.2)
+                detail = client.get(
+                    f"/v1/plans/{plan_id}",
+                    headers={"Authorization": f"Bearer {raw_tokens['viewer']}"},
+                )
+            assert detail.status_code == 200
+            final_target = recovery_target.observe_scale("cpu-api")
+            assert final_target["replicas"] == final_target["ready_replicas"] == 4
+            with docker_e2e_database.repository.transaction() as conn:
+                execution = conn.execute(
+                    "SELECT status FROM plan_executions WHERE plan_id = %s", (plan_id,)
+                ).fetchone()
+                action = conn.execute(
+                    "SELECT execution_state, execution_result FROM action_intents "
+                    "WHERE plan_id = %s",
+                    (plan_id,),
+                ).fetchone()
+            assert execution["status"] == "COMMITTED"
+            assert action["execution_state"] == "SUCCEEDED"
+            assert action["execution_result"]["target_observation"]["replicas"] == 4
+            assert action["execution_result"]["unknown_resolutions"]
+            assert target.set_calls == 1
+    finally:
+        target.allow_response.set()
+        traffic_stop.set()
+        if traffic_thread is not None:
+            traffic_thread.join(timeout=5)
+        target._compose("down", "--remove-orphans", timeout=120)
+    assert not traffic_errors

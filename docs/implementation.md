@@ -170,12 +170,13 @@ Execution health thresholds are bounded by the checked-in local workload contrac
 memory 150 ms, queued 80 ms p99, and 1,000 ppm errors. A supplied snapshot may request stricter
 limits but cannot relax these ceilings. Queue growth must be nonpositive.
 
-The Docker adapter uses `docker compose up --scale` with absolute replica targets, observes
-container IDs and running count, and uses a private host-local `flock` file for controller fencing.
-The checked-in Compose services publish fixed host ports, so the local service harness supports
-only one replica per service; the real adapter smoke check exercised 0-to-1, readiness, traffic,
-and fresh metrics. Docker Engine does not provide the Deployment-style resource-version CAS used
-by Kubernetes. Keep this adapter on one host and do not allow other Docker clients to mutate the
+The Docker adapter uses `docker compose up --scale` with absolute replica targets and a private
+host-local `flock` file for controller fencing. It uses Docker healthcheck status as readiness when
+the service defines a healthcheck, otherwise it counts running containers. Before scaling above one
+replica, it checks that `docker compose config` reports no published host ports. The checked-in
+Compose services publish fixed ports and remain single-replica; the isolated portless fixture covers
+multi-replica execution. Docker Engine does not provide the Deployment-style resource-version CAS
+used by Kubernetes. Keep this adapter on one host and do not allow other Docker clients to mutate the
 same Compose project while FleetRight executes.
 
 The Kubernetes target supports only `SET_REPLICA_COUNT` for the checked-in `cpu-api`
@@ -281,13 +282,15 @@ An API 400, 403, or 422 while creating a generated Pod sets a sanitized
 workload condition; transient request errors and failed status writes still
 surface as controller errors.
 
-The live Docker Compose adapter smoke run changed its supported service from zero to one container
-and observed readiness and fresh metrics. A Docker API optimize/approve/execute E2E was attempted
-but did not qualify: the checked-in optimization snapshot requires at least two existing replicas,
-while the Compose harness publishes fixed ports and supports at most one service replica. The
-independent verifier correctly rejected the zero-replica fixture before execution. Real Docker API
-compensation and crash recovery remain unverified; fake-target journal tests cover compensation and
-the live kind run covers post-apply crash recovery.
+The Docker API E2E now passes on a separate portless Compose fixture: a verified 3→4 plan is
+authenticated, approved, executed, observed ready across all four Docker healthchecks, and committed
+with a fresh workload SLO window. The test injects a lost response after the real scale, stops the
+first controller thread after `OUTCOME_UNKNOWN`, waits for its lease to expire, then verifies a new
+controller commits from observed state without redispatch. This is not a killed-process test; Docker
+target timeout, health-regression compensation, and compensation recovery remain unverified. The
+checked-in Compose services still publish fixed ports and support only one replica each. The adapter
+fails closed on multiple replicas unless Compose configuration confirms there are no published host
+ports.
 
 Docker local operation commands:
 

@@ -7,6 +7,7 @@ from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
+import fleetright.execution as execution_module
 import pytest
 from fleetright.api import create_app
 from fleetright.execution import (
@@ -271,9 +272,96 @@ def test_docker_refuses_replica_counts_that_conflict_on_the_published_port(
         "ready_replicas": 1,
     }
     monkeypatch.setattr(target, "observe_scale", lambda _workload: current)
-    monkeypatch.setattr(target, "_compose", lambda *_args, **_kwargs: pytest.fail("mutated"))
-    with pytest.raises(TargetPreconditionFailed, match="supports one replica"):
+    calls: list[tuple[object, ...]] = []
+
+    def compose(*args: object, **_kwargs: object) -> SimpleNamespace:
+        calls.append(args)
+        return SimpleNamespace(
+            stdout=json.dumps({"services": {"cpu-service": {"ports": [{"published": "8081"}]}}})
+        )
+
+    monkeypatch.setattr(target, "_compose", compose)
+    with pytest.raises(TargetPreconditionFailed, match="without published host ports"):
         target.set_replicas("cpu-api", 2, current, expected_replicas=1, fencing_token=1)
+    assert calls == [("config", "--no-interpolate", "--format", "json")]
+
+
+def test_docker_allows_multiple_replicas_for_portless_compose_service(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    monkeypatch.setenv("FLEETRIGHT_DOCKER_FENCE_DIR", str(tmp_path / "fences"))
+    target = DockerComposeTarget(project="fleetright-test")
+    current = {
+        "uid": "fleetright-test/cpu-service",
+        "replicas": 3,
+        "container_ids": ["a" * 12, "b" * 12, "c" * 12],
+        "ready_replicas": 3,
+    }
+    calls: list[tuple[object, ...]] = []
+
+    def compose(*args: object, **_kwargs: object) -> SimpleNamespace:
+        calls.append(args)
+        if args[0] == "config":
+            return SimpleNamespace(stdout=json.dumps({"services": {"cpu-service": {}}}))
+        current.update(
+            replicas=4,
+            container_ids=["a" * 12, "b" * 12, "c" * 12, "d" * 12],
+            ready_replicas=4,
+        )
+        return SimpleNamespace(stdout="")
+
+    def observe(_workload: str) -> dict[str, object]:
+        return {**current, "generation": len(current["container_ids"])}
+
+    monkeypatch.setattr(target, "observe_scale", observe)
+    monkeypatch.setattr(target, "_compose", compose)
+    result = target.set_replicas(
+        "cpu-api", 4, observe("cpu-api"), expected_replicas=3, fencing_token=1
+    )
+
+    assert result["replicas"] == 4
+    assert result["applied"] is True
+    assert calls[0] == ("config", "--no-interpolate", "--format", "json")
+    assert calls[1][0] == "up"
+
+
+def test_docker_fails_closed_when_compose_ports_cannot_be_verified(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    monkeypatch.setenv("FLEETRIGHT_DOCKER_FENCE_DIR", str(tmp_path / "fences"))
+    target = DockerComposeTarget(project="fleetright-test")
+    observed = {"uid": "fleetright-test/cpu-service", "generation": 1, "replicas": 3}
+    monkeypatch.setattr(target, "observe_scale", lambda _workload: observed)
+    monkeypatch.setattr(
+        target,
+        "_compose",
+        lambda *_args, **_kwargs: SimpleNamespace(stdout="not-json"),
+    )
+
+    with pytest.raises(TargetPreconditionFailed, match="cannot verify Compose service ports"):
+        target.set_replicas("cpu-api", 4, observed, expected_replicas=3, fencing_token=1)
+
+
+def test_docker_observation_counts_compose_healthchecks_as_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = DockerComposeTarget(project="fleetright-test")
+    ids = ["a" * 12, "b" * 12]
+    states = [
+        {"State": {"Running": True, "Health": {"Status": "healthy"}}},
+        {"State": {"Running": True, "Health": {"Status": "starting"}}},
+    ]
+    monkeypatch.setattr(target, "_compose", lambda *_args: SimpleNamespace(stdout="\n".join(ids)))
+    monkeypatch.setattr(
+        execution_module,
+        "_run",
+        lambda *_args: SimpleNamespace(stdout=json.dumps(states)),
+    )
+
+    observed = target.observe_scale("cpu-api")
+
+    assert observed["replicas"] == 2
+    assert observed["ready_replicas"] == 1
 
 
 def test_kubernetes_target_has_no_pod_eviction_or_node_cordon_mutators() -> None:

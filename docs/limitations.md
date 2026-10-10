@@ -37,10 +37,12 @@ workload/node lease set, so parallel planning for independent workloads is not s
 
 Prompt 2B exposes live Docker Compose execution and a Kubernetes `FleetRightWorkload` target behind
 explicit `EXECUTE` configuration. The Docker fence is host-local, and the checked-in Compose
-services publish fixed host ports, limiting the harness to one replica per service. On Kubernetes,
-only monotonic scale-up on a new `cpu-api` object marked `monotonic-scale-up-v1` is admitted; direct
-Deployment execution and scale-down are disabled. Kubernetes execution requires an explicit
-namespace-scoped kubeconfig and narrowly scoped RBAC.
+services publish fixed host ports, so those services remain single-replica. The adapter allows
+multiple replicas only after `docker compose config` confirms the selected service has no published
+host ports; an isolated portless fixture exercises 3→4 scaling. On Kubernetes, only monotonic
+scale-up on a new `cpu-api` object marked `monotonic-scale-up-v1` is admitted; direct Deployment
+execution and scale-down are disabled. Kubernetes execution requires an explicit namespace-scoped
+kubeconfig and narrowly scoped RBAC.
 
 The current session's dedicated safety-lab API access is blocked because its Kubernetes v1.37.0
 certificate is not yet valid at the session time; no TLS verification bypass or cluster mutation was

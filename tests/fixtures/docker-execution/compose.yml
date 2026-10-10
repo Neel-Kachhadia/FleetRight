@@ -1,0 +1,30 @@
+services:
+  cpu-service:
+    build:
+      context: ../../..
+      dockerfile: workloads/Dockerfile
+    command: ["python", "/app/service.py"]
+    environment:
+      WORKLOAD_MODE: cpu
+      SERVICE_MS: "4"
+      SERVICE_DISTRIBUTION: jittered
+      COLD_START_MS: "3000"
+      LATENCY_SLO_MS: "120"
+    cpus: 1.0
+    mem_limit: 512m
+    read_only: true
+    user: "10001:10001"
+    init: true
+    pids_limit: 128
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: "no"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - from urllib.request import urlopen; urlopen('http://127.0.0.1:8080/ready', timeout=1)
+      interval: 1s
+      timeout: 2s
+      retries: 60
