@@ -44,9 +44,13 @@ scale-up on a new `cpu-api` object marked `monotonic-scale-up-v1` is admitted; d
 execution and scale-down are disabled. Kubernetes execution requires an explicit namespace-scoped
 kubeconfig and narrowly scoped RBAC.
 
-The current session's dedicated safety-lab API access is blocked because its Kubernetes v1.37.0
-certificate is not yet valid at the session time; no TLS verification bypass or cluster mutation was
-attempted. The saved live negative control from 2026-10-08 demonstrates that an unready same-UID Pod
+The current session's dedicated safety-lab Kubernetes v1.37.0 API and `/readyz` endpoint responded
+after the API certificate's NotBefore time, but the lab is not qualified for live execution: CoreDNS,
+etcd, the API server, controller manager, scheduler, kindnet, and kube-proxy Pods reported container
+startup errors, and worker kube-proxy logged `fsnotify watcher init: too many open files`. Restarting
+the three nodes in this dedicated kind cluster did not stabilize kube-system. No FleetRight resources
+were applied and the opt-in live scale-up test was not run. The saved live negative control from
+2026-10-08 demonstrates that an unready same-UID Pod
 under `IfHealthyBudget` can be evicted after its resourceVersion changes even when the PDB reports
 zero allowed disruptions. PostgreSQL leases, a Pod UID, and a resourceVersion check do not fence
 that separate final mutation. In the healthy-Pod path, Kubernetes can update PDB disruption
