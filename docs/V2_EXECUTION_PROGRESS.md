@@ -15,12 +15,16 @@ worktree was clean at start.
 **Local implementation checkpoint:** `10292a2`
 (`fix: fence workload authority across takeovers`). No tag or push was made.
 
-**Checkpoint recorded:** 2026-10-10 16:48 UTC (about 3 hours 40 minutes elapsed;
-about 5 hours 20 minutes remains to the hard stop).
+**Checkpoint recorded:** 2026-10-10 18:36 UTC (about 5 hours 28 minutes elapsed;
+about 3 hours 32 minutes remains to the hard stop).
 
-**HEAD before this checkpoint update:** `88ddad1`
-(`docs: record readiness-loss recovery evidence`). This update adds a real
-Docker CLI timeout-after-apply scenario and records its full-suite result.
+**HEAD before this checkpoint update:** `8e5f902`
+(`docs: record docker timeout recovery evidence`). This update adds an opt-in
+live Kubernetes API scale-up/crash-takeover test and records the failed lab
+health preflight. The test has not run. No FleetRight Kubernetes resources
+were applied. The three nodes in the dedicated `fleetright-safety-lab` kind
+cluster were restarted to clear system-container startup failures; API
+`/readyz` responds, but kube-system Pods still report container startup errors.
 
 **Current gate:** Prompt 2B remains PARTIAL. Current Kubernetes execution
 admits only monotonic scale-up on a newly created, explicitly marked
@@ -44,10 +48,12 @@ resourceVersion precondition; no safe final-mutation fence has been established.
 | Python/PostgreSQL suite with target-timeout E2E | PASS, 166 passed, 1 warning (112.55s) | `.venv/bin/python -m pytest -q python/tests` with `FLEETRIGHT_RUN_DOCKER_E2E=1`; fresh no-volume PostgreSQL 16 `fleetright_test` on loopback port 32976. Process-crash/takeover, target-timeout, and post-scale readiness-loss Docker E2Es all ran. Temporary DB and Compose resources were removed. |
 | CRD preflight unit and manifest checks | PASS | 5 focused tests; all 25 required runtime execution rules and required request/fence fields match the checked-in CRD. Live API-server validation remains blocked until the cluster cert is valid. |
 | C++ regression | PASS, 36/36 | `ctest --test-dir build --output-on-failure` |
-| Changed Python quality checks | PASS | Ruff 0.15.20 check and `compileall` pass for `reconciler.py` and the Docker E2E module; test-module format check passes. |
+| Focused target/controller tests | PASS, 69 passed (0.21s) | `.venv/bin/python -m pytest -q python/tests/test_prompt2b_execution_targets.py python/tests/test_workload_controller.py` |
+| Live Kubernetes API test harness | BLOCKED / NOT RUN | New opt-in `test_kubernetes_workload_api_recovers_after_ready_scale_up_crash`; it uses a short-lived executor ServiceAccount kubeconfig and checks named-workload patch plus negative Pod-delete, Eviction, Secret-read, and Node-patch RBAC. The test requires a healthy workload controller and Pod health path; the lab's kube-system Pods are currently failing, so no FleetRight resources were applied. |
+| Changed Python quality checks | PASS | Ruff 0.15.20 check/format and `compileall` pass for the modified API test module; `pytest --collect-only -k kubernetes_workload_api` collects the test. |
 | Changed YAML and CRD contract | PASS | PyYAML parsed the CRD, all 7 RBAC documents, and the portless Docker fixture; direct check confirmed all 25 execution CEL rules, required fields, and scale-up protocol enum |
 | Supplied DB endpoint | BLOCKED | Credential file parsed without displaying secrets; configured database is `fleetright_test`, but `127.0.0.1:32768` refused connections and `fleetright-isolated-test-db` was absent |
-| Safety-lab live access | BLOCKED | Explicit kubeconfig/context used. Sandbox first denied localhost socket access; one elevated read reached Kubernetes client v1.37.1 but API TLS certificate is not valid until `2026-10-10 18:29:54 UTC`. No TLS bypass or cluster mutation was attempted |
+| Safety-lab health | BLOCKED | Explicit API read succeeds at Kubernetes v1.37.0 and `/readyz?verbose` passes. All three Nodes report Ready, but kube-system shows CoreDNS, etcd, API server, controller manager, scheduler, kindnet, and kube-proxy Pods in `CreateContainerError`, `CrashLoopBackOff`, or `Error`; worker kube-proxy logs `fsnotify watcher init: too many open files`. Restarting the three named kind node containers did not stabilize these Pods. The FleetRight namespaces and CRD were absent; no FleetRight resource was applied. |
 | Current V2 destructive execution | DISABLED | Source, verifier, current RBAC, ADR-008, and saved API-server race evidence reviewed; no eviction or cordon mutator exists at committed HEAD |
 | Docker failure coverage | PARTIAL | Process-crash takeover, target timeout after real apply, and post-scale readiness-loss fail-safe pass. Destructive-operation compensation/recovery remains untested. |
 
@@ -202,13 +208,13 @@ target protocol resolves these cases.
   compensation foundation is not live-qualified. Prompt 3 must not start
   unless every mandatory Prompt 2B gate passes.
 
-**Next executable action:** after `2026-10-10 18:29:54 UTC`, retry only the
-explicitly scoped `kind-fleetright-safety-lab` API access. If TLS and RBAC
-permit, perform bounded API-server validation of the updated workload CRD and
-the currently supported monotonic scale-up path in an isolated namespace. This
-cannot qualify destructive execution. Keep the V2 mutation path disabled; do
-not create milestone 4 or start Prompt 3 while any mandatory gate remains
-incomplete.
+**Next executable action:** restore the dedicated kind lab's kube-system health
+and verify all required controllers/network Pods before provisioning any
+FleetRight test object. Then run the opt-in authenticated API scale-up/
+crash-takeover test with the restricted executor ServiceAccount kubeconfig.
+This can qualify only monotonic scale-up, not V2 destructive execution. Keep
+eviction, drain, and compensation disabled; do not create milestone 4 or start
+Prompt 3 while any mandatory gate remains incomplete.
 
 ## 2026-10-08 Prompt 2B continuation — Checkpoint A result (historical)
 

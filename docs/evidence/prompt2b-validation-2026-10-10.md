@@ -85,3 +85,33 @@ Pods are owned by the FleetRightWorkload. The current V2 contract cannot bind
 to this execution target. The managed FleetRightWorkload PDB derives
 `maxUnavailable` from `availabilityFloor`; it does not prove the profile
 required replica floor or the V2 N-1 reserve. These are additional blockers.
+
+## 2026-10-10 18:36 UTC continuation — live lab preflight
+
+- Repository HEAD remains `8e5f902` on `phase4/safe-execution-reconciliation`;
+  no tag or push was created.
+- The opt-in `test_kubernetes_workload_api_recovers_after_ready_scale_up_crash`
+  was updated to require a temporary executor ServiceAccount kubeconfig. It
+  checks the context, positive patch access to only the named workload, and
+  negative Pod deletion, Eviction, Secret read, and Node patch access. Ruff
+  check/format, Python compilation, and collection passed. The E2E itself was
+  not run.
+- With the explicit kubeconfig and context, `/version` returned Kubernetes
+  `v1.37.0`; `/readyz?verbose` passed. All three Nodes reported Ready, but the
+  system Pods were not healthy. Worker `kube-proxy` logged
+  `fsnotify watcher init: too many open files`. CoreDNS, etcd, API server,
+  controller manager, scheduler, kindnet, and kube-proxy later appeared in
+  `CreateContainerError`, `CrashLoopBackOff`, or `Error`. The control-plane
+  manager's earlier log recorded its startup before the API certificate's
+  NotBefore time; later container-runtime events also reported reserved
+  container names.
+- Only the three nodes belonging to `fleetright-safety-lab` were restarted in
+  an attempt to recover the disposable test cluster. This did not stabilize
+  kube-system. At the final read, the API health endpoint still passed and all
+  three Nodes were Ready, but kube-system Pods continued to report startup
+  failures. No FleetRight namespace, CRD, workload, or controller resource was
+  applied. No V2 destructive mutation was attempted.
+- The live Kubernetes scale-up/crash-takeover test is BLOCKED by this lab
+  state. No further cluster mutation should be attempted until kube-system
+  health is restored. Prompt 2B remains incomplete; Prompt 3, milestone 4, and
+  `v1.0.0` remain unauthorized.

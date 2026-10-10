@@ -30,7 +30,11 @@ from fleetright.control import (
     Repository,
     transition_allowed,
 )
-from fleetright.execution import DockerComposeTarget, WorkloadHealthObserver
+from fleetright.execution import (
+    DockerComposeTarget,
+    FleetRightWorkloadTarget,
+    WorkloadHealthObserver,
+)
 from fleetright.reconciler import ExecutionController
 from fleetright.scenario import oracle_snapshot_fields
 from psycopg import sql
@@ -146,6 +150,77 @@ def _run_docker_e2e_controller(
         lease_ttl_ms=lease_ttl_ms,
         max_attempts=2,
         readiness_timeout_seconds=readiness_timeout_seconds,
+        poll_seconds=0.1,
+    )
+    while not Path(stop_file).exists():
+        controller.run_once()
+        time.sleep(0.1)
+
+
+def _run_kind_e2e_controller(
+    dsn: str,
+    kubeconfig: str,
+    health_url: str,
+    controller_id: str,
+    stop_file: str,
+    *,
+    start_file: str | None = None,
+    block_after_ready_file: str | None = None,
+    lease_ttl_ms: int = 30_000,
+) -> None:
+    target = FleetRightWorkloadTarget(kubeconfig=kubeconfig, namespace="fleetright-v2")
+    if block_after_ready_file is not None:
+        set_replicas = target.set_replicas
+
+        def block_after_ready(
+            workload_id: str,
+            replicas: int,
+            observed: dict[str, object],
+            *,
+            expected_replicas: int,
+            fencing_token: int,
+            plan_id: str,
+            operation_id: str,
+        ) -> dict[str, object]:
+            result = set_replicas(
+                workload_id,
+                replicas,
+                observed,
+                expected_replicas=expected_replicas,
+                fencing_token=fencing_token,
+                plan_id=plan_id,
+                operation_id=operation_id,
+            )
+            deadline = time.monotonic() + 120
+            while time.monotonic() < deadline:
+                current = target.observe_scale(workload_id)
+                execution = current.get("execution")
+                if (
+                    current["ready_replicas"] == replicas
+                    and isinstance(execution, dict)
+                    and execution.get("planID") == plan_id
+                    and execution.get("operationID") == operation_id
+                    and execution.get("phase") == "APPLIED"
+                ):
+                    Path(block_after_ready_file).write_text("ready", encoding="ascii")
+                    threading.Event().wait(3_600)
+                    return result
+                time.sleep(0.2)
+            raise TimeoutError("FleetRightWorkload did not reach the requested Ready count")
+
+        target.set_replicas = block_after_ready  # type: ignore[method-assign]
+
+    if start_file is not None:
+        while not Path(start_file).exists() and not Path(stop_file).exists():
+            time.sleep(0.05)
+    controller = ExecutionController(
+        Repository(dsn),
+        target,
+        WorkloadHealthObserver({"cpu-api": health_url}),
+        controller_id,
+        lease_ttl_ms=lease_ttl_ms,
+        max_attempts=2,
+        readiness_timeout_seconds=90,
         poll_seconds=0.1,
     )
     while not Path(stop_file).exists():
@@ -1169,6 +1244,248 @@ def test_api_rejects_oversized_request_body(clean_database: Database) -> None:
         response = client.post("/v1/optimize", content=b"x" * (MAX_REQUEST_BYTES + 1))
     assert response.status_code == 413
     assert response.json()["detail"] == "request body exceeds 2 MiB"
+
+
+@pytest.mark.skipif(
+    os.getenv("FLEETRIGHT_RUN_KIND_E2E") != "1",
+    reason="set FLEETRIGHT_RUN_KIND_E2E=1 for the isolated Kubernetes workload E2E",
+)
+def test_kubernetes_workload_api_recovers_after_ready_scale_up_crash(
+    docker_e2e_database: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    kubeconfig = os.getenv("FLEETRIGHT_EXECUTOR_KUBECONFIG")
+    admin_kubeconfig = os.getenv("FLEETRIGHT_LAB_ADMIN_KUBECONFIG")
+    health_url = os.getenv("FLEETRIGHT_KIND_HEALTH_URL")
+    assert kubeconfig and admin_kubeconfig and health_url, "Kubeconfigs and health URL are required"
+    assert Path(admin_kubeconfig).resolve() == Path(
+        "/home/neel/.cache/fleetright/safety-lab.kubeconfig"
+    )
+    assert Path(kubeconfig).resolve() != Path(admin_kubeconfig).resolve()
+    assert health_url.startswith("http://127.0.0.1:")
+    assert conninfo_to_dict(docker_e2e_database.dsn).get("host") == "127.0.0.1"
+
+    def api_server(config: str) -> str:
+        return subprocess.run(
+            [
+                "kubectl",
+                f"--kubeconfig={config}",
+                "config",
+                "view",
+                "--minify",
+                "-o",
+                "jsonpath={.clusters[0].cluster.server}",
+            ],
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=5,
+        ).stdout.strip()
+
+    assert api_server(kubeconfig) == api_server(admin_kubeconfig)
+    assert (
+        subprocess.run(
+            ["kubectl", f"--kubeconfig={kubeconfig}", "config", "current-context"],
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=5,
+        ).stdout.strip()
+        == "fleetright-controller"
+    )
+    for args, expected in (
+        (("patch", "fleetrightworkloads.fleetright.io", "--resource-name=cpu-api"), "yes"),
+        (("delete", "pods"), "no"),
+        (("create", "pods/eviction"), "no"),
+        (("get", "secrets"), "no"),
+        (("patch", "nodes"), "no"),
+    ):
+        access = subprocess.run(
+            [
+                "kubectl",
+                f"--kubeconfig={kubeconfig}",
+                "auth",
+                "can-i",
+                *args,
+                "--namespace=fleetright-v2",
+            ],
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=5,
+        )
+        assert access.stdout.strip() == expected, (args, access.stdout, access.stderr)
+    monkeypatch.setenv("FLEETRIGHT_EXECUTION_LEASE_TTL_MS", "30000")
+
+    target = FleetRightWorkloadTarget(kubeconfig=kubeconfig, namespace="fleetright-v2")
+    baseline = target.observe_scale("cpu-api")
+    assert baseline["replicas"] == baseline["ready_replicas"] == 3
+    health = WorkloadHealthObserver({"cpu-api": health_url})
+    traffic_stop = threading.Event()
+    traffic_errors: list[str] = []
+
+    def send_traffic() -> None:
+        while not traffic_stop.is_set():
+            try:
+                with urllib.request.urlopen(f"{health_url}/work", timeout=2):
+                    pass
+            except OSError as error:
+                traffic_errors.append(str(error))
+            traffic_stop.wait(0.1)
+
+    traffic_thread = threading.Thread(target=send_traffic, daemon=True)
+    primary_stop = tmp_path / "kind-primary.stop"
+    recovery_start = tmp_path / "kind-recovery.start"
+    recovery_stop = tmp_path / "kind-recovery.stop"
+    mutation_ready = tmp_path / "kind-mutation.ready"
+    process_context = multiprocessing.get_context("spawn")
+    primary = process_context.Process(
+        target=_run_kind_e2e_controller,
+        args=(
+            docker_e2e_database.dsn,
+            kubeconfig,
+            health_url,
+            "kind-e2e-controller",
+            str(primary_stop),
+        ),
+        kwargs={"block_after_ready_file": str(mutation_ready), "lease_ttl_ms": 30_000},
+    )
+    recovery = process_context.Process(
+        target=_run_kind_e2e_controller,
+        args=(
+            docker_e2e_database.dsn,
+            kubeconfig,
+            health_url,
+            "kind-e2e-controller-recovery",
+            str(recovery_stop),
+        ),
+        kwargs={"start_file": str(recovery_start), "lease_ttl_ms": 30_000},
+    )
+    tokens, raw_tokens = _tokens()
+    app = create_app(
+        docker_e2e_database.repository,
+        tokens=tokens,
+        mode="EXECUTE",
+        execution_target="kubernetes-workload",
+        target_adapter=target,
+        health_observer=health,
+        start_execution_worker=False,
+    )
+    try:
+        traffic_thread.start()
+        time.sleep(1)
+        health.observe("cpu-api", p99_limit_ms=120, error_slo_ppm=1_000)
+        time.sleep(0.2)
+        baseline_health = health.observe("cpu-api", p99_limit_ms=120, error_slo_ppm=1_000)
+        assert baseline_health["ready"] is True
+        assert baseline_health["fresh_sample"] is True
+        assert baseline_health["healthy"] is True
+        primary.start()
+        recovery.start()
+        with TestClient(app) as client:
+            plan = _create_verified_plan(client, raw_tokens)
+            plan_id = plan["plan_id"]
+            approved = client.post(
+                f"/v1/plans/{plan_id}/approve",
+                headers={
+                    "Authorization": f"Bearer {raw_tokens['operator']}",
+                    "Idempotency-Key": "kind-e2e-approve",
+                },
+                json={},
+            )
+            assert approved.status_code == 200, approved.text
+            accepted = client.post(
+                f"/v1/plans/{plan_id}/execute",
+                headers={
+                    "Authorization": f"Bearer {raw_tokens['operator']}",
+                    "Idempotency-Key": "kind-e2e-execute",
+                },
+                json={},
+            )
+            replayed = client.post(
+                f"/v1/plans/{plan_id}/execute",
+                headers={
+                    "Authorization": f"Bearer {raw_tokens['operator']}",
+                    "Idempotency-Key": "kind-e2e-execute",
+                },
+                json={},
+            )
+            assert accepted.status_code == replayed.status_code == 202
+            assert accepted.json() == replayed.json()
+
+            deadline = time.monotonic() + 150
+            while not mutation_ready.exists() and time.monotonic() < deadline:
+                assert primary.is_alive(), f"execution controller exited: {primary.exitcode}"
+                time.sleep(0.1)
+            assert mutation_ready.exists(), "Kubernetes scale did not reach four Ready replicas"
+            scaled = target.observe_scale("cpu-api")
+            assert scaled["replicas"] == scaled["ready_replicas"] == 4
+            with docker_e2e_database.repository.transaction() as conn:
+                action_state = conn.execute(
+                    "SELECT execution_state FROM action_intents WHERE plan_id = %s",
+                    (plan_id,),
+                ).fetchone()["execution_state"]
+            assert action_state == "RUNNING"
+            primary.kill()
+            primary.join(timeout=10)
+            assert not primary.is_alive()
+            assert primary.exitcode != 0
+
+            time.sleep(30.2)
+            recovery_start.write_text("start", encoding="ascii")
+            detail = client.get(
+                f"/v1/plans/{plan_id}",
+                headers={"Authorization": f"Bearer {raw_tokens['viewer']}"},
+            )
+            deadline = time.monotonic() + 120
+            while detail.json().get("execution", {}).get("status") != "COMMITTED":
+                assert detail.json().get("execution", {}).get("status") not in {
+                    "FAILED_SAFE",
+                    "COMPENSATING",
+                    "COMPENSATED",
+                    "STALE",
+                }, detail.text
+                assert time.monotonic() < deadline, detail.text
+                time.sleep(0.2)
+                detail = client.get(
+                    f"/v1/plans/{plan_id}",
+                    headers={"Authorization": f"Bearer {raw_tokens['viewer']}"},
+                )
+            assert detail.status_code == 200
+            final_target = target.observe_scale("cpu-api")
+            assert final_target["replicas"] == final_target["ready_replicas"] == 4
+            with docker_e2e_database.repository.transaction() as conn:
+                execution = conn.execute(
+                    "SELECT status FROM plan_executions WHERE plan_id = %s", (plan_id,)
+                ).fetchone()
+                action = conn.execute(
+                    "SELECT execution_state, execution_result FROM action_intents "
+                    "WHERE plan_id = %s",
+                    (plan_id,),
+                ).fetchone()
+            assert execution["status"] == "COMMITTED"
+            assert action["execution_state"] == "SUCCEEDED"
+            assert action["execution_result"]["unknown_resolutions"]
+            dispatches = [
+                item
+                for item in action["execution_result"]["progress"]
+                if isinstance(item, dict)
+                and isinstance(item.get("result"), dict)
+                and "dispatch_target_replicas" in item["result"]
+            ]
+            assert len(dispatches) == 1
+    finally:
+        primary_stop.write_text("stop", encoding="ascii")
+        recovery_start.write_text("start", encoding="ascii")
+        recovery_stop.write_text("stop", encoding="ascii")
+        for process in (primary, recovery):
+            if process.pid is not None and process.is_alive():
+                process.kill()
+            if process.pid is not None:
+                process.join(timeout=10)
+        traffic_stop.set()
+        if traffic_thread.ident is not None:
+            traffic_thread.join(timeout=5)
+    assert not traffic_errors
 
 
 @pytest.mark.skipif(
