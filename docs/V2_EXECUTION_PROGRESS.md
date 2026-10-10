@@ -189,8 +189,11 @@ target protocol resolves these cases.
   a second process resolves the operation from observed state and commits with
   one durable dispatch. This proves one scale-up crash boundary, not every
   interruption point.
-- Docker target timeout, health regression, successful compensation, and
-  compensation failure remain NOT RUN. The checked-in
+- A second Docker API E2E lets real Compose apply 3→4, then delays the CLI
+  response past the target deadline. Reconciliation observes the four Ready
+  containers after `OUTCOME_UNKNOWN` and commits with one dispatch. A separate
+  post-scale readiness-loss case reaches `FAILED_SAFE` without downscaling.
+- Docker compensation and compensation failure remain NOT RUN. The checked-in
   Compose file still publishes fixed ports and remains single-replica; the
   adapter permits multiple replicas only after Compose confirms no published
   host ports. Docker's lock is host-local, not a fence against another host.

@@ -75,8 +75,8 @@ partial-drain recovery, and live compensation are not implemented. The V2 contra
 C++ verifier cover bounded placement/resource/topology/N-1 outcomes, but V2 plans remain inadmissible
 for execution because no target enforces the required operation authority and staged mutation
 protocol. The complete authenticated API-to-live-Kubernetes-workload takeover path is also not yet
-qualified. Docker process-crash takeover is tested only for one scale-up boundary; its target timeout
-and compensation paths remain unqualified.
+qualified. Docker process-crash takeover and target timeout after a real scale-up are tested, but
+only for monotonic scale-up; destructive-operation recovery and compensation remain unqualified.
 The local Deployment recipe is a health fixture, not a current EXECUTE target; there is no checked-in
 sample `FleetRightWorkload` resource or turnkey live setup recipe yet.
 See [ADR-008](adr/008-staged-evacuation-execution.md).

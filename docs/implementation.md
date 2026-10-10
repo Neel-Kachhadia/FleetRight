@@ -286,8 +286,11 @@ The Docker API E2E passes on a separate portless Compose fixture: a verified 3â†
 approved, executed, observed ready across all four Docker healthchecks, and committed with a fresh
 workload SLO window. It kills a spawned controller process after the real scale but before the target
 response returns, leaving the journal `RUNNING`. After lease expiry, a second process commits from
-observed state without redispatch; the journal contains one dispatch. This covers one crash boundary.
-Docker target timeout, health-regression compensation, and compensation recovery remain unverified.
+observed state without redispatch; the journal contains one dispatch. A separate run lets real
+Compose apply 3â†’4, then delays its CLI response past the target timeout; the controller records
+`OUTCOME_UNKNOWN`, observes four Ready containers, and commits with one dispatch. These tests cover
+scale-up crash and timeout boundaries only. Destructive-operation health recovery and compensation
+remain unverified.
 The checked-in Compose services still publish fixed ports and support only one replica each. The
 adapter fails closed on multiple replicas unless Compose configuration confirms there are no
 published host ports.
