@@ -16,13 +16,14 @@ new replica to an exact node or select an exact replica for scale-down. Its
 scheduler chooses replacement placement. Evicting the source while the
 Deployment remains at the surged replica count can cause its ReplicaSet to
 create another Pod; scaling back down can then remove an arbitrary Pod through
-the controller, outside the Eviction API and PDB admission. The existing
+the controller, outside the Eviction API and PDB admission. The earlier
 Deployment topology-spread constraint is not an exact-node placement rule.
 
-The existing eviction helper does use the Eviction API and source UID/resource
-version preconditions, but is not a journaled reconciler action. A Pod fence
-patch can invalidate an eviction request constructed with an older resource
-version on the normal healthy-Pod path. It is not a universal fence: Kubernetes
+Earlier adapter code used the Eviction API with source UID/resourceVersion
+preconditions, but no eviction mutator exists in the current target and no such
+request was a journaled reconciler action. A Pod fence patch can invalidate an
+eviction request constructed with an older resourceVersion on the normal
+healthy-Pod path. It is not a universal fence: Kubernetes
 v1.37.0's Eviction handler can replace the supplied resource-version
 precondition with the freshly read Pod version for an unready Pod admitted by
 its unhealthy-Pod PDB policy ([upstream handler](https://github.com/kubernetes/kubernetes/blob/v1.37.0/pkg/registry/core/pod/storage/eviction.go#L216-L274)).
@@ -128,9 +129,13 @@ version cannot both succeed. The controller validates current workload UID,
 deterministic logical Pod identity, owner UID, immutable template fingerprint,
 allowed Node name/UID, observed readiness, and availability floor before it
 creates or adopts any Pod. It records `RECONCILING` before Pod creation and
-`APPLIED` after all desired ordinals are present and verified. New operation
-identity is blocked until prior status is `APPLIED`, the object generation is
-observed with `Reconciled=True`, and the current availability floor is met.
+`APPLIED` after all desired ordinals exist and pass identity/template/placement
+validation; this status does not imply that they are Ready. The API reconciler
+separately gates action completion on the matching observed generation and
+replica count, Ready/Available counts, and a fresh healthy metrics window. New
+operation identity is blocked until prior status is `APPLIED`, the object
+generation is observed with `Reconciled=True`, and the current availability
+floor is met.
 
 Safety property: under this protocol and while the same workload object UID is
 retained, any delayed Pod CREATE can only create an ordinal within a previously

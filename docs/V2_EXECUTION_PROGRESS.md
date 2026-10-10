@@ -1,6 +1,111 @@
 # V2 Execution Progress
 
-## 2026-10-08 Prompt 2B continuation — Checkpoint A current result
+## 2026-10-10 Prompt 2B continuation — current session audit
+
+**Current top-level prompt:** Prompt 2B of the original three-prompt plan.
+Prompt 3 has not started. No new milestone or release tag was created.
+
+**Session start:** 2026-10-10 13:07:50 UTC; nine-hour hard stop is
+2026-10-10 22:07:50 UTC, with target finish by 21:37:50 UTC.
+
+**Branch / starting HEAD:** `phase4/safe-execution-reconciliation` /
+`d70c276` (`fix: bound Kubernetes execution to workload authority`). The
+worktree was clean at start.
+
+**Local implementation checkpoint:** `10292a2`
+(`fix: fence workload authority across takeovers`). No tag or push was made.
+
+**Checkpoint recorded:** 2026-10-10 14:29 UTC (about 1 hour 21 minutes elapsed;
+about 7 hours 39 minutes remain to the hard stop).
+
+**Current gate:** Prompt 2B remains PARTIAL. Current Kubernetes execution
+admits only monotonic scale-up on a newly created, explicitly marked
+`FleetRightWorkload`. V2 movement, Pod eviction, scale-down, terminal-Pod
+replacement, and node drain remain disabled. The saved Kubernetes 1.37.0
+negative control shows that an unready-Pod Eviction can replace the caller's
+resourceVersion precondition; no safe final-mutation fence has been established.
+
+### Current-session evidence
+
+| Check | Result | Evidence |
+|---|---|---|
+| Initial repository audit | PASS | Expected root and branch; clean worktree; `git diff --check` clean; HEAD `d70c276`; no milestone-4 or release tag |
+| Python and PostgreSQL suite | PASS, 155 passed, 1 warning | `.venv/bin/python -m pytest -q python/tests`; `fleetright_test`; temporary no-volume PostgreSQL 16 container bound to loopback because the named container was absent; stopped and removed after the run |
+| C++ regression | PASS, 36/36 | `ctest --test-dir build --output-on-failure` |
+| Changed Python quality checks | PASS | `ruff check` on changed Python files; `python3 -m compileall -q` on changed Python source files |
+| Changed Kubernetes YAML syntax | PASS | PyYAML parsed the modified FleetRightWorkload CRD and RBAC manifests |
+| Supplied DB endpoint | BLOCKED | Credential file parsed without displaying secrets; configured database is `fleetright_test`, but `127.0.0.1:32768` refused connections and `fleetright-isolated-test-db` was absent |
+| Safety-lab live access | BLOCKED | Explicit kubeconfig/context used. Sandbox first denied localhost socket access; one elevated read reached Kubernetes client v1.37.1 but API TLS certificate is not valid until `2026-10-10 18:29:54 UTC`. No TLS bypass or cluster mutation was attempted |
+| Current V2 destructive execution | DISABLED | Source, verifier, current RBAC, ADR-008, and saved API-server race evidence reviewed; no eviction or cordon mutator exists at this HEAD |
+| Docker E2E | NOT RUN | Default sandbox denied the Docker socket. A narrowly escalated read-only `docker ps` was then allowed and showed only the three `fleetright-safety-lab` kind containers; no Docker state was changed |
+
+The test DB run used a fresh no-volume container bound only to
+`127.0.0.1:32768`, generated a temporary password, confirmed the database name,
+ran the full suite, then stopped and removed the container. The existing
+`fleetright_fleetright-postgres` volume was not attached or changed.
+
+### Current-session fence changes and review
+
+- The FleetRightWorkload CRD now binds authorization to a
+  `fencedGeneration`; admission rules require generation advancement and
+  prevent removing, decreasing, or reusing the authority token with a changed
+  fence. Target observations fail closed when the recorded generation does not
+  match the object generation.
+- Takeover receipt validation now checks the latest dispatch against the live
+  target fence. A late request that wins after a takeover has recorded a
+  `PENDING` precondition is rejected as stale, observed, and re-fenced before
+  authorization continues. Repeated takeover replay reconstructs the prior
+  fenced generation instead of assuming a single-generation step.
+- Added direct target and PostgreSQL journal race coverage for stale
+  preconditions, same-token replay, repeated takeover, delayed old authorization,
+  and an old receipt arriving after a newer dispatch.
+- GPT-6.1 Sol High and Sol Max re-reviewed the final scale-up fencing changes
+  and reported no remaining production blockers in the reviewed path. This
+  review is not runtime proof and does not extend the destructive-action
+  boundary. A read-only Claude Sonnet request through the signed-in Claude Code
+  subscription failed before inference because DNS could not reach its API
+  (`EAI_AGAIN`); `ANTHROPIC_API_KEY` was absent, and no pay-as-you-go API was
+  used.
+
+### Source findings and remaining Prompt 2B gates
+
+- `FleetRightWorkload` `APPLIED` means all deterministic desired Pod ordinals
+  exist and pass identity/template/placement checks. It does not mean Ready.
+  The API reconciler separately waits for matching controller status, observed
+  replicas, readiness, availability, and a healthy metrics window before it
+  completes an action.
+- PostgreSQL leases and the workload `resourceVersion` CAS protect
+  authorization writes only; they do not fence a separate Eviction request.
+  A durable immutable retirement intent might be a different protocol, but it
+  must also prevent stale controller CREATEs from recreating retired ordinals,
+  bind the exact operation/source, preserve cancellation semantics, and define
+  mixed-version behavior. No such protocol is implemented or proven.
+- The complete authenticated API approval/journal/takeover path against the
+  live `FleetRightWorkload` target, including process crash and lost response,
+  remains NOT RUN in this session because the cluster certificate is not yet
+  valid. Recheck only after its `NotBefore` time, with the explicit context.
+- Docker optimize/approve/execute E2E is NOT RUN. The adapter is limited to one
+  replica for the checked-in Compose service because it publishes a fixed host
+  port. Although a read-only Docker listing was authorized, no mutation was
+  attempted; the host-local lock is also not a fence for a remote or independent
+  Docker client.
+- Real Docker optimize/approve/execute state change and compensation remain
+  unqualified. The checked-in Compose services cap at one replica, while the
+  independent verifier rejected the zero-replica test fixture. Do not weaken
+  the verifier to force a pass.
+- PDB-safe replacement/eviction, bounded drain, partial-drain recovery, and
+  live compensation remain unimplemented. Prompt 3 must not start unless every
+  mandatory Prompt 2B gate passes.
+
+**Next executable action:** after `2026-10-10 18:29:54 UTC`, retry only the
+explicitly scoped `kind-fleetright-safety-lab` API access and, if TLS and RBAC
+permit, qualify the updated `FleetRightWorkload` CRD/controller scale-up path
+through the authenticated API. The checked-in Docker service cannot scale past
+one replica because of its fixed host port, so no Docker E2E is claimed. Keep
+destructive execution disabled; do not create milestone 4 or start Prompt 3
+while any mandatory gate remains incomplete.
+
+## 2026-10-08 Prompt 2B continuation — Checkpoint A result (historical)
 
 **Current top-level prompt:** Prompt 2B of the original three-prompt plan.
 Prompt 3 has not started. Older “Phase” labels below are historical checkpoint
@@ -49,11 +154,13 @@ milestone tag was made.
   observed with `Reconciled=True`, and its replica count matches the journal.
 - Before each create, the controller checks FleetRightWorkload UID and logical
   identity, deterministic ordinal, template fingerprint, owner UID, allowed
-  node name and UID, existing Pod phase, current readiness, and the availability
-  floor. It persists `RECONCILING` before Pod creation and `APPLIED` only after
-  every desired ordinal is observable and validated. Ambiguous API outcomes
-  remain `OUTCOME_UNKNOWN` in the durable execution journal; retries observe or
-  adopt the deterministic slot before attempting a duplicate.
+  node name and UID, and any existing Pod's identity/placement. It persists
+  `RECONCILING` before Pod creation and `APPLIED` once every desired ordinal
+  exists and is validated; this status does not assert readiness. The API
+  reconciler separately gates action completion on Ready/Available observations
+  and the configured workload health window. Ambiguous API outcomes remain
+  `OUTCOME_UNKNOWN` in the durable execution journal; retries observe or adopt
+  the deterministic slot before attempting a duplicate.
 
 ### Exact safety guarantee and limit
 
@@ -124,7 +231,8 @@ host security settings; the temporary patch will be removed with test cleanup.
 The live test namespace, CRD, controller RBAC, and temporary image have been
 removed; prior images and host security settings were preserved. Changed-file
 checks and evidence updates are complete, and this checkpoint is committed on
-the current branch. Next, run the full API approval/journal/takeover flow against
+the current branch. Next action at that checkpoint: run the full API
+approval/journal/takeover flow against
 the real `FleetRightWorkload` target through a controller crash and lost
 response. Keep Eviction, replacement, scale-down, and node drain disabled until
 their request-order safety is proven. Do not start Prompt 3.

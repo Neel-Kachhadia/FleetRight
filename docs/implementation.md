@@ -145,16 +145,17 @@ timestamps. `/v1/plans/{id}` includes the execution owner/fence/lease and per-ac
 state. Controller leases and workload conflict leases use PostgreSQL time and monotonically
 increasing fencing tokens.
 
-Before a replica change the controller rereads the Deployment/Compose service, verifies the
-approved replica count and object identity/generation, rechecks plan expiry and snapshot/policy
-binding, verifies its leases, then commits the dispatch intent. After a crash or timeout, a
+Before a replica change the controller rereads the configured target, verifies the approved replica
+count and target identity/generation, rechecks plan expiry and snapshot/policy binding, verifies its
+leases, then commits the dispatch intent. After a crash or timeout, a
 persisted dispatch with no recorded response is treated as unknown. A new controller fences the
 actual target before it takes over; the active owner observes the target before deciding whether an
 unknown operation already applied or may be retried. Retries are limited to two attempts and occur
 only after observation proves the prior requested count was not applied. A known successful response
-followed by an external revert fails safe without redispatch. Scale-downs change one replica per
-step, wait for observed readiness, then require a fresh health window before continuing. The first
-sample after controller restart cannot authorize scale-down. A fresh latency, error, or queue
+followed by an external revert fails safe without redispatch. Targets that admit scale-down change
+one replica per step, wait for observed readiness, then require a fresh health window before
+continuing; the Kubernetes workload target rejects scale-down. The first sample after controller
+restart cannot authorize scale-down. A fresh latency, error, or queue
 regression after scale-down creates a durable compensation action restoring the pre-action replica
 count; `COMPENSATED` is written only after capacity and a fresh healthy window are observed. A
 scale-out health regression leaves the added capacity in place and ends `FAILED_SAFE`. Known target
@@ -177,44 +178,36 @@ and fresh metrics. Docker Engine does not provide the Deployment-style resource-
 by Kubernetes. Keep this adapter on one host and do not allow other Docker clients to mutate the
 same Compose project while FleetRight executes.
 
-The Kubernetes adapter supports only `SET_REPLICA_COUNT` on the checked-in `cpu-api` stateless
-Deployment. It reads UID, generation, resourceVersion, desired/ready/available counts, and the
-stored fencing annotation. Approval binds UID, generation, and replicas; the live JSON Patch tests
-those values plus freshly observed resourceVersion and the fencing annotation before changing
-`.spec.replicas`. Fence requests persist a pending receipt before the target patch; takeover retries
-the same fence token after a crash, and reconciliation checks the recorded precondition and
-post-fence generation before resolving an ambiguous scale. The namespace Role permits named
-Deployment `get`/`patch` only. It grants no Pod eviction, PDB, or Node operations because those
-actions are not wired to the reconciler. Kubernetes EXECUTE requires an explicit mode-0600
-kubeconfig and `FLEETRIGHT_KUBERNETES_NAMESPACE=fleetright`.
+The Kubernetes target supports only `SET_REPLICA_COUNT` for the checked-in `cpu-api`
+`FleetRightWorkload`, and only for objects created with `monotonic-scale-up-v1`. It reads workload
+UID, generation, resourceVersion, desired/observed/ready/available counts, and the durable execution
+request/status. One resourceVersion-guarded Merge Patch binds plan ID, action ID, generation, and
+expected/target replica counts to the new desired count. The executor Role permits GET/PATCH on that
+named custom resource only; the separate workload-controller Role creates Pods but cannot delete
+Pods, submit Evictions, patch workload spec, or mutate Nodes. Direct Kubernetes Deployment execution
+is disabled. Kubernetes EXECUTE requires an explicit mode-0600 kubeconfig and
+`FLEETRIGHT_KUBERNETES_NAMESPACE=fleetright-v2`.
 
-Live execution evidence was collected on the dedicated `fleetright-prompt2b-e2e` kind cluster
-(kind v0.33.0, Kubernetes v1.37.0). Through the authenticated API, a verified plan scaled the
-Deployment from three to four replicas. The adapter then simulated a lost response by terminating
-the controller after the API server applied the scale. A replacement controller observed four
-available replicas, marked the existing action successful on attempt one, and committed the plan;
-the instrumented adapter counted exactly one scale mutation. A repeated execute request returned
-the same `202` response, and an unauthenticated execute returned `401`. This E2E used a deterministic
-healthy health observer; readiness and available replica counts came from the live Deployment, but
-Prometheus SLO metrics were not used in this run. A separate real API check changed the Deployment
-after approval and observed `FAILED_SAFE` with zero FleetRight target mutations.
+The workload controller reports `APPLIED` after all desired deterministic Pod ordinals exist and
+pass identity/template/placement validation; this does not imply readiness. The API reconciler
+separately requires matching operation identity, observed generation/count, Ready/Available counts,
+and a fresh healthy workload-metrics window before it completes the action. A later operation also
+requires the prior operation to be `APPLIED`, the current availability floor to be met, and the
+workload to report `Reconciled=True`.
 
-With a temporary test-only Role expansion, direct adapter checks against the live PDB observed
-`PDB_BLOCKED` at zero disruptions and left the Pod present; after the PDB allowed disruption, the
-Eviction API accepted the request and the replacement became Ready. These are adapter-level checks,
-not durable reconciler actions, and the expanded permissions are not in the checked-in manifest.
-With the checked-in Role applied, the ServiceAccount could read the named Deployment while creating
-a ClusterRoleBinding was denied. The kind host had only the control plane and one worker Ready
-because of its inotify quota; the test-only Deployment had a temporary control-plane toleration. No
-host sysctl was changed.
+Earlier authenticated API and direct-adapter evidence used a Kubernetes Deployment target on a
+different disposable kind cluster. That target is disabled at this HEAD, so those results do not
+qualify the current `FleetRightWorkload` target. The current API approval/journal/takeover flow has
+not yet been run end-to-end against a live `FleetRightWorkload` controller under crash and lost
+response.
 
-The API and reconciler still reject `MOVE_REPLICA`, `DEACTIVATE_NODE`, and resource resizing before
-claiming execution. The Pod eviction, PDB check, cordon, and movement observation helpers are not
-connected to the durable action journal. Therefore durable PDB-blocked execution, progressive node
-drain, partial-drain restart recovery, and end-to-end topology-preserving evacuation are not
-implemented. The RBAC manifest has no Node `patch` permission, so FleetRight cannot cordon Nodes.
-Do not treat the direct eviction checks as a supported drain path. The PDB does not gate Deployment
-replica updates.
+At this HEAD, the API rejects `MOVE_REPLICA`, `DEACTIVATE_NODE`, and resource resizing before
+claiming execution. No Pod eviction or Node-cordon mutator is present in the current target, and the
+RBAC manifests grant neither permission. Durable PDB-blocked execution, staged replacement, bounded
+node drain, partial-drain restart recovery, and live compensation therefore remain unimplemented.
+The saved Kubernetes 1.37.0 negative control shows that an unready same-UID Pod can be evicted after
+the caller's resourceVersion changes, so Pod UID and the workload CAS are not a final-mutation fence.
+The PDB does not govern the supported scale-up operation.
 
 ## V2 workload model: Phase 1
 
@@ -330,7 +323,11 @@ curl --fail-with-body -sS -H "Authorization: Bearer $FLEETRIGHT_OPERATOR_BEARER_
   "http://127.0.0.1:8080/v1/plans/$PLAN_ID"
 ```
 
-For local kind, run:
+The following Deployment setup is a legacy service-health fixture. It is not the current Kubernetes
+execution target: `FLEETRIGHT_EXECUTION_TARGET=kubernetes` is disabled, and a Deployment in
+`fleetright` cannot be used by the `FleetRightWorkload` target in `fleetright-v2`.
+
+For a disposable local kind cluster, the legacy service-health fixture can be started with:
 
 ```sh
 kind create cluster --config deploy/kubernetes/kind.yaml
@@ -341,8 +338,14 @@ kubectl -n fleetright rollout status deployment/cpu-api --timeout=120s
 kubectl -n fleetright port-forward service/cpu-api 8081:8080
 ```
 
-In a second shell, mint a short-lived ServiceAccount token from the kind administrator context,
-write a private kubeconfig for the bounded namespace Role, and start EXECUTE:
+The current scale-up target additionally requires the CRD, the separate workload controller, and a
+new `FleetRightWorkload` object created with `executionProtocol: monotonic-scale-up-v1` and current
+allowed-node names and UIDs. The repository has no checked-in sample object or turnkey setup for
+that target, so the commands above do not qualify its live execution path.
+
+When that target has been provisioned in an isolated cluster, mint a short-lived ServiceAccount
+token from the kind administrator context, write a private kubeconfig for the bounded namespace
+Role, and start EXECUTE:
 
 ```sh
 export FLEETRIGHT_KUBE_SERVER="$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')"

@@ -35,30 +35,29 @@ control API. Forecast coverage is evaluated on historical test windows only; no 
 history has been supplied for model calibration. The control API uses a single cluster-wide
 workload/node lease set, so parallel planning for independent workloads is not supported yet.
 
-Prompt 2B adds live Docker Compose and Kubernetes Deployment replica scaling behind explicit
-`EXECUTE` configuration. The Docker fence is host-local and Docker Compose's fixed published ports
-limit the checked-in service harness to one replica per service. Kubernetes execution must use an
-explicit namespace-scoped kubeconfig. The dedicated `fleetright-safety-lab` kind cluster and its
-three nodes were healthy at preflight, but no evacuation action was run: the v1.37.0 Eviction API
-does not preserve the supplied Pod resourceVersion precondition on every applicable unhealthy-Pod
-PDB branch, so a stale controller is not fenced at the final mutation. The safety-lab has no
-`fleetright` namespace or installed workload/RBAC; Kubernetes readiness, topology, PDB admission,
-ServiceAccount identity, and RBAC were not exercised against this cluster during this focused
-session. The earlier Prompt 2B cluster and adapter checks recorded below in
-[the specialist review log](specialist-review-log.md) were run on a different disposable cluster
-and did not validate durable evacuation. The documented optimize-to-approve-to-execute API runbook
-was not exercised end-to-end; API idempotency was tested with a fake target, and the real Docker
-adapter was exercised separately.
+Prompt 2B exposes live Docker Compose execution and a Kubernetes `FleetRightWorkload` target behind
+explicit `EXECUTE` configuration. The Docker fence is host-local, and the checked-in Compose
+services publish fixed host ports, limiting the harness to one replica per service. On Kubernetes,
+only monotonic scale-up on a new `cpu-api` object marked `monotonic-scale-up-v1` is admitted; direct
+Deployment execution and scale-down are disabled. Kubernetes execution requires an explicit
+namespace-scoped kubeconfig and narrowly scoped RBAC.
 
-Only immutable replica-count actions are executable. A Deployment scale action does not identify a
-Pod or use the Eviction API; it cannot implement a verified per-Pod move. `MOVE_REPLICA`, node
-deactivation/drain, and resource resizing are rejected during planning admission and rechecked at
-approval before execution-journal creation. Although the Kubernetes target code has PDB-aware
-eviction helpers, eviction and node drain are not wired to the durable reconciler, so PDB-blocked
-retry and partial-drain recovery are not supported. SHADOW produces recommendations without a
-separate simulated reconciliation pass. The exact-destination evacuation proof cannot be faithfully
-carried out through the current Deployment scaling interface. See
-[ADR-008](adr/008-staged-evacuation-execution.md).
+The current session's dedicated safety-lab API access is blocked because its Kubernetes v1.37.0
+certificate is not yet valid at the session time; no TLS verification bypass or cluster mutation was
+attempted. The saved live negative control from 2026-10-08 demonstrates that an unready same-UID Pod
+under `IfHealthyBudget` can be evicted after its resourceVersion changes even when the PDB reports
+zero allowed disruptions. PostgreSQL leases, a Pod UID, and a resourceVersion check do not fence
+that separate final mutation. No eviction or cordon mutator exists in the current target.
+
+V2 `MOVE_REPLICA`, `DEACTIVATE_NODE`, and resource resizing are rejected during planning admission
+and again before execution-journal creation. Durable staged replacement, PDB-safe eviction,
+partial-drain recovery, and live compensation are not implemented. The V2 contract and independent
+C++ verifier cover bounded placement/resource/topology/N-1 outcomes, but V2 plans remain inadmissible
+for execution because no target enforces the required operation authority and staged mutation
+protocol. The complete authenticated API-to-live-workload takeover path is also not yet qualified.
+The local Deployment recipe is a health fixture, not a current EXECUTE target; there is no checked-in
+sample `FleetRightWorkload` resource or turnkey live setup recipe yet.
+See [ADR-008](adr/008-staged-evacuation-execution.md).
 
 The separate V2 contract and independent C++ verifier prove a bounded
 constraint-based evacuation for one source Pod UID. A verified V2 plan remains
