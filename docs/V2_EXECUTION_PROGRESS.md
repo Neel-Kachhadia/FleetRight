@@ -26,6 +26,11 @@ were applied. The three nodes in the dedicated `fleetright-safety-lab` kind
 cluster were restarted to clear system-container startup failures; API
 `/readyz` responds, but kube-system Pods still report container startup errors.
 
+**Safe code/evidence checkpoint:** `e93a44a`
+(`test: add restricted kind scale-up recovery harness`). This is the current
+implementation commit; it contains only the opt-in test harness and checkpoint
+documentation, not a production execution-path change.
+
 **Current gate:** Prompt 2B remains PARTIAL. Current Kubernetes execution
 admits only monotonic scale-up on a newly created, explicitly marked
 `FleetRightWorkload`. V2 movement, Pod eviction, scale-down, terminal-Pod
