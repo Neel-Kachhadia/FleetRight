@@ -15,12 +15,13 @@ worktree was clean at start.
 **Local implementation checkpoint:** `10292a2`
 (`fix: fence workload authority across takeovers`). No tag or push was made.
 
-**Checkpoint recorded:** 2026-10-10 16:02 UTC (about 2 hours 55 minutes elapsed;
-about 6 hours 5 minutes remains to the hard stop).
+**Checkpoint recorded:** 2026-10-10 16:18 UTC (about 3 hours 10 minutes elapsed;
+about 5 hours 50 minutes remains to the hard stop).
 
-**Current committed HEAD:** `27df715`
-(`test: cover docker controller process crash recovery`). The worktree was
-clean after this commit; current checkpoint edits are documentation only.
+**Current committed HEAD:** `31f2fd2`
+(`docs: record Docker process crash recovery evidence`). The process-crash test
+is in `27df715`; this follow-up commit records its evidence. The worktree is
+clean.
 
 **Current gate:** Prompt 2B remains PARTIAL. Current Kubernetes execution
 admits only monotonic scale-up on a newly created, explicitly marked

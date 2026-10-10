@@ -4,7 +4,7 @@ Repository: `/home/neel/Projects/FleetRight`
 Branch: `phase4/safe-execution-reconciliation`
 Starting commit: `d70c276` (`fix: bound Kubernetes execution to workload authority`)
 Local implementation checkpoint: `10292a2` (`fix: fence workload authority across takeovers`)
-Current committed HEAD: `27df715` (`test: cover docker controller process crash recovery`)
+Current committed HEAD: `31f2fd2` (`docs: record Docker process crash recovery evidence`)
 Session start: 2026-10-10 13:07:50 UTC; hard stop: 2026-10-10 22:07:50 UTC.
 
 ## Executed checks
@@ -24,7 +24,7 @@ Session start: 2026-10-10 13:07:50 UTC; hard stop: 2026-10-10 22:07:50 UTC.
 
 The test database URL was sourced from the private environment file and overridden for a fresh no-volume `fleetright_test` container at `127.0.0.1:32976`; no credentials were printed. The full Python suite and Docker E2E each used the isolated endpoint, and each temporary container was stopped and removed. The existing `fleetright_fleetright-postgres` volume was not attached or modified.
 
-## Current safety boundary at committed HEAD `27df715`
+## Current safety boundary at committed HEAD `31f2fd2`
 
 - The Kubernetes API target admits only monotonic scale-up for a newly created `FleetRightWorkload` marked `monotonic-scale-up-v1`. Workload UID, template, placement, and policy are immutable; `spec.replicas` is the high-water value and growth is bound to a durable request. There is no separate high-water field.
 - The controller's `APPLIED` status means desired deterministic Pod ordinals exist and pass identity/template/placement checks. It does not mean they are Ready. The API reconciler separately checks the matching operation, observed generation/count, readiness/availability, and a healthy metrics window.
