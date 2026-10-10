@@ -282,15 +282,15 @@ An API 400, 403, or 422 while creating a generated Pod sets a sanitized
 workload condition; transient request errors and failed status writes still
 surface as controller errors.
 
-The Docker API E2E now passes on a separate portless Compose fixture: a verified 3→4 plan is
-authenticated, approved, executed, observed ready across all four Docker healthchecks, and committed
-with a fresh workload SLO window. The test injects a lost response after the real scale, stops the
-first controller thread after `OUTCOME_UNKNOWN`, waits for its lease to expire, then verifies a new
-controller commits from observed state without redispatch. This is not a killed-process test; Docker
-target timeout, health-regression compensation, and compensation recovery remain unverified. The
-checked-in Compose services still publish fixed ports and support only one replica each. The adapter
-fails closed on multiple replicas unless Compose configuration confirms there are no published host
-ports.
+The Docker API E2E passes on a separate portless Compose fixture: a verified 3→4 plan is authenticated,
+approved, executed, observed ready across all four Docker healthchecks, and committed with a fresh
+workload SLO window. It kills a spawned controller process after the real scale but before the target
+response returns, leaving the journal `RUNNING`. After lease expiry, a second process commits from
+observed state without redispatch; the journal contains one dispatch. This covers one crash boundary.
+Docker target timeout, health-regression compensation, and compensation recovery remain unverified.
+The checked-in Compose services still publish fixed ports and support only one replica each. The
+adapter fails closed on multiple replicas unless Compose configuration confirms there are no
+published host ports.
 
 Docker local operation commands:
 

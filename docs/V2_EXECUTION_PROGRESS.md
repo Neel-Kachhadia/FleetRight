@@ -15,12 +15,12 @@ worktree was clean at start.
 **Local implementation checkpoint:** `10292a2`
 (`fix: fence workload authority across takeovers`). No tag or push was made.
 
-**Checkpoint recorded:** 2026-10-10 15:49 UTC (about 2 hours 42 minutes elapsed;
-about 6 hours 18 minutes remains to the hard stop).
+**Checkpoint recorded:** 2026-10-10 16:02 UTC (about 2 hours 55 minutes elapsed;
+about 6 hours 5 minutes remains to the hard stop).
 
-**Current committed HEAD:** `1671339`
-(`feat: support portless Compose scale execution`). Only the current-session
-progress and evidence documents remain uncommitted.
+**Current committed HEAD:** `27df715`
+(`test: cover docker controller process crash recovery`). The worktree was
+clean after this commit; current checkpoint edits are documentation only.
 
 **Current gate:** Prompt 2B remains PARTIAL. Current Kubernetes execution
 admits only monotonic scale-up on a newly created, explicitly marked
@@ -34,9 +34,9 @@ resourceVersion precondition; no safe final-mutation fence has been established.
 | Check | Result | Evidence |
 |---|---|---|
 | Initial repository audit | PASS | Expected root and branch; clean worktree; `git diff --check` clean; HEAD `d70c276`; no milestone-4 or release tag |
-| Python and PostgreSQL suite | PASS, 163 passed, 1 skipped, 1 warning (7.99s) | `.venv/bin/python -m pytest -q python/tests`; fresh no-volume PostgreSQL 16 `fleetright_test`, trust auth bound to `127.0.0.1:32975`; temporary container stopped and removed. The opt-in Docker E2E is the one skip. |
-| Targeted takeover replay regression | PASS | Included in the 162-test suite; injects response loss after fake target authorization has published the request, then checks takeover replay and one authorization. |
-| Docker API E2E | PASS, 1 passed (21.37s) | `test_docker_api_execution_changes_real_compose_state`; authenticated optimize/verify/approve/execute, duplicate request, real Compose 3→4, healthcheck readiness for all four replicas, fresh SLO metrics, injected response loss after mutation, controller-thread stop, lease expiry, new-controller takeover, observed commit without redispatch. Fresh no-volume `fleetright_test` on `127.0.0.1:32973`; isolated random project removed. |
+| Python and PostgreSQL suite | PASS, 163 passed, 1 skipped, 1 warning (7.80s) | `.venv/bin/python -m pytest -q python/tests`; fresh no-volume PostgreSQL 16 `fleetright_test`, trust auth bound to `127.0.0.1:32976`; temporary container stopped and removed. The opt-in Docker E2E is the one skip. |
+| Targeted takeover replay regression | PASS | Included in the 163-passed Python suite; injects response loss after fake target authorization has published the request, then checks takeover replay and one authorization. |
+| Docker API E2E | PASS, 1 passed (21.31s) | `python/tests/test_prompt2a_control_api.py::test_docker_api_execution_changes_real_compose_state`; authenticated optimize/verify/approve/execute, duplicate request, real Compose 3→4, healthcheck readiness for all four replicas, fresh SLO metrics, then kill a spawned controller process after mutation while the durable action remains `RUNNING`. After lease expiry, a second controller process observes the target and commits with exactly one recorded dispatch. Fresh no-volume `fleetright_test` on `127.0.0.1:32976`; isolated random project removed. |
 | CRD preflight unit and manifest checks | PASS | 5 focused tests; all 25 required runtime execution rules and required request/fence fields match the checked-in CRD. Live API-server validation remains blocked until the cluster cert is valid. |
 | C++ regression | PASS, 36/36 | `ctest --test-dir build --output-on-failure` |
 | Changed Python quality checks | PASS | Ruff 0.15.20 and `compileall` on all four changed Python files |
@@ -44,11 +44,12 @@ resourceVersion precondition; no safe final-mutation fence has been established.
 | Supplied DB endpoint | BLOCKED | Credential file parsed without displaying secrets; configured database is `fleetright_test`, but `127.0.0.1:32768` refused connections and `fleetright-isolated-test-db` was absent |
 | Safety-lab live access | BLOCKED | Explicit kubeconfig/context used. Sandbox first denied localhost socket access; one elevated read reached Kubernetes client v1.37.1 but API TLS certificate is not valid until `2026-10-10 18:29:54 UTC`. No TLS bypass or cluster mutation was attempted |
 | Current V2 destructive execution | DISABLED | Source, verifier, current RBAC, ADR-008, and saved API-server race evidence reviewed; no eviction or cordon mutator exists at committed HEAD |
-| Docker failure coverage | PARTIAL | Real lost-response recovery and controller-thread takeover pass. Actual process kill, target timeout, health-regression compensation, and compensation recovery remain untested. |
+| Docker failure coverage | PARTIAL | Lost response, actual process kill at the post-mutation/pre-response boundary, and process takeover from observed state pass. Target timeout, health-regression compensation, and compensation recovery remain untested. |
 
 The full-suite DB run used a fresh no-volume container bound only to
-`127.0.0.1:32975`, confirmed database name `fleetright_test`, ran the suite,
-then stopped and removed the container. The existing
+`127.0.0.1:32976`, confirmed database name `fleetright_test`, ran the suite,
+then stopped and removed the container. The separate Docker E2E used a fresh
+container on the same port, then also stopped and removed it. The existing
 `fleetright_fleetright-postgres` volume was not attached or changed.
 
 ### Current-session fence changes and review
@@ -166,13 +167,14 @@ target protocol resolves these cases.
   valid. Recheck only after its `NotBefore` time, with the explicit context.
 - The positive Docker API path now passes against a portless isolated Compose
   fixture: verified 3→4 scaling, authenticated approval/execution, duplicate
-  execute replay, per-container healthchecks, and a fresh SLO window. A target
-  response is deliberately lost after the real scale; the first controller
-  records `OUTCOME_UNKNOWN`, stops, and a new controller takes over after lease
-  expiry and commits from observed state without redispatch. This is a
-  controller-thread restart simulation, not a killed/restarted process.
-- Docker target timeout, process crash/restart, health regression, successful
-  compensation, and compensation failure remain NOT RUN. The checked-in
+  execute replay, per-container healthchecks, and a fresh SLO window. A spawned
+  controller process is killed after the actual Compose scale but before the
+  target response returns; the journal remains `RUNNING`. After lease expiry,
+  a second process resolves the operation from observed state and commits with
+  one durable dispatch. This proves one scale-up crash boundary, not every
+  interruption point.
+- Docker target timeout, health regression, successful compensation, and
+  compensation failure remain NOT RUN. The checked-in
   Compose file still publishes fixed ports and remains single-replica; the
   adapter permits multiple replicas only after Compose confirms no published
   host ports. Docker's lock is host-local, not a fence against another host.
