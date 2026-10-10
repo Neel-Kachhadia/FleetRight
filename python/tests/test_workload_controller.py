@@ -243,7 +243,7 @@ def test_stale_generation_cannot_create_pods_after_a_newer_workload_update() -> 
     assert api.status["conditions"][2]["reason"] == "StaleWorkloadGeneration"
 
 
-def test_delayed_old_create_after_takeover_remains_a_valid_deterministic_slot() -> None:
+def test_delayed_old_create_can_recreate_removed_slot_after_takeover() -> None:
     class CompareAndSwapStatusAPI(FakeAPI):
         status_resource_version = "1"
 
@@ -306,6 +306,10 @@ def test_delayed_old_create_after_takeover_remains_a_valid_deterministic_slot() 
         takeover["spec"]["executionRequest"]["generation"] = 101
         takeover["status"] = deepcopy(api.status)
         reconcile_workload(api, takeover, _nodes())
+        retired_name = _pod_name("workload-uid", 1)
+        retired_uid = api.pods[retired_name]["metadata"]["uid"]
+        source_node = "worker-a"
+        api.pods[retired_name]["spec"]["nodeName"] = source_node
 
         api.status_resource_version = str(int(api.status_resource_version) + 1)
         next_operation = deepcopy(takeover)
@@ -322,11 +326,24 @@ def test_delayed_old_create_after_takeover_remains_a_valid_deterministic_slot() 
         )
         next_operation["status"] = deepcopy(api.status)
         reconcile_workload(api, next_operation, _nodes())
+        # Model the old Pod disappearing while the earlier CREATE is still pending.
+        del api.pods[retired_name]
+        assert api.get_pod(retired_name) is None
         release_post.set()
         with pytest.raises(ApiError, match="status resourceVersion conflict"):
             old.result(timeout=3)
 
     assert len(api.pods) == 3
+    recreated = api.pods[retired_name]
+    assert recreated["metadata"]["uid"] != retired_uid
+    node_terms = recreated["spec"]["affinity"]["nodeAffinity"][
+        "requiredDuringSchedulingIgnoredDuringExecution"
+    ]["nodeSelectorTerms"]
+    assert any(
+        term["matchFields"][0]["values"] == [source_node]
+        for term in node_terms
+        if term.get("matchFields")
+    )
     assert {_pod_name("workload-uid", ordinal) for ordinal in range(3)} == set(api.pods)
     assert api.status["execution"]["operationID"] == "action-2"
     assert api.status["execution"]["phase"] == "APPLIED"

@@ -1,5 +1,80 @@
 # V2 Execution Progress
 
+## 2026-10-10 Prompt 2B continuation — live Kind validation
+
+**Scope:** Prompt 2B continuation only. Prompt 3 has not started.
+
+**Session start:** approximately 2026-10-10 19:33 UTC; two-hour hard stop
+2026-10-10 21:33 UTC.
+
+**Branch / starting HEAD:** `phase4/safe-execution-reconciliation` /
+`840322db5204cdfe386232842bba1bbc2738c9fd`. The worktree was clean at start.
+
+**Checkpoint status:** PARTIAL. Live authenticated Kubernetes scale-up and
+controller crash/takeover now pass. No destructive V2 operation was enabled.
+
+### Current-session evidence
+
+| Check | Result | Evidence |
+|---|---|---|
+| Safety-lab health | PASS | Explicit `kind-fleetright-safety-lab` context: 3/3 Nodes Ready, all system Pods Running/Ready, Kubernetes v1.37.0, `/readyz?verbose` passed. `fs.inotify.max_user_instances` remains 16384. |
+| FleetRight fixtures | PASS | Reinstalled the CRD, RBAC, controller and test workload for the recreated cluster. The live `cpu-api` workload reports APPLIED, 4 replicas, 4 Ready. |
+| Executor authority | PASS | Live test accepted named `FleetRightWorkload` patch; Pod delete, Pod Eviction, Secret read and Node patch were denied. Restricted kubeconfig and port-forward were removed after the test. |
+| Authenticated Kubernetes API E2E | PASS, 1 passed (80.28s) | `test_kubernetes_workload_api_recovers_after_ready_scale_up_crash`: authenticated optimize/approve/execute and idempotent replay; real 3→4 scale-up; controller process crash while journal remained RUNNING; 30-second lease expiry; takeover committed from observed state with one durable dispatch. One existing Starlette/httpx deprecation warning. |
+| PostgreSQL | PASS | Full Python suite used isolated PostgreSQL 16.15 `fleetright_test` at loopback port 32976. The supplied private environment file was sourced without printing credentials. The temporary container had no mounts and was removed after the suite. |
+| Python | PASS, 163 passed, 4 skipped (20.08s) | `.venv/bin/python -m pytest -q python/tests`. Three opt-in Docker variants were skipped (two dispatch-fault cases and one readiness-regression case); the Kind case was run separately and passed above. One existing deprecation warning. |
+| C++ | PASS, 36/36 | `ctest --test-dir build --output-on-failure`, including all 13 `EvacuationV2Test` cases. |
+| Quality checks | PASS | Ruff check/format, `compileall` on changed test modules, and `git diff --check`. |
+| Destructive V2 execution | DISABLED | No eviction, scale-down, node deactivation or drain authority was added. |
+
+The live test fixes three `kubectl auth can-i` probe mistakes in the existing
+E2E harness: named-resource syntax, Eviction subresource syntax, and expected
+denial exit codes. A controller regression now holds an old deterministic Pod
+CREATE across takeover and a later operation, removes the old Pod, then proves
+the delayed request can recreate that slot with a new UID and source-node
+placement still allowed. The stale status resourceVersion conflict does not
+undo the Kubernetes CREATE. This test passed in the full Python suite.
+
+### Safety review and remaining gates
+
+GPT-6.1 Sol Max and Sol High completed separate read-only reviews. Claude
+Sonnet 5.5 High and Claude Opus 5.5 Medium completed focused reviews through
+the first-party Claude subscription after approval to send selected project
+source. Sonnet's terminal capture was truncated; Opus's full review confirmed
+the following source-level blockers, which match the regression test:
+
+- A fresh controller also recreates any missing ordinal while desired count
+  remains unchanged. A replacement can therefore return to the source node.
+- A stale Pod CREATE can complete after the source Pod was removed and after a
+  newer operation was applied. Workload status CAS only rejects stale status;
+  it does not fence the independent Kubernetes CREATE.
+- FleetRightWorkload Pods are owned by the FleetRightWorkload, while the V2
+  verifier requires Deployment/ReplicaSet source ownership. The managed PDB
+  also does not encode the verifier's profile replica floor and N-1 reserve.
+- Kubernetes 1.37.0's unready-Pod Eviction path does not establish a reliable
+  resourceVersion fence for a delayed request. PDB admission does not reserve
+  replacement readiness through later source deletion.
+
+These conditions leave source identity, stale-controller rejection, safe
+takeover, PDB preconditions and uncertain Eviction reconciliation unproven.
+Keep Pod eviction, staged replacement, scale-down and node drain disabled.
+Recovery, compensation and drain qualification remain NOT RUN. The existing
+monotonic scale-up path was validated; no operation was newly enabled.
+
+GPT-6 Luna Max ran the fixture restoration and live E2E. GPT-6.1 Sol Max
+reviewed stale destructive effects; GPT-6.1 Sol High reviewed the workload
+controller/PDB contract. Claude Sonnet independently reviewed live test and
+crash cases; Claude Opus reviewed the narrow destructive protocol. Graphify
+found no existing map; a rebuild was skipped because this continuation
+already had completed safety analysis and prioritizes execution evidence.
+
+**Next exact implementation action:** add a target-side retired-ordinal
+tombstone/admission contract that rejects both fresh and delayed Pod CREATEs
+for a retired source slot; first prove that invariant with race tests, then
+consider wiring exact-UID Eviction. Do not enable Eviction until that contract,
+replacement readiness, PDB safety, recovery, compensation and live drain gates
+pass. Prompt 2B remains incomplete; do not create `milestone-4-safe-control-plane`.
+
 ## 2026-10-10 Prompt 2B continuation — current session audit
 
 **Current top-level prompt:** Prompt 2B of the original three-prompt plan.

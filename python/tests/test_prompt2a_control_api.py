@@ -1293,9 +1293,9 @@ def test_kubernetes_workload_api_recovers_after_ready_scale_up_crash(
         == "fleetright-controller"
     )
     for args, expected in (
-        (("patch", "fleetrightworkloads.fleetright.io", "--resource-name=cpu-api"), "yes"),
+        (("patch", "fleetrightworkloads.fleetright.io/cpu-api"), "yes"),
         (("delete", "pods"), "no"),
-        (("create", "pods/eviction"), "no"),
+        (("create", "pods", "--subresource=eviction"), "no"),
         (("get", "secrets"), "no"),
         (("patch", "nodes"), "no"),
     ):
@@ -1309,11 +1309,15 @@ def test_kubernetes_workload_api_recovers_after_ready_scale_up_crash(
                 "--namespace=fleetright-v2",
             ],
             capture_output=True,
-            check=True,
+            check=False,
             text=True,
             timeout=5,
         )
-        assert access.stdout.strip() == expected, (args, access.stdout, access.stderr)
+        expected_returncode = 0 if expected == "yes" else 1
+        assert (access.returncode, access.stdout.strip()) == (
+            expected_returncode,
+            expected,
+        ), (args, access.returncode, access.stdout, access.stderr)
     monkeypatch.setenv("FLEETRIGHT_EXECUTION_LEASE_TTL_MS", "30000")
 
     target = FleetRightWorkloadTarget(kubeconfig=kubeconfig, namespace="fleetright-v2")
