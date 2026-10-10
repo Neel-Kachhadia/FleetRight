@@ -25,6 +25,51 @@ _WORKLOAD_SERVICES = {
     "memory-api": "memory-service",
     "queued-api": "queued-service",
 }
+_WORKLOAD_FENCE_RULES = {
+    "!has(oldSelf.executionFence) || has(self.executionFence)",
+    (
+        "!has(oldSelf.executionFence) || !has(self.executionFence) || "
+        "self.executionFence.generation >= oldSelf.executionFence.generation"
+    ),
+    (
+        "!has(oldSelf.executionFence) || !has(self.executionFence) || "
+        "self.executionFence.generation > oldSelf.executionFence.generation || "
+        "(self.executionFence.generation == oldSelf.executionFence.generation && "
+        "self.executionFence.planID == oldSelf.executionFence.planID && "
+        "self.executionFence.operationID == oldSelf.executionFence.operationID && "
+        "self.executionFence.expectedGeneration == oldSelf.executionFence.expectedGeneration && "
+        "self.executionFence.expectedReplicas == oldSelf.executionFence.expectedReplicas && "
+        "self.executionFence.fencedGeneration == oldSelf.executionFence.fencedGeneration)"
+    ),
+    (
+        "!has(oldSelf.executionFence) || !has(self.executionFence) || "
+        "self.executionFence.generation == oldSelf.executionFence.generation || "
+        "self.executionFence.fencedGeneration > oldSelf.executionFence.fencedGeneration"
+    ),
+    (
+        "!has(self.executionRequest) || "
+        "(has(oldSelf.executionRequest) && self.executionRequest == oldSelf.executionRequest) || "
+        "(has(self.executionFence) && "
+        "self.executionRequest.generation == self.executionFence.generation && "
+        "self.executionRequest.planID == self.executionFence.planID && "
+        "self.executionRequest.operationID == self.executionFence.operationID)"
+    ),
+    (
+        "!has(oldSelf.executionFence) || !has(self.executionRequest) || "
+        "(has(oldSelf.executionRequest) && self.executionRequest == oldSelf.executionRequest) || "
+        "self.executionRequest.generation > oldSelf.executionFence.generation"
+    ),
+    (
+        "!has(self.executionFence) || !has(self.executionRequest) || "
+        "self.executionFence.generation >= self.executionRequest.generation"
+    ),
+    (
+        "!has(self.executionFence) || !has(self.executionRequest) || "
+        "self.executionFence.generation != self.executionRequest.generation || "
+        "(self.executionFence.planID == self.executionRequest.planID && "
+        "self.executionFence.operationID == self.executionRequest.operationID)"
+    ),
+}
 
 # ponytail: ceilings cover three checked-in workloads; add one with each new target.
 EXECUTION_HEALTH_CEILINGS = {
@@ -396,6 +441,54 @@ class FleetRightWorkloadTarget(KubernetesTarget):
 
     supports_workload_execution = True
 
+    def _require_fencing_schema(self) -> None:
+        crd = self._json("get", "crd", "fleetrightworkloads.fleetright.io", "-o", "json")
+        spec_root = crd.get("spec") if isinstance(crd, dict) else None
+        versions = spec_root.get("versions", []) if isinstance(spec_root, dict) else []
+        if not isinstance(versions, list):
+            versions = []
+        version = next(
+            (
+                item
+                for item in versions
+                if isinstance(item, dict) and item.get("name") == "v1alpha1"
+            ),
+            None,
+        )
+        version_schema = version.get("schema") if isinstance(version, dict) else None
+        schema = version_schema.get("openAPIV3Schema") if isinstance(version_schema, dict) else None
+        if not isinstance(schema, dict):
+            schema = {}
+        root_properties = schema.get("properties")
+        spec = root_properties.get("spec", {}) if isinstance(root_properties, dict) else {}
+        rules = spec.get("x-kubernetes-validations", []) if isinstance(spec, dict) else []
+        properties = spec.get("properties", {}) if isinstance(spec, dict) else {}
+        fence = properties.get("executionFence", {}) if isinstance(properties, dict) else {}
+        if not isinstance(rules, list):
+            rules = []
+        required_fence_fields = fence.get("required", []) if isinstance(fence, dict) else []
+        if not isinstance(required_fence_fields, list):
+            required_fence_fields = []
+        installed_rules = {
+            rule.get("rule")
+            for rule in rules
+            if isinstance(rule, dict) and isinstance(rule.get("rule"), str)
+        }
+        if not (
+            _WORKLOAD_FENCE_RULES <= installed_rules
+            and isinstance(fence, dict)
+            and set(required_fence_fields)
+            >= {
+                "planID",
+                "operationID",
+                "generation",
+                "expectedGeneration",
+                "expectedReplicas",
+                "fencedGeneration",
+            }
+        ):
+            raise TargetPreconditionFailed("FleetRightWorkload fencing CRD is not installed")
+
     def observe_scale(self, workload_id: str) -> dict[str, Any]:
         name = _checked_name(workload_id, "workload identifier")
         value = self._json("get", "fleetrightworkload", name, "-n", self.namespace, "-o", "json")
@@ -409,6 +502,7 @@ class FleetRightWorkloadTarget(KubernetesTarget):
             value.get("status", {}),
         )
         request = spec.get("executionRequest")
+        fence = spec.get("executionFence")
         execution = status.get("execution")
         replicas, ready, available = (
             spec.get("replicas"),
@@ -431,6 +525,7 @@ class FleetRightWorkloadTarget(KubernetesTarget):
             or type(status.get("observedGeneration", 0)) is not int
             or not isinstance(conditions, list)
             or (request is not None and not isinstance(request, dict))
+            or (fence is not None and not isinstance(fence, dict))
             or (execution is not None and not isinstance(execution, dict))
         ):
             raise TargetError("FleetRightWorkload identity or status is invalid")
@@ -455,6 +550,33 @@ class FleetRightWorkloadTarget(KubernetesTarget):
             or request["expectedReplicas"] > request["targetReplicas"]
         ):
             raise TargetError("FleetRightWorkload durable operation identity is invalid")
+        fence_token = fence.get("generation", 0) if isinstance(fence, dict) else 0
+        if isinstance(fence, dict) and (
+            not all(
+                isinstance(fence.get(key), str) and fence[key] for key in ("planID", "operationID")
+            )
+            or type(fence_token) is not int
+            or fence_token < 1
+            or type(fence.get("expectedGeneration")) is not int
+            or type(fence.get("expectedReplicas")) is not int
+            or type(fence.get("fencedGeneration")) is not int
+            or fence["expectedGeneration"] < 1
+            or fence["expectedReplicas"] < 0
+            or fence["fencedGeneration"] < 1
+        ):
+            raise TargetError("FleetRightWorkload execution fence is invalid")
+        if isinstance(fence, dict) and fence["fencedGeneration"] != generation:
+            raise TargetPreconditionFailed("workload changed after the authority fence")
+        if isinstance(fence, dict) and (
+            fence_token < token
+            or (
+                fence_token == token
+                and isinstance(request, dict)
+                and (fence.get("planID"), fence.get("operationID"))
+                != (request.get("planID"), request.get("operationID"))
+            )
+        ):
+            raise TargetError("FleetRightWorkload execution fence is behind its request")
         return {
             "uid": metadata["uid"],
             "generation": generation,
@@ -471,11 +593,150 @@ class FleetRightWorkloadTarget(KubernetesTarget):
             ),
             "availability_floor": spec["availabilityFloor"],
             "observed_generation": status.get("observedGeneration", 0),
-            "fencing_token": token,
+            "fencing_token": max(token, fence_token),
             "generation_tracks_spec": True,
             "workload_execution": True,
             "execution_request": request,
+            "execution_fence": fence,
             "execution": execution,
+        }
+
+    def fence_scale(
+        self,
+        workload_id: str,
+        fencing_token: int,
+        *,
+        expected: dict[str, Any],
+        plan_id: str,
+        operation_id: str,
+        target_replicas: int,
+    ) -> dict[str, Any]:
+        if (
+            type(fencing_token) is not int
+            or fencing_token <= 0
+            or not plan_id
+            or not operation_id
+            or type(target_replicas) is not int
+        ):
+            raise TargetPreconditionFailed("invalid workload execution fence")
+        current = self.observe_scale(workload_id)
+        if current["uid"] != expected.get("uid"):
+            raise TargetPreconditionFailed("FleetRightWorkload identity changed")
+        request = current["execution_request"]
+        fence = current["execution_fence"]
+        same_request = (
+            isinstance(request, dict)
+            and request.get("planID") == plan_id
+            and request.get("operationID") == operation_id
+            and request.get("targetReplicas") == target_replicas
+            and current["replicas"] == target_replicas
+            and request.get("generation", fencing_token) <= fencing_token
+        )
+        same_fence = (
+            isinstance(fence, dict)
+            and fence.get("generation") == fencing_token
+            and fence.get("planID") == plan_id
+            and fence.get("operationID") == operation_id
+        )
+        applied_before_fence = bool(same_request)
+        expected_unchanged = all(
+            current.get(key) == expected.get(key) for key in ("generation", "replicas")
+        )
+        if not expected_unchanged and not (same_fence or same_request):
+            raise TargetPreconditionFailed("FleetRightWorkload changed before fencing")
+        if current["fencing_token"] > fencing_token:
+            raise TargetPreconditionFailed("a newer workload execution generation exists")
+        self._require_fencing_schema()
+        if (
+            isinstance(request, dict)
+            and not same_request
+            and not (
+                isinstance(current["execution"], dict)
+                and current["execution"].get("planID") == request.get("planID")
+                and current["execution"].get("operationID") == request.get("operationID")
+                and current["execution"].get("generation") == request.get("generation")
+                and current["execution"].get("phase") == "APPLIED"
+                and current["observed_generation"] == current["generation"]
+            )
+        ):
+            raise ActionBlocked("PRIOR_WORKLOAD_OPERATION_UNRESOLVED")
+        if same_fence:
+            same_request = (
+                isinstance(request, dict)
+                and (request.get("planID"), request.get("operationID")) == (plan_id, operation_id)
+                and current["replicas"] == target_replicas
+            )
+            fence_precondition = {
+                "uid": current["uid"],
+                "generation": fence["fencedGeneration"] - 1,
+                "replicas": current["replicas"] if same_request else fence["expectedReplicas"],
+            }
+            return {
+                **current,
+                "fence_precondition": fence_precondition,
+                "fence_applied": True,
+                "fence_replayed": True,
+                "operation_applied_before_fence": applied_before_fence,
+            }
+
+        if same_request and not expected_unchanged:
+            raise TargetPreconditionFailed("workload changed before fencing")
+
+        if isinstance(fence, dict) and (fence.get("planID"), fence.get("operationID")) == (
+            plan_id,
+            operation_id,
+        ):
+            base_generation = fence["expectedGeneration"]
+            base_replicas = fence["expectedReplicas"]
+        elif same_request:
+            base_generation = current["generation"] - 1
+            base_replicas = request["expectedReplicas"]
+        else:
+            base_generation = expected["generation"]
+            base_replicas = expected["replicas"]
+        fence_precondition = {key: current[key] for key in ("uid", "generation", "replicas")}
+        new_fence = {
+            "planID": plan_id,
+            "operationID": operation_id,
+            "generation": fencing_token,
+            "expectedGeneration": base_generation,
+            "expectedReplicas": base_replicas,
+            "fencedGeneration": current["generation"] + 1,
+        }
+        value = self._json(
+            "patch",
+            "fleetrightworkload",
+            _checked_name(workload_id, "workload identifier"),
+            "-n",
+            self.namespace,
+            "--type=merge",
+            "-p",
+            json.dumps(
+                {
+                    "metadata": {"resourceVersion": current["resource_version"]},
+                    "spec": {"executionFence": new_fence},
+                },
+                separators=(",", ":"),
+            ),
+            "-o",
+            "json",
+        )
+        fenced = self._observe(value, workload_id)
+        if (
+            fenced["uid"] != current["uid"]
+            or fenced["replicas"] != current["replicas"]
+            or fenced["generation"] != current["generation"] + 1
+            or fenced["fencing_token"] != fencing_token
+            or fenced["execution_fence"] != new_fence
+        ):
+            raise OutcomeUnknown("Kubernetes did not confirm the workload authority fence")
+        return {
+            **fenced,
+            "fence_precondition": fence_precondition,
+            "fence_applied": True,
+            "fence_replayed": False,
+            "prior_execution_fence": fence if isinstance(fence, dict) else None,
+            "operation_applied_before_fence": applied_before_fence,
         }
 
     def authorize_scale(
@@ -521,11 +782,26 @@ class FleetRightWorkloadTarget(KubernetesTarget):
             raise TargetPreconditionFailed("FleetRightWorkload precondition changed")
         if same and current["fencing_token"] == fencing_token:
             return {**current, "fence_precondition": expected, "already_authorized": True}
-        if current["fencing_token"] >= fencing_token:
+        if current["fencing_token"] > fencing_token:
             raise TargetPreconditionFailed("a newer workload execution generation exists")
         if target_replicas < current["replicas"]:
             raise ActionBlocked("WORKLOAD_SCALE_DOWN_DISABLED")
-        if current["observed_generation"] != current["generation"] and not same:
+        self._require_fencing_schema()
+        fence = current["execution_fence"]
+        fenced_base_ready = (
+            isinstance(fence, dict)
+            and fence.get("planID") == plan_id
+            and fence.get("operationID") == operation_id
+            and fence.get("expectedGeneration") == current["observed_generation"]
+            and fence.get("expectedReplicas") == current["replicas"]
+            and current["observed_replicas"] == current["replicas"]
+            and current["reconciled"]
+        )
+        if (
+            current["observed_generation"] != current["generation"]
+            and not same
+            and not fenced_base_ready
+        ):
             raise ActionBlocked("WORKLOAD_RECONCILIATION_PENDING")
         if (
             min(current["ready_replicas"], current["available_replicas"])
@@ -557,9 +833,32 @@ class FleetRightWorkloadTarget(KubernetesTarget):
             "expectedReplicas": current["replicas"],
             "targetReplicas": target_replicas,
         }
+        current_fence = current["execution_fence"]
+        base_generation = (
+            current_fence["expectedGeneration"]
+            if isinstance(current_fence, dict)
+            and (current_fence.get("planID"), current_fence.get("operationID"))
+            == (plan_id, operation_id)
+            else current["generation"]
+        )
+        base_replicas = (
+            current_fence["expectedReplicas"]
+            if isinstance(current_fence, dict)
+            and (current_fence.get("planID"), current_fence.get("operationID"))
+            == (plan_id, operation_id)
+            else current["replicas"]
+        )
+        new_fence = {
+            "planID": plan_id,
+            "operationID": operation_id,
+            "generation": fencing_token,
+            "expectedGeneration": base_generation,
+            "expectedReplicas": base_replicas,
+            "fencedGeneration": current["generation"] + 1,
+        }
         patch: dict[str, Any] = {
             "metadata": {"resourceVersion": current["resource_version"]},
-            "spec": {"executionRequest": new_request},
+            "spec": {"executionRequest": new_request, "executionFence": new_fence},
         }
         if target_replicas != current["replicas"]:
             patch["spec"]["replicas"] = target_replicas

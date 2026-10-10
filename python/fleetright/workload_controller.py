@@ -552,6 +552,7 @@ def _validate_spec(
     if spec["availabilityFloor"] > spec["replicas"]:
         raise SafetyError("InvalidSpec", "availabilityFloor cannot exceed replicas")
     execution = spec.get("executionRequest")
+    fence = spec.get("executionFence")
     if execution is not None and (
         spec.get("executionProtocol") != "monotonic-scale-up-v1"
         or not isinstance(execution, dict)
@@ -569,6 +570,32 @@ def _validate_spec(
         raise SafetyError(
             "InvalidExecutionRequest", "execution request identity or target is invalid"
         )
+    if fence is not None and (
+        not isinstance(fence, dict)
+        or not all(
+            isinstance(fence.get(key), str) and fence[key] for key in ("planID", "operationID")
+        )
+        or type(fence.get("generation")) is not int
+        or fence["generation"] < 1
+        or type(fence.get("expectedGeneration")) is not int
+        or fence["expectedGeneration"] < 1
+        or type(fence.get("expectedReplicas")) is not int
+        or fence["expectedReplicas"] < 0
+        or type(fence.get("fencedGeneration")) is not int
+        or fence["fencedGeneration"] != metadata["generation"]
+        or (
+            isinstance(execution, dict)
+            and (
+                fence["generation"] < execution["generation"]
+                or (
+                    fence["generation"] == execution["generation"]
+                    and (fence["planID"], fence["operationID"])
+                    != (execution["planID"], execution["operationID"])
+                )
+            )
+        )
+    ):
+        raise SafetyError("InvalidExecutionFence", "execution fence is invalid")
     disruption = spec.get("disruption")
     max_unavailable = (
         disruption.get("maxConcurrentDisruptions") if isinstance(disruption, dict) else None
@@ -716,6 +743,7 @@ def _validate_execution_request(workload: dict[str, Any]) -> None:
     previous = status.get("execution")
     observed_generation = status.get("observedGeneration")
     expected = request["expectedReplicas"]
+    fence = spec.get("executionFence")
     same_operation = isinstance(previous, dict) and all(
         previous.get(key) == request[key] for key in ("planID", "operationID")
     )
@@ -730,12 +758,28 @@ def _validate_execution_request(workload: dict[str, Any]) -> None:
         and observed_generation == metadata["generation"] - 1
         and status.get("replicas") == expected
     )
+    fenced_previous_generation = (
+        isinstance(fence, dict)
+        and fence.get("planID") == request["planID"]
+        and fence.get("operationID") == request["operationID"]
+        and type(fence.get("generation")) is int
+        and fence["generation"] >= request["generation"]
+        and type(fence.get("expectedGeneration")) is int
+        and observed_generation == fence["expectedGeneration"]
+        and status.get("replicas") == fence.get("expectedReplicas") == expected
+    )
     if isinstance(previous, dict):
         if (
             reconciled_previous_generation
             and previous.get("phase") == "APPLIED"
             and type(previous.get("generation")) is int
             and request["generation"] > previous["generation"]
+        ):
+            return
+        if (
+            fenced_previous_generation
+            and previous.get("phase") == "APPLIED"
+            and previous.get("targetReplicas") == expected
         ):
             return
     else:
@@ -748,6 +792,12 @@ def _validate_execution_request(workload: dict[str, Any]) -> None:
         )
         if (
             reconciled_previous_generation
+            and reconciled
+            and status.get("readyReplicas", 0) >= spec["availabilityFloor"]
+        ):
+            return
+        if (
+            fenced_previous_generation
             and reconciled
             and status.get("readyReplicas", 0) >= spec["availabilityFloor"]
         ):

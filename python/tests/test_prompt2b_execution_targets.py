@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 from fleetright.api import create_app
 from fleetright.execution import (
+    _WORKLOAD_FENCE_RULES,
     ActionBlocked,
     DockerComposeTarget,
     FleetRightWorkloadTarget,
@@ -23,6 +24,12 @@ from fleetright.execution import (
     valid_execution_health_policy,
 )
 from fleetright.reconciler import ExecutionController
+
+
+def _skip_fencing_crd_preflight(
+    monkeypatch: pytest.MonkeyPatch, target: FleetRightWorkloadTarget
+) -> None:
+    monkeypatch.setattr(target, "_require_fencing_schema", lambda: None)
 
 
 def test_execution_health_policy_is_capped_by_server_workload_contract() -> None:
@@ -283,6 +290,8 @@ def test_kubernetes_roles_publish_requests_and_leave_pod_creation_to_controller(
 
     assert 'resources: ["fleetrightworkloads"]' in api_rbac
     assert 'verbs: ["get", "patch"]' in api_rbac
+    assert 'resourceNames: ["fleetrightworkloads.fleetright.io"]' in api_rbac
+    assert 'resources: ["customresourcedefinitions"]' in api_rbac
     assert 'resources: ["deployments"]' not in api_rbac
     assert 'resources: ["pods/eviction"]' not in api_rbac
     assert 'resources: ["pods"]\n    verbs: ["get", "list", "create"]' in workload_rbac
@@ -319,6 +328,7 @@ def test_workload_request_cas_binds_identity_generation_and_replica_target(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     target = FleetRightWorkloadTarget(namespace="fleetright-v2")
+    _skip_fencing_crd_preflight(monkeypatch, target)
     state = _workload_object()
     patches: list[dict[str, object]] = []
 
@@ -362,9 +372,329 @@ def test_workload_request_cas_binds_identity_generation_and_replica_target(
                 "expectedReplicas": 2,
                 "targetReplicas": 3,
             },
+            "executionFence": {
+                "planID": "plan-1",
+                "operationID": "action-1",
+                "generation": 12,
+                "expectedGeneration": 4,
+                "expectedReplicas": 2,
+                "fencedGeneration": 5,
+            },
             "replicas": 3,
         },
     }
+
+
+def test_workload_preflight_requires_old_fence_advance_rule(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = FleetRightWorkloadTarget(namespace="fleetright-v2")
+    advance_rule = (
+        "!has(oldSelf.executionFence) || !has(self.executionRequest) || "
+        "(has(oldSelf.executionRequest) && self.executionRequest == oldSelf.executionRequest) || "
+        "self.executionRequest.generation > oldSelf.executionFence.generation"
+    )
+    assert advance_rule in _WORKLOAD_FENCE_RULES
+    crd = {
+        "spec": {
+            "versions": [
+                {
+                    "name": "v1alpha1",
+                    "schema": {
+                        "openAPIV3Schema": {
+                            "properties": {
+                                "spec": {
+                                    "properties": {
+                                        "executionFence": {
+                                            "required": [
+                                                "planID",
+                                                "operationID",
+                                                "generation",
+                                                "expectedGeneration",
+                                                "expectedReplicas",
+                                                "fencedGeneration",
+                                            ]
+                                        }
+                                    },
+                                    "x-kubernetes-validations": [
+                                        {"rule": rule}
+                                        for rule in _WORKLOAD_FENCE_RULES
+                                        if rule != advance_rule
+                                    ],
+                                }
+                            }
+                        }
+                    },
+                }
+            ]
+        }
+    }
+    monkeypatch.setattr(target, "_json", lambda *_args: crd)
+
+    with pytest.raises(TargetPreconditionFailed, match="fencing CRD is not installed"):
+        target._require_fencing_schema()
+
+
+def test_workload_takeover_fence_changes_authority_without_scaling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = FleetRightWorkloadTarget(namespace="fleetright-v2")
+    _skip_fencing_crd_preflight(monkeypatch, target)
+    state = _workload_object()
+    patches: list[dict[str, object]] = []
+
+    def apply(*args: str) -> dict[str, object]:
+        if args[0] == "get":
+            return deepcopy(state)
+        patch = json.loads(args[args.index("-p") + 1])
+        patches.append(patch)
+        state["spec"].update(patch["spec"])  # type: ignore[index]
+        state["metadata"]["generation"] += 1  # type: ignore[index]
+        state["metadata"]["resourceVersion"] = str(  # type: ignore[index]
+            int(state["metadata"]["resourceVersion"]) + 1  # type: ignore[index]
+        )
+        return deepcopy(state)
+
+    monkeypatch.setattr(target, "_json", apply)
+    before = target.observe_scale("cpu-api")
+    result = target.fence_scale(
+        "cpu-api",
+        12,
+        expected=before,
+        plan_id="plan-1",
+        operation_id="action-1",
+        target_replicas=3,
+    )
+    repeated = target.fence_scale(
+        "cpu-api",
+        12,
+        expected=before,
+        plan_id="plan-1",
+        operation_id="action-1",
+        target_replicas=3,
+    )
+    advanced = target.fence_scale(
+        "cpu-api",
+        13,
+        expected=repeated,
+        plan_id="plan-1",
+        operation_id="action-1",
+        target_replicas=3,
+    )
+    authorized = target.authorize_scale(
+        "cpu-api",
+        14,
+        expected=advanced,
+        plan_id="plan-1",
+        operation_id="action-1",
+        target_replicas=3,
+    )
+
+    assert result["replicas"] == repeated["replicas"] == advanced["replicas"] == 2
+    assert result["fencing_token"] == repeated["fencing_token"] == 12
+    assert advanced["fencing_token"] == 13
+    assert authorized["replicas"] == 3
+    assert authorized["execution_fence"]["generation"] == 14
+    assert authorized["execution_fence"]["expectedGeneration"] == 4
+    assert authorized["execution_fence"]["expectedReplicas"] == 2
+    assert result["execution_request"] is None
+    assert result["execution_fence"] == {
+        "planID": "plan-1",
+        "operationID": "action-1",
+        "generation": 12,
+        "expectedGeneration": 4,
+        "expectedReplicas": 2,
+        "fencedGeneration": 5,
+    }
+    assert patches[:2] == [
+        {
+            "metadata": {"resourceVersion": "7"},
+            "spec": {"executionFence": result["execution_fence"]},
+        },
+        {
+            "metadata": {"resourceVersion": "8"},
+            "spec": {
+                "executionFence": {
+                    "planID": "plan-1",
+                    "operationID": "action-1",
+                    "generation": 13,
+                    "expectedGeneration": 4,
+                    "expectedReplicas": 2,
+                    "fencedGeneration": 6,
+                }
+            },
+        },
+    ]
+
+
+def test_workload_takeover_fence_replay_rejects_later_spec_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = FleetRightWorkloadTarget(namespace="fleetright-v2")
+    _skip_fencing_crd_preflight(monkeypatch, target)
+    state = _workload_object()
+
+    def apply(*args: str) -> dict[str, object]:
+        if args[0] == "get":
+            return deepcopy(state)
+        patch = json.loads(args[args.index("-p") + 1])
+        state["spec"].update(patch["spec"])  # type: ignore[index]
+        state["metadata"]["generation"] += 1  # type: ignore[index]
+        state["metadata"]["resourceVersion"] = str(  # type: ignore[index]
+            int(state["metadata"]["resourceVersion"]) + 1  # type: ignore[index]
+        )
+        return deepcopy(state)
+
+    monkeypatch.setattr(target, "_json", apply)
+    before = target.observe_scale("cpu-api")
+    target.fence_scale(
+        "cpu-api",
+        12,
+        expected=before,
+        plan_id="plan-1",
+        operation_id="action-1",
+        target_replicas=3,
+    )
+    state["metadata"]["generation"] += 1  # type: ignore[index]
+    state["metadata"]["resourceVersion"] = "external-spec-update"  # type: ignore[index]
+
+    with pytest.raises(TargetPreconditionFailed, match="changed after the authority fence"):
+        target.fence_scale(
+            "cpu-api",
+            12,
+            expected=before,
+            plan_id="plan-1",
+            operation_id="action-1",
+            target_replicas=3,
+        )
+
+
+def test_takeover_fences_an_already_published_request_without_replaying_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = FleetRightWorkloadTarget(namespace="fleetright-v2")
+    _skip_fencing_crd_preflight(monkeypatch, target)
+    state = _workload_object()
+    state["metadata"]["generation"] = 5  # type: ignore[index]
+    state["spec"].update(  # type: ignore[index]
+        replicas=3,
+        executionRequest={
+            "planID": "plan-1",
+            "operationID": "action-1",
+            "generation": 10,
+            "expectedReplicas": 2,
+            "targetReplicas": 3,
+        },
+    )
+    state["status"].update(replicas=2, observedGeneration=4)  # type: ignore[index]
+    patches: list[dict[str, object]] = []
+
+    def apply(*args: str) -> dict[str, object]:
+        if args[0] == "get":
+            return deepcopy(state)
+        patch = json.loads(args[args.index("-p") + 1])
+        patches.append(patch)
+        state["spec"].update(patch["spec"])  # type: ignore[index]
+        state["metadata"]["generation"] += 1  # type: ignore[index]
+        state["metadata"]["resourceVersion"] = str(  # type: ignore[index]
+            int(state["metadata"]["resourceVersion"]) + 1  # type: ignore[index]
+        )
+        return deepcopy(state)
+
+    monkeypatch.setattr(target, "_json", apply)
+    stale_expected = {"uid": "workload-uid", "generation": 4, "replicas": 2}
+    with pytest.raises(TargetPreconditionFailed, match="changed before fencing"):
+        target.fence_scale(
+            "cpu-api",
+            12,
+            expected=stale_expected,
+            plan_id="plan-1",
+            operation_id="action-1",
+            target_replicas=3,
+        )
+    fenced = target.fence_scale(
+        "cpu-api",
+        12,
+        expected=target.observe_scale("cpu-api"),
+        plan_id="plan-1",
+        operation_id="action-1",
+        target_replicas=3,
+    )
+    replayed = target.fence_scale(
+        "cpu-api",
+        12,
+        expected=stale_expected,
+        plan_id="plan-1",
+        operation_id="action-1",
+        target_replicas=3,
+    )
+
+    assert fenced["replicas"] == 3
+    assert fenced["operation_applied_before_fence"] is True
+    assert replayed["fence_replayed"] is True
+    assert replayed["fence_precondition"] == fenced["fence_precondition"]
+    assert fenced["fence_precondition"] == {
+        "uid": "workload-uid",
+        "generation": 5,
+        "replicas": 3,
+    }
+    assert fenced["execution_request"]["generation"] == 10
+    assert fenced["execution_fence"]["generation"] == 12
+    assert patches == [
+        {
+            "metadata": {"resourceVersion": "7"},
+            "spec": {
+                "executionFence": {
+                    "planID": "plan-1",
+                    "operationID": "action-1",
+                    "generation": 12,
+                    "expectedGeneration": 4,
+                    "expectedReplicas": 2,
+                    "fencedGeneration": 6,
+                }
+            },
+        }
+    ]
+
+
+def test_workload_mutation_fails_closed_when_fencing_crd_is_old(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = FleetRightWorkloadTarget(namespace="fleetright-v2")
+    state = _workload_object()
+    patches: list[dict[str, object]] = []
+
+    def apply(*args: str) -> dict[str, object]:
+        if args[0] == "get" and args[1] == "fleetrightworkload":
+            return deepcopy(state)
+        if args[0] == "get" and args[1] == "crd":
+            return {
+                "spec": {
+                    "versions": [
+                        {
+                            "name": "v1alpha1",
+                            "schema": {
+                                "openAPIV3Schema": {"properties": {"spec": {"properties": {}}}}
+                            },
+                        }
+                    ]
+                }
+            }
+        patches.append(json.loads(args[args.index("-p") + 1]))
+        return deepcopy(state)
+
+    monkeypatch.setattr(target, "_json", apply)
+    before = target.observe_scale("cpu-api")
+    with pytest.raises(TargetPreconditionFailed, match="fencing CRD is not installed"):
+        target.authorize_scale(
+            "cpu-api",
+            12,
+            expected=before,
+            plan_id="plan-1",
+            operation_id="action-1",
+            target_replicas=3,
+        )
+    assert patches == []
 
 
 def test_workload_scale_down_is_rejected_before_any_mutation(
@@ -392,6 +722,7 @@ def test_workload_takeover_blocks_new_operation_until_prior_request_is_applied(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     target = FleetRightWorkloadTarget(namespace="fleetright-v2")
+    _skip_fencing_crd_preflight(monkeypatch, target)
     value = _workload_object()
     value["spec"].update(
         replicas=3,
@@ -433,6 +764,7 @@ def test_workload_authorization_fails_closed_on_unreconciled_status(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     target = FleetRightWorkloadTarget(namespace="fleetright-v2")
+    _skip_fencing_crd_preflight(monkeypatch, target)
     value = _workload_object()
     value["status"]["conditions"] = [{"type": "Reconciled", "status": "False"}]
     current = target._observe(value, "cpu-api")
@@ -495,6 +827,7 @@ def test_concurrent_workload_takeover_uses_resource_version_cas(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     target = FleetRightWorkloadTarget(namespace="fleetright-v2")
+    _skip_fencing_crd_preflight(monkeypatch, target)
     state = _workload_object()
     barrier = threading.Barrier(2)
     lock = threading.Lock()

@@ -19,6 +19,7 @@ from fleetright.workload_controller import (
     _ensure_pdb,
     _pod_name,
     _pod_object,
+    _validate_spec,
     reconcile_workload,
 )
 
@@ -350,6 +351,73 @@ def test_execution_request_on_unreconciled_create_cannot_start_pod_creation() ->
     assert api.status["execution"]["operationID"] == "forged-operation"
     assert api.status["execution"]["phase"] == "BLOCKED"
     assert api.status["conditions"][2]["reason"] == "WorkloadOperationUnreconciled"
+
+
+def test_execution_request_reconciles_after_fence_without_intermediate_status_write() -> None:
+    api = FakeAPI()
+    workload = _workload(executionProtocol="monotonic-scale-up-v1")
+    reconcile_workload(api, workload, _nodes())
+    for pod in api.pods.values():
+        pod["status"] = {
+            "phase": "Running",
+            "conditions": [{"type": "Ready", "status": "True"}],
+        }
+    reconcile_workload(api, workload, _nodes())
+    assert api.status["conditions"][2]["status"] == "True"
+
+    authorized = deepcopy(workload)
+    authorized["metadata"].update(generation=3, resourceVersion="3")
+    authorized["spec"].update(
+        replicas=2,
+        executionFence={
+            "planID": "plan-1",
+            "operationID": "action-1",
+            "generation": 101,
+            "expectedGeneration": 1,
+            "expectedReplicas": 1,
+            "fencedGeneration": 3,
+        },
+        executionRequest={
+            "planID": "plan-1",
+            "operationID": "action-1",
+            "generation": 101,
+            "expectedReplicas": 1,
+            "targetReplicas": 2,
+        },
+    )
+    authorized["status"] = deepcopy(api.status)
+
+    reconcile_workload(api, authorized, _nodes())
+
+    assert len(api.pods) == 2
+    assert api.status["execution"]["phase"] == "APPLIED"
+    assert api.status["conditions"][2]["reason"] == "Reconciled"
+
+
+def test_workload_controller_rejects_stale_fence_generation() -> None:
+    workload = _workload(
+        executionProtocol="monotonic-scale-up-v1",
+        replicas=2,
+        executionFence={
+            "planID": "plan-1",
+            "operationID": "action-1",
+            "generation": 101,
+            "expectedGeneration": 1,
+            "expectedReplicas": 1,
+            "fencedGeneration": 2,
+        },
+        executionRequest={
+            "planID": "plan-1",
+            "operationID": "action-1",
+            "generation": 101,
+            "expectedReplicas": 1,
+            "targetReplicas": 2,
+        },
+    )
+    workload["metadata"]["generation"] = 3
+
+    with pytest.raises(SafetyError, match="execution fence is invalid"):
+        _validate_spec(workload, _nodes())
 
 
 def test_stale_pdb_get_cannot_overwrite_a_newer_write() -> None:

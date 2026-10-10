@@ -81,6 +81,22 @@ spec:
                   message: changing operation identity requires a higher execution generation
                 - rule: "!has(oldSelf.executionRequest) || !has(self.executionRequest) || self.executionRequest.generation > oldSelf.executionRequest.generation || self.executionRequest == oldSelf.executionRequest"
                   message: changing an execution request requires a higher generation
+                - rule: "!has(oldSelf.executionFence) || has(self.executionFence)"
+                  message: executionFence cannot be removed
+                - rule: "!has(oldSelf.executionFence) || !has(self.executionFence) || self.executionFence.generation >= oldSelf.executionFence.generation"
+                  message: execution fence generation cannot decrease
+                - rule: "!has(oldSelf.executionFence) || !has(self.executionFence) || self.executionFence.generation > oldSelf.executionFence.generation || (self.executionFence.generation == oldSelf.executionFence.generation && self.executionFence.planID == oldSelf.executionFence.planID && self.executionFence.operationID == oldSelf.executionFence.operationID && self.executionFence.expectedGeneration == oldSelf.executionFence.expectedGeneration && self.executionFence.expectedReplicas == oldSelf.executionFence.expectedReplicas && self.executionFence.fencedGeneration == oldSelf.executionFence.fencedGeneration)"
+                  message: an operation cannot change its execution fence precondition
+                - rule: "!has(oldSelf.executionFence) || !has(self.executionFence) || self.executionFence.generation == oldSelf.executionFence.generation || self.executionFence.fencedGeneration > oldSelf.executionFence.fencedGeneration"
+                  message: a new authority fence must record a newer object generation
+                - rule: "!has(self.executionRequest) || (has(oldSelf.executionRequest) && self.executionRequest == oldSelf.executionRequest) || (has(self.executionFence) && self.executionRequest.generation == self.executionFence.generation && self.executionRequest.planID == self.executionFence.planID && self.executionRequest.operationID == self.executionFence.operationID)"
+                  message: changing an execution request requires its matching execution fence
+                - rule: "!has(oldSelf.executionFence) || !has(self.executionRequest) || (has(oldSelf.executionRequest) && self.executionRequest == oldSelf.executionRequest) || self.executionRequest.generation > oldSelf.executionFence.generation"
+                  message: changed execution requests must advance past the previous authority fence
+                - rule: "!has(self.executionFence) || !has(self.executionRequest) || self.executionFence.generation >= self.executionRequest.generation"
+                  message: execution fence cannot trail its request
+                - rule: "!has(self.executionFence) || !has(self.executionRequest) || self.executionFence.generation != self.executionRequest.generation || (self.executionFence.planID == self.executionRequest.planID && self.executionFence.operationID == self.executionRequest.operationID)"
+                  message: equal execution generations require matching identities
                 - rule: "!has(self.executionRequest) || self.executionRequest.targetReplicas == self.replicas"
                   message: execution request target must equal desired replicas
                 - rule: "self.replicas <= oldSelf.replicas || (self.executionProtocol == 'monotonic-scale-up-v1' && has(self.executionRequest) && self.executionRequest.expectedReplicas == oldSelf.replicas && self.executionRequest.targetReplicas == self.replicas && (!has(oldSelf.executionRequest) || self.executionRequest.generation > oldSelf.executionRequest.generation))"
@@ -130,6 +146,35 @@ spec:
                       format: int32
                       minimum: 0
                       maximum: 1000
+                executionFence:
+                  type: object
+                  required: [planID, operationID, generation, expectedGeneration, expectedReplicas, fencedGeneration]
+                  properties:
+                    planID:
+                      type: string
+                      minLength: 1
+                      maxLength: 128
+                    operationID:
+                      type: string
+                      minLength: 1
+                      maxLength: 128
+                    generation:
+                      type: integer
+                      format: int64
+                      minimum: 1
+                    expectedGeneration:
+                      type: integer
+                      format: int64
+                      minimum: 1
+                    expectedReplicas:
+                      type: integer
+                      format: int32
+                      minimum: 0
+                      maximum: 1000
+                    fencedGeneration:
+                      type: integer
+                      format: int64
+                      minimum: 1
                 availabilityFloor:
                   type: integer
                   format: int32

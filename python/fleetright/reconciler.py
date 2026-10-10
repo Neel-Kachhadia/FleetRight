@@ -137,7 +137,12 @@ class ExecutionController:
                     )
             recovered_fence = False
             try:
-                target = self._authorize_target(action, plan_id, pending_token, precondition)
+                if getattr(self.target, "supports_workload_execution", False):
+                    target = self._fence_workload_target(
+                        action, plan_id, pending_token, precondition
+                    )
+                else:
+                    target = self._authorize_target(action, plan_id, pending_token, precondition)
                 receipt = target
             except TargetPreconditionFailed:
                 try:
@@ -151,7 +156,15 @@ class ExecutionController:
                 if live_token > pending_token:
                     return None
                 if recovered_fence:
-                    receipt = {**live, "fence_precondition": precondition}
+                    if getattr(self.target, "supports_workload_execution", False):
+                        try:
+                            receipt = self._fence_workload_target(
+                                action, plan_id, pending_token, precondition
+                            )
+                        except TargetError:
+                            return None
+                    else:
+                        receipt = {**live, "fence_precondition": precondition}
                 else:
                     precondition = {key: live[key] for key in ("uid", "generation", "replicas")}
                     with self.repository.transaction() as conn:
@@ -165,9 +178,14 @@ class ExecutionController:
                             {"state": "PENDING", "precondition": precondition},
                         )
                     try:
-                        receipt = self._authorize_target(
-                            action, plan_id, pending_token, precondition
-                        )
+                        if getattr(self.target, "supports_workload_execution", False):
+                            receipt = self._fence_workload_target(
+                                action, plan_id, pending_token, precondition
+                            )
+                        else:
+                            receipt = self._authorize_target(
+                                action, plan_id, pending_token, precondition
+                            )
                     except TargetError:
                         return None
             except TargetNotFound:
@@ -183,7 +201,12 @@ class ExecutionController:
             except TargetError:
                 return None
             fence_precondition = receipt.get("fence_precondition", {})
-            if (
+            if getattr(self.target, "supports_workload_execution", False):
+                if not self._takeover_fence_matches(
+                    action, plan_id, pending_token, receipt, precondition
+                ):
+                    return None
+            elif (
                 receipt.get("uid") != precondition.get("uid")
                 or (not recovered_fence and receipt.get("replicas") != precondition.get("replicas"))
                 or receipt.get("fencing_token") != pending_token
@@ -197,8 +220,13 @@ class ExecutionController:
                 "state": "COMPLETE",
                 "token": pending_token,
                 "precondition": precondition,
-                "fence_precondition": precondition,
+                "fence_precondition": fence_precondition,
                 "generation": receipt.get("generation"),
+                "prior_execution_fence": receipt.get("prior_execution_fence"),
+                "fence_replayed": receipt.get("fence_replayed", False),
+                "operation_applied_before_fence": receipt.get(
+                    "operation_applied_before_fence", False
+                ),
                 "observation": receipt,
             }
             with self.repository.transaction() as conn:
@@ -220,6 +248,26 @@ class ExecutionController:
                 self.lease_ttl_ms,
             )
         return token
+
+    def _fence_workload_target(
+        self,
+        action: dict[str, Any],
+        plan_id: str,
+        fencing_token: int,
+        expected: dict[str, Any],
+    ) -> dict[str, Any]:
+        payload = action.get("payload", {})
+        desired = payload.get("proposed_replicas") if isinstance(payload, dict) else None
+        if not isinstance(desired, int):
+            raise TargetPreconditionFailed("workload execution target is missing replica intent")
+        return self.target.fence_scale(
+            action["workload_id"],
+            fencing_token,
+            expected=expected,
+            plan_id=plan_id,
+            operation_id=action["intent_id"],
+            target_replicas=desired,
+        )
 
     def _authorize_target(
         self,
@@ -618,8 +666,40 @@ class ExecutionController:
                 and observed.get("generation") != dispatch_response_observation["generation"]
             )
         ):
-            self._fail_safe(plan_id, token, "target-generation-changed-during-action")
-            return
+            takeover_receipt = self._takeover_fence_receipt(
+                plan_id,
+                action["intent_id"],
+                token,
+                after_target_token=(
+                    last_dispatch.get("target_fencing_token")
+                    if isinstance(last_dispatch, dict)
+                    else None
+                ),
+            )
+            fence = observed.get("execution_fence")
+            fence_observation = takeover_receipt.get("observation", {}) if takeover_receipt else {}
+            fence_precondition = (
+                takeover_receipt.get("fence_precondition", {}) if takeover_receipt else {}
+            )
+            recovered_after_takeover = (
+                getattr(self.target, "supports_workload_execution", False)
+                and takeover_receipt is not None
+                and takeover_receipt.get("operation_applied_before_fence") is True
+                and self._takeover_fence_matches(action, plan_id, token, takeover_receipt)
+                and isinstance(fence, dict)
+                and fence.get("generation") == takeover_receipt.get("token")
+                and observed.get("fencing_token") == takeover_receipt.get("token")
+                and observed.get("generation") == takeover_receipt.get("generation")
+                and isinstance(dispatch_response_observation, dict)
+                and fence_precondition.get("generation", -1)
+                >= dispatch_response_observation.get("generation", 0)
+                and isinstance(fence_observation, dict)
+                and fence_observation.get("execution_fence") == fence
+                and fence_observation.get("generation") == observed.get("generation")
+            )
+            if not recovered_after_takeover:
+                self._fail_safe(plan_id, token, "target-generation-changed-during-action")
+                return
         desired = payload.get("proposed_replicas")
         original = pre.get("replicas")
         if not isinstance(desired, int) or not isinstance(original, int):
@@ -646,38 +726,77 @@ class ExecutionController:
                 if isinstance(dispatch_observation, dict)
                 else None
             )
-            takeover_receipt = self._takeover_fence_receipt(plan_id, action["intent_id"], token)
+            takeover_receipt = self._takeover_fence_receipt(
+                plan_id,
+                action["intent_id"],
+                token,
+                after_target_token=(
+                    last_dispatch.get("target_fencing_token")
+                    if isinstance(last_dispatch, dict)
+                    else None
+                ),
+            )
             if getattr(self.target, "supports_workload_execution", False):
                 request = observed.get("execution_request")
-                if current == dispatch_target:
-                    expected_token = (
-                        takeover_receipt.get("token")
-                        if takeover_receipt is not None
-                        else last_dispatch.get("target_fencing_token")
-                        if isinstance(last_dispatch, dict)
-                        else None
+                if not isinstance(last_dispatch, dict):
+                    self._fail_safe(
+                        plan_id, token, "target-generation-changed-during-unknown-action"
                     )
-                    expected_target_generation = (
-                        takeover_receipt.get("generation")
-                        if takeover_receipt is not None
-                        else expected_generation + 1
-                        if isinstance(expected_generation, int)
-                        else None
-                    )
-                    generation_matches = (
-                        isinstance(request, dict)
-                        and request.get("planID") == plan_id
-                        and request.get("operationID") == action["intent_id"]
-                        and request.get("targetReplicas") == dispatch_target
-                        and request.get("generation") == expected_token
-                        and observed.get("generation") == expected_target_generation
-                    )
-                    if not generation_matches:
-                        self._fail_safe(
-                            plan_id, token, "target-generation-changed-during-unknown-action"
+                    return
+                fence = observed.get("execution_fence")
+                if takeover_receipt is None:
+                    dispatch_token = last_dispatch.get("target_fencing_token")
+                    if current == dispatch_target:
+                        base_generation = pre.get("generation")
+                        generation_matches = (
+                            isinstance(expected_generation, int)
+                            and observed.get("generation") == expected_generation + 1
+                            and observed.get("fencing_token") == dispatch_token
+                            and isinstance(request, dict)
+                            and request.get("planID") == plan_id
+                            and request.get("operationID") == action["intent_id"]
+                            and request.get("expectedReplicas") == dispatch_expected
+                            and request.get("targetReplicas") == dispatch_target
+                            and request.get("generation") == dispatch_token
+                            and isinstance(fence, dict)
+                            and fence.get("planID") == plan_id
+                            and fence.get("operationID") == action["intent_id"]
+                            and fence.get("generation") == dispatch_token
+                            and fence.get("expectedGeneration") == base_generation
+                            and fence.get("expectedReplicas") == dispatch_expected
+                            and fence.get("fencedGeneration") == observed.get("generation")
                         )
-                        return
-                elif current != dispatch_expected or takeover_receipt is not None:
+                    else:
+                        generation_matches = (
+                            current == dispatch_expected
+                            and isinstance(expected_generation, int)
+                            and observed.get("generation") == expected_generation
+                        )
+                else:
+                    fence_observation = takeover_receipt.get("observation", {})
+                    fence_matches = (
+                        self._takeover_fence_matches(
+                            action, plan_id, token, takeover_receipt
+                        )
+                        and isinstance(fence, dict)
+                        and isinstance(fence_observation, dict)
+                        and fence_observation.get("execution_fence") == fence
+                        and fence.get("generation") == takeover_receipt.get("token")
+                        and observed.get("fencing_token") == takeover_receipt.get("token")
+                        and observed.get("generation") == takeover_receipt.get("generation")
+                        and fence_observation.get("generation") == observed.get("generation")
+                    )
+                    generation_matches = fence_matches and (
+                        (
+                            current == dispatch_target
+                            and takeover_receipt.get("operation_applied_before_fence") is True
+                        )
+                        or (
+                            current == dispatch_expected
+                            and takeover_receipt.get("operation_applied_before_fence") is False
+                        )
+                    )
+                if not generation_matches:
                     self._fail_safe(
                         plan_id, token, "target-generation-changed-during-unknown-action"
                     )
@@ -728,7 +847,16 @@ class ExecutionController:
             self._fail_safe(plan_id, token, "target-reverted-after-accepted-mutation")
             return
         if state == "OUTCOME_UNKNOWN":
-            takeover_receipt = self._takeover_fence_receipt(plan_id, action["intent_id"], token)
+            takeover_receipt = self._takeover_fence_receipt(
+                plan_id,
+                action["intent_id"],
+                token,
+                after_target_token=(
+                    last_dispatch.get("target_fencing_token")
+                    if isinstance(last_dispatch, dict)
+                    else None
+                ),
+            )
             if takeover_receipt is None:
                 self._yield_for_target_fence(plan_id, token, action["intent_id"])
                 return
@@ -1181,13 +1309,130 @@ class ExecutionController:
             return None
 
     def _takeover_fence_receipt(
-        self, plan_id: str, intent_id: str, token: int
+        self,
+        plan_id: str,
+        intent_id: str,
+        token: int,
+        *,
+        after_target_token: int | None = None,
     ) -> dict[str, Any] | None:
         with self.repository.transaction() as conn:
             receipt = Repository.execution_fence_receipt(conn, plan_id, intent_id, token)
         if receipt is not None and receipt.get("state", "COMPLETE") != "COMPLETE":
             return None
+        if (
+            receipt is not None
+            and after_target_token is not None
+            and receipt.get("token", -1) < after_target_token
+        ):
+            return None
         return receipt if isinstance(receipt, dict) else None
+
+    @staticmethod
+    def _latest_dispatch(action: dict[str, Any]) -> dict[str, Any] | None:
+        journal = action.get("execution_result")
+        progress = journal.get("progress") if isinstance(journal, dict) else None
+        if not isinstance(progress, list):
+            return None
+        return next(
+            (
+                item["result"]
+                for item in reversed(progress)
+                if isinstance(item, dict)
+                and isinstance(item.get("result"), dict)
+                and "dispatch_target_replicas" in item["result"]
+            ),
+            None,
+        )
+
+    @classmethod
+    def _takeover_fence_matches(
+        cls,
+        action: dict[str, Any],
+        plan_id: str,
+        token: int,
+        receipt: dict[str, Any],
+        expected_precondition: dict[str, Any] | None = None,
+    ) -> bool:
+        journal = action.get("execution_result")
+        base = journal.get("pre_observation") if isinstance(journal, dict) else None
+        target = receipt.get("observation", receipt)
+        fence_precondition = receipt.get("fence_precondition")
+        saved_precondition = receipt.get("precondition", expected_precondition)
+        fence = target.get("execution_fence") if isinstance(target, dict) else None
+        request = target.get("execution_request") if isinstance(target, dict) else None
+        prior_fence = receipt.get("prior_execution_fence")
+        dispatch = cls._latest_dispatch(action)
+        payload = action.get("payload")
+        if not all(
+            isinstance(item, dict)
+            for item in (base, fence_precondition, saved_precondition, fence, payload)
+        ):
+            return False
+        base_generation = base.get("generation")
+        base_replicas = base.get("replicas")
+        desired = payload.get("proposed_replicas")
+        operation_applied = receipt.get("operation_applied_before_fence") is True
+        if (
+            type(base_generation) is not int
+            or type(base_replicas) is not int
+            or type(desired) is not int
+            or fence_precondition.get("uid") != base.get("uid")
+            or fence_precondition.get("generation") != saved_precondition.get("generation")
+            or fence_precondition.get("replicas") != saved_precondition.get("replicas")
+            or fence_precondition.get("uid") != saved_precondition.get("uid")
+            or receipt.get("generation") != fence_precondition.get("generation", -2) + 1
+            or target.get("uid") != base.get("uid")
+            or target.get("generation") != receipt.get("generation")
+            or target.get("fencing_token") != token
+            or receipt.get("fencing_token", token) != token
+            or fence.get("planID") != plan_id
+            or fence.get("operationID") != action.get("intent_id")
+            or fence.get("generation") != token
+            or fence.get("expectedGeneration") != base_generation
+            or fence.get("expectedReplicas") != base_replicas
+            or fence.get("fencedGeneration") != receipt.get("generation")
+        ):
+            return False
+        if operation_applied:
+            if not isinstance(dispatch, dict) or not isinstance(request, dict):
+                return False
+            if (
+                request.get("planID") != plan_id
+                or request.get("operationID") != action.get("intent_id")
+                or request.get("expectedReplicas") != dispatch.get("dispatch_expected_replicas")
+                or request.get("targetReplicas") != dispatch.get("dispatch_target_replicas")
+                or request.get("generation") != dispatch.get("target_fencing_token")
+                or request.get("targetReplicas") != desired
+                or fence_precondition.get("replicas") != desired
+                or target.get("replicas") != desired
+            ):
+                return False
+        elif (
+            fence_precondition.get("replicas") != base_replicas
+            or target.get("replicas") != base_replicas
+            or (
+                isinstance(request, dict)
+                and request.get("planID") == plan_id
+                and request.get("operationID") == action.get("intent_id")
+            )
+        ):
+            return False
+
+        if receipt.get("fence_replayed") is True:
+            return isinstance(saved_precondition, dict)
+        prior_same_operation = (
+            isinstance(prior_fence, dict)
+            and prior_fence.get("planID") == plan_id
+            and prior_fence.get("operationID") == action.get("intent_id")
+            and prior_fence.get("expectedGeneration") == base_generation
+            and prior_fence.get("expectedReplicas") == base_replicas
+            and prior_fence.get("generation", token) < token
+            and prior_fence.get("fencedGeneration") == fence_precondition.get("generation")
+        )
+        if prior_same_operation:
+            return True
+        return fence_precondition.get("generation") == base_generation + int(operation_applied)
 
     def _yield_for_target_fence(self, plan_id: str, token: int, intent_id: str) -> None:
         try:
@@ -1324,12 +1569,11 @@ class ExecutionController:
             )
             if execution["status"] in {"COMMITTED", "COMPENSATED", "FAILED_SAFE"}:
                 return
-            unresolved = conn.execute(
-                "SELECT intent_id, action_type, workload_id, execution_state "
-                "FROM action_intents WHERE plan_id = %s "
-                "AND execution_state IN ('RUNNING', 'OUTCOME_UNKNOWN') LIMIT 1",
-                (plan_id,),
-            ).fetchall()
+            unresolved = [
+                action
+                for action in Repository.incomplete_actions(conn, plan_id)
+                if action["execution_state"] in {"RUNNING", "OUTCOME_UNKNOWN"}
+            ]
         for action in unresolved:
             if action["action_type"] != "SET_REPLICA_COUNT" or not action["workload_id"]:
                 LOG.error(
@@ -1345,8 +1589,31 @@ class ExecutionController:
                     extra={"plan_id": plan_id, "action_id": action["intent_id"], "reason": reason},
                 )
                 return
-            target_fence = self._takeover_fence_receipt(plan_id, action["intent_id"], token)
-            if target_fence is None:
+            dispatch = self._latest_dispatch(action)
+            target_fence = self._takeover_fence_receipt(
+                plan_id,
+                action["intent_id"],
+                token,
+                after_target_token=(
+                    dispatch.get("target_fencing_token") if isinstance(dispatch, dict) else None
+                ),
+            )
+            fence_observation = target_fence.get("observation", {}) if target_fence else {}
+            fence_matches_live = (
+                target_fence is not None
+                and observed.get("uid") == fence_observation.get("uid")
+                and observed.get("generation") == target_fence.get("generation")
+                and observed.get("fencing_token") == target_fence.get("token")
+                and (
+                    not getattr(self.target, "supports_workload_execution", False)
+                    or (
+                        self._takeover_fence_matches(action, plan_id, token, target_fence)
+                        and observed.get("execution_fence")
+                        == fence_observation.get("execution_fence")
+                    )
+                )
+            )
+            if not fence_matches_live:
                 LOG.error(
                     "execution yielded until its unresolved target can be fenced",
                     extra={"plan_id": plan_id, "action_id": action["intent_id"], "reason": reason},

@@ -221,9 +221,12 @@ class FakeFleetRightWorkloadTarget:
         self.observed_generation = 1
         self.fencing_token = 0
         self.execution_request: dict[str, object] | None = None
+        self.execution_fence: dict[str, object] | None = None
         self.execution: dict[str, object] | None = None
         self.reconciled = True
         self.lose_next_response = lose_next_response
+        self.lose_before_authorize = False
+        self.crash_after_fence = False
         self.authorizations = 0
 
     def observe_scale(self, _workload_id: str) -> dict[str, object]:
@@ -241,8 +244,98 @@ class FakeFleetRightWorkloadTarget:
             "observed_generation": self.observed_generation,
             "fencing_token": self.fencing_token,
             "execution_request": self.execution_request,
+            "execution_fence": self.execution_fence,
             "execution": self.execution,
             "reconciled": self.reconciled,
+        }
+
+    def fence_scale(
+        self,
+        _workload_id: str,
+        token: int,
+        *,
+        expected: dict[str, object],
+        plan_id: str,
+        operation_id: str,
+        target_replicas: int,
+    ) -> dict[str, object]:
+        current = self.observe_scale(_workload_id)
+        if self.fencing_token > token:
+            raise TargetPreconditionFailed("newer workload execution generation exists")
+        request = self.execution_request
+        same_request = (
+            isinstance(request, dict)
+            and request.get("planID") == plan_id
+            and request.get("operationID") == operation_id
+            and request.get("targetReplicas") == target_replicas
+            and self.replicas == target_replicas
+        )
+        same_fence = (
+            isinstance(self.execution_fence, dict)
+            and self.execution_fence.get("generation") == token
+            and self.execution_fence.get("planID") == plan_id
+            and self.execution_fence.get("operationID") == operation_id
+        )
+        expected_unchanged = all(
+            current.get(key) == expected.get(key) for key in ("uid", "generation", "replicas")
+        )
+        if same_fence and current["generation"] != self.execution_fence["fencedGeneration"]:
+            raise TargetPreconditionFailed("workload changed after the authority fence")
+        if same_request and not same_fence and not expected_unchanged:
+            raise TargetPreconditionFailed("workload changed before fencing")
+        if (
+            not same_fence
+            and not same_request
+            and not expected_unchanged
+        ):
+            raise TargetPreconditionFailed("workload precondition changed")
+        prior_fence = self.execution_fence
+        before = (
+            {
+                "uid": current["uid"],
+                "generation": self.execution_fence["fencedGeneration"] - 1,
+                "replicas": (
+                    current["replicas"]
+                    if same_request
+                    else self.execution_fence["expectedReplicas"]
+                ),
+            }
+            if same_fence
+            else {key: current[key] for key in ("uid", "generation", "replicas")}
+        )
+        if not same_fence:
+            prior = self.execution_fence
+            self.execution_fence = {
+                "planID": plan_id,
+                "operationID": operation_id,
+                "generation": token,
+                "expectedGeneration": (
+                    prior["expectedGeneration"]
+                    if isinstance(prior, dict)
+                    and (prior.get("planID"), prior.get("operationID")) == (plan_id, operation_id)
+                    else expected["generation"]
+                ),
+                "expectedReplicas": (
+                    prior["expectedReplicas"]
+                    if isinstance(prior, dict)
+                    and (prior.get("planID"), prior.get("operationID")) == (plan_id, operation_id)
+                    else expected["replicas"]
+                ),
+                "fencedGeneration": self.generation + 1,
+            }
+            self.fencing_token = token
+            self.generation += 1
+            self.resource_version = str(int(self.resource_version) + 1)
+        if self.crash_after_fence:
+            self.crash_after_fence = False
+            raise SystemExit("injected controller crash after target fence")
+        return {
+            **self.observe_scale(_workload_id),
+            "fence_precondition": before,
+            "fence_applied": True,
+            "fence_replayed": same_fence,
+            "prior_execution_fence": prior_fence if not same_fence else None,
+            "operation_applied_before_fence": bool(same_request),
         }
 
     def authorize_scale(
@@ -256,18 +349,34 @@ class FakeFleetRightWorkloadTarget:
         target_replicas: int,
     ) -> dict[str, object]:
         current = self.observe_scale(_workload_id)
-        if any(current.get(key) != expected.get(key) for key in ("uid", "generation", "replicas")):
-            raise TargetPreconditionFailed("workload precondition changed")
         same = (
             isinstance(self.execution_request, dict)
             and self.execution_request.get("planID") == plan_id
             and self.execution_request.get("operationID") == operation_id
             and self.execution_request.get("targetReplicas") == target_replicas
         )
+        recovered = (
+            same
+            and token == self.fencing_token
+            and current["uid"] == expected.get("uid")
+            and current["generation"] == expected.get("generation", -2) + 1
+            and current["replicas"] == target_replicas
+        )
+        if current["uid"] != expected.get("uid"):
+            raise TargetPreconditionFailed("workload identity changed")
+        if not recovered and any(
+            current.get(key) != expected.get(key) for key in ("generation", "replicas")
+        ):
+            raise TargetPreconditionFailed("workload precondition changed")
+        if same and token == self.fencing_token:
+            return {**current, "fence_precondition": expected, "already_authorized": True}
         if token <= self.fencing_token:
             raise TargetPreconditionFailed("newer workload execution generation exists")
         if target_replicas < self.replicas:
             raise ActionBlocked("WORKLOAD_SCALE_DOWN_DISABLED")
+        if self.lose_before_authorize:
+            self.lose_before_authorize = False
+            raise OutcomeUnknown("injected lost workload authorization before apply")
         if (
             self.execution_request is not None
             and not same
@@ -279,6 +388,27 @@ class FakeFleetRightWorkloadTarget:
         ):
             raise ActionBlocked("PRIOR_WORKLOAD_OPERATION_UNRESOLVED")
         self.fencing_token = token
+        prior_fence = self.execution_fence
+        self.execution_fence = {
+            "planID": plan_id,
+            "operationID": operation_id,
+            "generation": token,
+            "expectedGeneration": (
+                prior_fence["expectedGeneration"]
+                if isinstance(prior_fence, dict)
+                and (prior_fence.get("planID"), prior_fence.get("operationID"))
+                == (plan_id, operation_id)
+                else self.generation
+            ),
+            "expectedReplicas": (
+                prior_fence["expectedReplicas"]
+                if isinstance(prior_fence, dict)
+                and (prior_fence.get("planID"), prior_fence.get("operationID"))
+                == (plan_id, operation_id)
+                else self.replicas
+            ),
+            "fencedGeneration": self.generation + 1,
+        }
         self.execution_request = {
             "planID": plan_id,
             "operationID": operation_id,
@@ -686,6 +816,441 @@ def test_takeover_fences_unknown_targets_before_final_claim(clean_database: Data
         with pytest.raises(LeaseConflict):
             Repository.assert_execution_controller(conn, "takeover", "controller-a", old_token)
         assert Repository.runnable_actions(conn, "takeover", "controller-b", pending_token) == []
+
+
+def test_workload_takeover_recovers_preapply_crash(clean_database: Database) -> None:
+    repo = clean_database.repository
+    with repo.transaction() as conn:
+        _insert_plan(conn, "workload-preapply")
+        conn.execute(
+            "INSERT INTO action_intents (plan_id, intent_id, action_sequence, action_type, "
+            "workload_id, payload, status) VALUES ('workload-preapply', 'scale', 0, "
+            "'SET_REPLICA_COUNT', 'cpu-api', %s, 'APPROVED')",
+            (Jsonb({"current_replicas": 2, "proposed_replicas": 3}),),
+        )
+        conn.execute(
+            "INSERT INTO control_state (singleton, snapshot_id, snapshot_generation, binding) "
+            "VALUES (TRUE, 'snapshot', 1, %s)",
+            (Jsonb({}),),
+        )
+    original = _claim(repo, "workload-preapply")
+    old_token = original["execution"]["controller_fencing_token"]
+    with repo.transaction() as conn:
+        Repository.transition_action(
+            conn,
+            "workload-preapply",
+            "scale",
+            "NOT_STARTED",
+            "RUNNING",
+            "controller-a",
+            old_token,
+            pre_observation={"replicas": 2, "uid": "deployment-uid", "generation": 1},
+        )
+        conn.execute(
+            "UPDATE plan_executions SET controller_lease_expires_at = clock_timestamp() "
+            "WHERE plan_id = 'workload-preapply'"
+        )
+        execution = conn.execute(
+            "SELECT plan_id, controller_id, controller_fencing_token, "
+            "controller_lease_expires_at <= clock_timestamp() AS controller_lease_expired "
+            "FROM plan_executions WHERE plan_id = 'workload-preapply'"
+        ).fetchone()
+
+    target = FakeFleetRightWorkloadTarget(2)
+    controller = ExecutionController(
+        repo, target, FakeHealth(), "controller-b", readiness_timeout_seconds=2
+    )
+    token = controller._claim(execution)
+
+    assert token is not None
+    assert target.replicas == 2
+    assert target.authorizations == 0
+    with repo.transaction() as conn:
+        receipt = Repository.execution_fence_receipt(conn, "workload-preapply", "scale", token)
+        owner = conn.execute(
+            "SELECT controller_id FROM plan_executions WHERE plan_id = 'workload-preapply'"
+        ).fetchone()["controller_id"]
+    assert receipt is not None and receipt["state"] == "COMPLETE"
+    assert owner == "controller-b"
+
+    with repo.transaction() as conn:
+        action = Repository.incomplete_actions(conn, "workload-preapply")[0]
+    controller._reconcile_action("workload-preapply", token, action, False)
+    with repo.transaction() as conn:
+        execution = conn.execute(
+            "SELECT status, outcome FROM plan_executions WHERE plan_id = 'workload-preapply'"
+        ).fetchone()
+    assert target.replicas == 3, execution
+    assert target.authorizations == 1
+
+
+def test_workload_second_controller_recovers_fence_written_before_first_claim(
+    clean_database: Database,
+) -> None:
+    repo = clean_database.repository
+    controller_a, _legacy_target, _health = _prepare_controller(
+        repo, "workload-second-fence", 2, 3
+    )
+    target = FakeFleetRightWorkloadTarget(2)
+    target.lose_before_authorize = True
+    controller_a.target = target
+    controller_a.run_once()
+    with repo.transaction() as conn:
+        conn.execute(
+            "UPDATE plan_executions SET controller_lease_expires_at = clock_timestamp() "
+            "WHERE plan_id = 'workload-second-fence'"
+        )
+
+    controller_b = ExecutionController(repo, target, FakeHealth(), "controller-b")
+    target.crash_after_fence = True
+    with pytest.raises(SystemExit, match="crash after target fence"):
+        controller_b.run_once()
+    with repo.transaction() as conn:
+        row = conn.execute(
+            "SELECT pending_controller_fencing_token FROM plan_executions "
+            "WHERE plan_id = 'workload-second-fence'"
+        ).fetchone()
+        token_b = row["pending_controller_fencing_token"]
+        pending = Repository.execution_fence_receipt(
+            conn, "workload-second-fence", "scale", token_b
+        )
+        assert pending is not None and pending["state"] == "PENDING"
+        conn.execute(
+            "UPDATE plan_executions SET pending_controller_lease_expires_at = clock_timestamp() "
+            "WHERE plan_id = 'workload-second-fence'"
+        )
+        execution = conn.execute(
+            "SELECT plan_id, controller_id, controller_fencing_token, "
+            "controller_lease_expires_at <= clock_timestamp() AS controller_lease_expired "
+            "FROM plan_executions WHERE plan_id = 'workload-second-fence'"
+        ).fetchone()
+
+    controller_c = ExecutionController(repo, target, FakeHealth(), "controller-c")
+    token_c = controller_c._claim(execution)
+
+    assert token_c is not None and token_c > token_b
+    assert target.replicas == 2
+    assert target.authorizations == 0
+    assert target.execution_fence["generation"] == token_c
+    with repo.transaction() as conn:
+        receipt = Repository.execution_fence_receipt(
+            conn, "workload-second-fence", "scale", token_c
+        )
+    assert receipt is not None and receipt["state"] == "COMPLETE"
+    assert receipt["prior_execution_fence"]["generation"] == token_b
+    assert receipt["fence_precondition"]["generation"] + 1 == receipt["generation"]
+
+
+def test_old_takeover_receipt_cannot_close_or_unfence_a_new_dispatch(
+    clean_database: Database,
+) -> None:
+    repo = clean_database.repository
+    controller_a, _legacy_target, _health = _prepare_controller(
+        repo, "workload-stale-receipt", 8, 9
+    )
+    target = FakeFleetRightWorkloadTarget(8)
+    target.lose_before_authorize = True
+    controller_a.target = target
+    controller_a.run_once()
+    with repo.transaction() as conn:
+        conn.execute(
+            "UPDATE plan_executions SET controller_lease_expires_at = clock_timestamp() "
+            "WHERE plan_id = 'workload-stale-receipt'"
+        )
+
+    controller_b = ExecutionController(repo, target, FakeHealth(), "controller-b")
+    target.lose_before_authorize = True
+    controller_b.run_once()
+    with repo.transaction() as conn:
+        action = Repository.incomplete_actions(conn, "workload-stale-receipt")[0]
+        execution = conn.execute(
+            "SELECT plan_id, controller_id, controller_fencing_token, "
+            "controller_lease_expires_at <= clock_timestamp() AS controller_lease_expired "
+            "FROM plan_executions WHERE plan_id = 'workload-stale-receipt'"
+        ).fetchone()
+        token_b = execution["controller_fencing_token"]
+        dispatch = ExecutionController._latest_dispatch(action)
+        receipt_b = Repository.execution_fence_receipt(
+            conn, "workload-stale-receipt", "scale", token_b
+        )
+    assert dispatch is not None and receipt_b is not None
+    target_token = dispatch["target_fencing_token"]
+    stale_observation = next(
+        item["observation"]
+        for item in reversed(action["execution_result"]["progress"])
+        if isinstance(item.get("result"), dict)
+        and "dispatch_target_replicas" in item["result"]
+    )
+    assert target_token > token_b
+    assert target.replicas == 8 and target.execution_request is None
+
+    controller_b.run_once()
+    with repo.transaction() as conn:
+        action = Repository.incomplete_actions(conn, "workload-stale-receipt")[0]
+        execution = conn.execute(
+            "SELECT plan_id, controller_id, controller_fencing_token, status, "
+            "controller_lease_expires_at <= clock_timestamp() AS controller_lease_expired "
+            "FROM plan_executions WHERE plan_id = 'workload-stale-receipt'"
+        ).fetchone()
+    assert action["execution_state"] == "OUTCOME_UNKNOWN"
+    assert execution["status"] == "EXECUTING"
+    assert execution["controller_lease_expired"]
+
+    controller_c = ExecutionController(
+        repo, target, FakeHealth(), "controller-c", max_attempts=3
+    )
+    token_c = controller_c._claim(execution)
+    assert token_c is not None and token_c > target_token
+    with pytest.raises(TargetPreconditionFailed):
+        target.authorize_scale(
+            "cpu-api",
+            target_token,
+            expected=stale_observation,
+            plan_id="workload-stale-receipt",
+            operation_id="scale",
+            target_replicas=9,
+        )
+    assert target.replicas == 8 and target.execution_request is None
+
+    with repo.transaction() as conn:
+        action = Repository.incomplete_actions(conn, "workload-stale-receipt")[0]
+    controller_c._reconcile_action("workload-stale-receipt", token_c, action, False)
+    target.mark_applied()
+    for _ in range(5):
+        controller_c.run_once()
+    with repo.transaction() as conn:
+        action_state = conn.execute(
+            "SELECT execution_state FROM action_intents WHERE plan_id = 'workload-stale-receipt'"
+        ).fetchone()["execution_state"]
+        execution_state = conn.execute(
+            "SELECT status FROM plan_executions WHERE plan_id = 'workload-stale-receipt'"
+        ).fetchone()["status"]
+    assert action_state == "SUCCEEDED"
+    assert execution_state == "COMMITTED"
+    assert target.authorizations == 1
+
+
+def test_workload_takeover_retry_only_fences_when_authority_cas_conflicts(
+    clean_database: Database,
+) -> None:
+    repo = clean_database.repository
+    with repo.transaction() as conn:
+        _insert_plan(conn, "workload-fence-conflict")
+        conn.execute(
+            "INSERT INTO action_intents (plan_id, intent_id, action_sequence, action_type, "
+            "workload_id, payload, status) VALUES ('workload-fence-conflict', 'scale', 0, "
+            "'SET_REPLICA_COUNT', 'cpu-api', %s, 'APPROVED')",
+            (Jsonb({"current_replicas": 2, "proposed_replicas": 3}),),
+        )
+        conn.execute(
+            "INSERT INTO control_state (singleton, snapshot_id, snapshot_generation, binding) "
+            "VALUES (TRUE, 'snapshot', 1, %s)",
+            (Jsonb({}),),
+        )
+    original = _claim(repo, "workload-fence-conflict")
+    old_token = original["execution"]["controller_fencing_token"]
+    with repo.transaction() as conn:
+        Repository.transition_action(
+            conn,
+            "workload-fence-conflict",
+            "scale",
+            "NOT_STARTED",
+            "RUNNING",
+            "controller-a",
+            old_token,
+            pre_observation={"replicas": 2, "uid": "deployment-uid", "generation": 1},
+        )
+        Repository.request_execution_control(
+            conn, "workload-fence-conflict", "CANCEL", "operator cancel"
+        )
+        conn.execute(
+            "UPDATE plan_executions SET controller_lease_expires_at = clock_timestamp() "
+            "WHERE plan_id = 'workload-fence-conflict'"
+        )
+        execution = conn.execute(
+            "SELECT plan_id, controller_id, controller_fencing_token, "
+            "controller_lease_expires_at <= clock_timestamp() AS controller_lease_expired "
+            "FROM plan_executions WHERE plan_id = 'workload-fence-conflict'"
+        ).fetchone()
+
+    target = FakeFleetRightWorkloadTarget(2)
+    original_fence = target.fence_scale
+    conflicted = False
+
+    def conflict_once(*args: object, **kwargs: object) -> dict[str, object]:
+        nonlocal conflicted
+        if not conflicted:
+            conflicted = True
+            target.resource_version = "2"
+            raise TargetPreconditionFailed("simulated status resourceVersion conflict")
+        return original_fence(*args, **kwargs)  # type: ignore[arg-type]
+
+    target.fence_scale = conflict_once  # type: ignore[method-assign]
+    controller = ExecutionController(repo, target, FakeHealth(), "controller-b")
+    token = controller._claim(execution)
+
+    assert token is not None
+    assert target.replicas == 2
+    assert target.authorizations == 0
+    with repo.transaction() as conn:
+        action = Repository.incomplete_actions(conn, "workload-fence-conflict")[0]
+        receipt = Repository.execution_fence_receipt(
+            conn, "workload-fence-conflict", "scale", token
+        )
+    controller._reconcile_action(
+        "workload-fence-conflict", token, action, False, allow_dispatch=False
+    )
+    assert target.replicas == 2
+    assert target.authorizations == 0
+    assert receipt is not None and receipt["state"] == "COMPLETE"
+
+
+def test_workload_takeover_refreshes_precondition_after_delayed_request_wins_race(
+    clean_database: Database,
+) -> None:
+    repo = clean_database.repository
+    controller_a, _legacy_target, health = _prepare_controller(
+        repo, "workload-delayed-request", 8, 9
+    )
+    target = FakeFleetRightWorkloadTarget(8)
+    target.lose_before_authorize = True
+    controller_a.target = target
+    controller_a.run_once()
+    with repo.transaction() as conn:
+        action = Repository.incomplete_actions(conn, "workload-delayed-request")[0]
+        execution = conn.execute(
+            "SELECT plan_id, controller_id, controller_fencing_token, "
+            "controller_lease_expires_at <= clock_timestamp() AS controller_lease_expired "
+            "FROM plan_executions WHERE plan_id = 'workload-delayed-request'"
+        ).fetchone()
+        conn.execute(
+            "UPDATE plan_executions SET controller_lease_expires_at = clock_timestamp() "
+            "WHERE plan_id = 'workload-delayed-request'"
+        )
+    dispatch = ExecutionController._latest_dispatch(action)
+    assert dispatch is not None and target.replicas == 8
+
+    original_fence = target.fence_scale
+    delayed = False
+
+    def publish_delayed_request(*args: object, **kwargs: object) -> dict[str, object]:
+        nonlocal delayed
+        if not delayed:
+            delayed = True
+            precondition = action["execution_result"]["pre_observation"]
+            target.authorize_scale(
+                "cpu-api",
+                dispatch["target_fencing_token"],
+                expected=precondition,
+                plan_id="workload-delayed-request",
+                operation_id="scale",
+                target_replicas=9,
+            )
+        return original_fence(*args, **kwargs)  # type: ignore[arg-type]
+
+    target.fence_scale = publish_delayed_request  # type: ignore[method-assign]
+    controller_b = ExecutionController(repo, target, health, "controller-b")
+    token = controller_b._claim(execution)
+
+    assert token is not None and delayed
+    assert target.replicas == 9
+    assert target.authorizations == 1
+    with repo.transaction() as conn:
+        receipt = Repository.execution_fence_receipt(
+            conn, "workload-delayed-request", "scale", token
+        )
+    assert receipt is not None and receipt["state"] == "COMPLETE"
+    assert receipt["operation_applied_before_fence"] is True
+    assert receipt["precondition"] == receipt["fence_precondition"]
+    assert receipt["precondition"]["replicas"] == 9
+
+    controller_b.run_once()
+    assert target.authorizations == 1
+    target.mark_applied()
+    for _ in range(5):
+        controller_b.run_once()
+    with repo.transaction() as conn:
+        action_state = conn.execute(
+            "SELECT execution_state FROM action_intents "
+            "WHERE plan_id = 'workload-delayed-request'"
+        ).fetchone()["execution_state"]
+        execution_state = conn.execute(
+            "SELECT status FROM plan_executions WHERE plan_id = 'workload-delayed-request'"
+        ).fetchone()["status"]
+    assert action_state == "SUCCEEDED"
+    assert execution_state == "COMMITTED"
+    assert target.authorizations == 1
+
+
+def test_workload_takeover_recovers_response_recorded_before_crash(
+    clean_database: Database,
+) -> None:
+    repo = clean_database.repository
+    controller_a, _target, _health = _prepare_controller(repo, "workload-response-crash", 8, 9)
+    target = FakeFleetRightWorkloadTarget(8)
+    controller_a.target = target
+    with repo.transaction() as conn:
+        execution = conn.execute(
+            "SELECT controller_fencing_token FROM plan_executions "
+            "WHERE plan_id = 'workload-response-crash'"
+        ).fetchone()
+        token = execution["controller_fencing_token"]
+        action = Repository.runnable_actions(
+            conn, "workload-response-crash", "controller-a", token
+        )[0]
+        Repository.transition_action(
+            conn,
+            "workload-response-crash",
+            action["intent_id"],
+            "NOT_STARTED",
+            "RUNNING",
+            "controller-a",
+            token,
+            pre_observation=target.observe_scale("cpu-api"),
+            result={"desired_replicas": 9},
+        )
+        action = Repository.incomplete_actions(conn, "workload-response-crash")[0]
+
+    def crash_after_dispatch(*_args: object, **_kwargs: object) -> None:
+        raise SystemExit("injected crash after durable response")
+
+    controller_a._reconcile_action = crash_after_dispatch  # type: ignore[method-assign]
+    with pytest.raises(SystemExit, match="after durable response"):
+        controller_a._dispatch(
+            "workload-response-crash",
+            token,
+            action,
+            target.observe_scale("cpu-api"),
+            9,
+            False,
+        )
+    assert target.replicas == 9
+    with repo.transaction() as conn:
+        conn.execute(
+            "UPDATE plan_executions SET controller_lease_expires_at = clock_timestamp() "
+            "WHERE plan_id = 'workload-response-crash'"
+        )
+        execution = conn.execute(
+            "SELECT plan_id, controller_id, controller_fencing_token, "
+            "controller_lease_expires_at <= clock_timestamp() AS controller_lease_expired "
+            "FROM plan_executions WHERE plan_id = 'workload-response-crash'"
+        ).fetchone()
+
+    controller_b = ExecutionController(repo, target, FakeHealth(), "controller-b")
+    token = controller_b._claim(execution)
+    assert token is not None
+    target.mark_applied()
+    with repo.transaction() as conn:
+        action = Repository.incomplete_actions(conn, "workload-response-crash")[0]
+    controller_b._reconcile_action("workload-response-crash", token, action, False)
+
+    with repo.transaction() as conn:
+        action = conn.execute(
+            "SELECT execution_state FROM action_intents WHERE plan_id = 'workload-response-crash'"
+        ).fetchone()
+    assert action["execution_state"] == "SUCCEEDED"
+    assert target.replicas == 9
+    assert target.authorizations == 1
 
 
 def test_unknown_action_blocks_dispatch_until_observed(clean_database: Database) -> None:
@@ -1184,7 +1749,7 @@ def test_cancel_keeps_workload_outcome_unknown_until_controller_applies_it(
         ).fetchone()
     assert action["execution_state"] == "SUCCEEDED"
     assert execution["status"] == "CANCELLED"
-    assert target.authorizations == 2
+    assert target.authorizations == 1
     assert target.replicas == target.observed_replicas == 9
 
 
