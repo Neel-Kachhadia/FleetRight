@@ -1907,6 +1907,168 @@ def test_compensation_is_persisted_once_before_dispatch(clean_database: Database
         )
 
 
+@pytest.mark.parametrize(
+    ("verification_failure", "expected_execution_state"),
+    [(False, "COMPENSATED"), (True, "FAILED_SAFE")],
+)
+def test_source_retirement_health_regression_restores_bounded_kubernetes_capacity(
+    clean_database: Database, verification_failure: bool, expected_execution_state: str
+) -> None:
+    repo = clean_database.repository
+    plan_id = "retirement-compensation"
+    recovery_nodes = [{"name": "worker-c", "uid": "worker-c-uid"}]
+    health_policy = {
+        "p99_limit_ms": 120,
+        "error_slo_ppm": 1_000,
+        "max_queue_growth_milli": 0,
+    }
+    payload = {
+        "operation_id": "retire",
+        "source_owner_uid": "deployment-uid",
+        "workload_generation": 1,
+        "baseline_replicas": 1,
+        "surge_desired_replicas": 2,
+        "final_desired_replicas": 2,
+        "maximum_live_replicas": 3,
+        "maximum_temporary_surge_replicas": 2,
+        "n_minus_1_recovery_target_replicas": 2,
+        "recovery_destination_nodes": recovery_nodes,
+        "destination_nodes": [{"name": "worker-b", "uid": "worker-b-uid"}],
+        "health": health_policy,
+    }
+    with repo.transaction() as conn:
+        _insert_plan(conn, plan_id)
+        conn.execute(
+            "INSERT INTO control_state "
+            "(singleton, snapshot_id, snapshot_generation, binding) VALUES "
+            "(TRUE, 'snapshot', 1, %s)",
+            (Jsonb({}),),
+        )
+        conn.execute(
+            "INSERT INTO action_intents (plan_id, intent_id, action_sequence, action_type, "
+            "workload_id, payload, status) VALUES (%s, 'retire', 0, "
+            "'PREPARE_SOURCE_RETIREMENT', 'cpu-api', %s, 'APPROVED')",
+            (plan_id, Jsonb(payload)),
+        )
+    claim = _claim(repo, plan_id)
+    token = claim["execution"]["controller_fencing_token"]
+    with repo.transaction() as conn:
+        Repository.transition_action(
+            conn,
+            plan_id,
+            "retire",
+            "NOT_STARTED",
+            "RUNNING",
+            "controller-a",
+            token,
+            pre_observation={"uid": "deployment-uid", "generation": 1, "replicas": 1},
+        )
+        Repository.transition_action(
+            conn,
+            plan_id,
+            "retire",
+            "RUNNING",
+            "SUCCEEDED",
+            "controller-a",
+            token,
+            target_observation={"uid": "deployment-uid", "generation": 2, "replicas": 2},
+            result={"stage": "RETIREMENT_COMPLETE"},
+        )
+        action = conn.execute(
+            "SELECT * FROM action_intents WHERE plan_id = %s AND intent_id = 'retire'",
+            (plan_id,),
+        ).fetchone()
+
+    class RecoveryTarget(FakeFleetRightWorkloadTarget):
+        def __init__(self) -> None:
+            super().__init__(2)
+            self.generation = self.observed_generation = 2
+            self.execution_request = {
+                "planID": plan_id,
+                "operationID": "retire",
+                "generation": 0,
+                "expectedReplicas": 1,
+                "targetReplicas": 2,
+            }
+            self.mark_applied()
+            self.authorized_destinations: list[dict[str, str]] | None = None
+
+        def authorize_scale(
+            self,
+            workload_id: str,
+            fencing_token: int,
+            *,
+            expected: dict[str, object],
+            plan_id: str,
+            operation_id: str,
+            target_replicas: int,
+            destination_nodes: list[dict[str, str]] | None = None,
+        ) -> dict[str, object]:
+            self.authorized_destinations = destination_nodes
+            assert destination_nodes == recovery_nodes
+            return super().authorize_scale(
+                workload_id,
+                fencing_token,
+                expected=expected,
+                plan_id=plan_id,
+                operation_id=operation_id,
+                target_replicas=target_replicas,
+            )
+
+        def set_replicas(self, *args: object, **kwargs: object) -> dict[str, object]:
+            super().set_replicas(*args, **kwargs)  # type: ignore[arg-type]
+            self.mark_applied()
+            return {**self.observe_scale("cpu-api"), "applied": True}
+
+        def verify_recovery(
+            self,
+            verified_plan_id: str,
+            recovery_action: dict[str, object],
+            observed: dict[str, object],
+        ) -> None:
+            assert verified_plan_id == plan_id
+            assert recovery_action["workload_id"] == "cpu-api"
+            assert observed["uid"] == "deployment-uid"
+            if verification_failure:
+                raise TargetPreconditionFailed("recovery target identity changed")
+
+    target = RecoveryTarget()
+    controller = ExecutionController(repo, target, FakeHealth([True]), "controller-a")
+    controller._begin_compensation(
+        plan_id,
+        token,
+        action,
+        {"uid": "deployment-uid", "generation": 2, "replicas": 2},
+        "EXECUTING",
+    )
+
+    with repo.transaction() as conn:
+        compensation = conn.execute(
+            "SELECT payload FROM action_intents "
+            "WHERE plan_id = %s AND compensates_intent_id = 'retire'",
+            (plan_id,),
+        ).fetchone()
+    assert compensation["payload"]["proposed_replicas"] == 3
+    assert compensation["payload"]["destination_nodes"] == recovery_nodes
+
+    controller.run_once()
+    controller.run_once()
+
+    with repo.transaction() as conn:
+        execution = conn.execute(
+            "SELECT status FROM plan_executions WHERE plan_id = %s", (plan_id,)
+        ).fetchone()
+        compensation = conn.execute(
+            "SELECT execution_state FROM action_intents WHERE plan_id = %s "
+            "AND compensates_intent_id = 'retire'",
+            (plan_id,),
+        ).fetchone()
+    assert execution["status"] == expected_execution_state
+    assert compensation["execution_state"] == "SUCCEEDED"
+    assert target.replicas == 3
+    assert target.authorized_destinations == recovery_nodes
+
+
 def test_lost_response_after_target_success_recovers_without_duplicate_mutation(
     clean_database: Database,
 ) -> None:

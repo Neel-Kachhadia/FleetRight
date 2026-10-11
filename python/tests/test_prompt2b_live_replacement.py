@@ -527,6 +527,51 @@ def test_live_workload_prepares_and_evacuates_source_with_real_pod_identity(
         assert retired["source_pod_uid"] == source["metadata"]["uid"]
         assert retired["final_desired_replicas"] == 2
         assert retired["observation"]["ready_replicas"] == 2
+
+        recovery_nodes = [
+            {"name": node["metadata"]["name"], "uid": node["metadata"]["uid"]} for node in workers
+        ]
+        before_recovery = takeover_target.observe_scale(workload_id)
+        recovery_operation_id = f"p2b-live-recovery-{uuid.uuid4().hex[:10]}"
+        takeover_target.authorize_scale(
+            workload_id,
+            15,
+            expected=before_recovery,
+            plan_id=plan_id,
+            operation_id=recovery_operation_id,
+            target_replicas=3,
+            destination_nodes=recovery_nodes,
+        )
+        deadline = time.monotonic() + 120
+        recovered_workload = takeover_target.observe_scale(workload_id)
+        while (
+            recovered_workload["ready_replicas"] != 3
+            or recovered_workload["available_replicas"] != 3
+            or recovered_workload["observed_generation"] != recovered_workload["generation"]
+            or recovered_workload["execution"].get("phase") != "APPLIED"
+        ):
+            assert time.monotonic() < deadline, recovered_workload
+            time.sleep(1)
+            recovered_workload = takeover_target.observe_scale(workload_id)
+        takeover_target.verify_recovery(
+            plan_id,
+            {
+                "intent_id": recovery_operation_id,
+                "workload_id": workload_id,
+                "payload": {
+                    "target_precondition": {
+                        key: before_recovery[key] for key in ("uid", "generation", "replicas")
+                    },
+                    "current_replicas": 2,
+                    "proposed_replicas": 3,
+                    "destination_nodes": recovery_nodes,
+                    "topology_key": "kubernetes.io/hostname",
+                    "minimum_topology_domains": 0,
+                    "maximum_topology_skew": 1,
+                },
+            },
+            recovered_workload,
+        )
     finally:
         kubectl(
             "delete",

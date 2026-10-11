@@ -23,7 +23,9 @@ from .workload_controller import (
     POD_CREATE_ATTEMPT_ANNOTATION,
     POD_CREATE_OPERATION_ANNOTATION,
     POD_CREATE_PLAN_ANNOTATION,
+    REPLICA_ID_LABEL,
     WORKLOAD_GENERATION_ANNOTATION,
+    WORKLOAD_UID_LABEL,
     SafetyError,
     _write_retired_slot_tombstone,
 )
@@ -1419,6 +1421,277 @@ class FleetRightWorkloadTarget(KubernetesTarget):
                 return False
         return True
 
+    def verify_recovery(
+        self, plan_id: str, action: dict[str, Any], observed: dict[str, Any]
+    ) -> None:
+        payload = action.get("payload")
+        precondition = payload.get("target_precondition") if isinstance(payload, dict) else None
+        desired = payload.get("proposed_replicas") if isinstance(payload, dict) else None
+        original = payload.get("current_replicas") if isinstance(payload, dict) else None
+        intent_id = action.get("intent_id")
+        destinations = payload.get("destination_nodes") if isinstance(payload, dict) else None
+        request, fence, execution = (
+            observed.get("execution_request"),
+            observed.get("execution_fence"),
+            observed.get("execution"),
+        )
+        if (
+            not isinstance(precondition, dict)
+            or observed.get("uid") != precondition.get("uid")
+            or precondition.get("replicas") != original
+            or not isinstance(intent_id, str)
+            or type(desired) is not int
+            or type(original) is not int
+            or desired <= original
+            or not isinstance(destinations, list)
+            or not destinations
+            or not isinstance(request, dict)
+            or (request.get("planID"), request.get("operationID")) != (plan_id, intent_id)
+            or request.get("targetReplicas") != desired
+            or request.get("expectedReplicas") != original
+            or request.get("destinationNodes") != destinations
+            or type(request.get("generation")) is not int
+            or observed.get("fencing_token") != request.get("generation")
+            or not isinstance(fence, dict)
+            or (fence.get("planID"), fence.get("operationID")) != (plan_id, intent_id)
+            or fence.get("generation") != request.get("generation")
+            or fence.get("expectedGeneration") != precondition.get("generation")
+            or fence.get("expectedReplicas") != original
+            or fence.get("fencedGeneration") != observed.get("generation")
+            or not isinstance(execution, dict)
+            or execution.get("phase") != "APPLIED"
+            or any(
+                execution.get(key) != request.get(key)
+                for key in ("planID", "operationID", "generation", "targetReplicas")
+            )
+        ):
+            raise ActionBlocked("RECOVERY_WORKLOAD_OR_OPERATION_IDENTITY_CHANGED")
+
+        approved = {
+            node.get("name"): node.get("uid")
+            for node in observed.get("approved_nodes", [])
+            if isinstance(node, dict)
+            and isinstance(node.get("name"), str)
+            and isinstance(node.get("uid"), str)
+        }
+        recovery = {
+            node.get("name"): node.get("uid")
+            for node in destinations
+            if isinstance(node, dict)
+            and isinstance(node.get("name"), str)
+            and isinstance(node.get("uid"), str)
+        }
+        if (
+            len(approved) != len(observed.get("approved_nodes", []))
+            or len(recovery) != len(destinations)
+            or any(approved.get(name) != uid for name, uid in recovery.items())
+        ):
+            raise ActionBlocked("RECOVERY_NODE_AUTHORIZATION_INVALID")
+
+        records = observed.get("authorized_pod_creates")
+        if not isinstance(records, list):
+            raise ActionBlocked("RECOVERY_CREATE_HISTORY_INVALID")
+        created = [
+            record
+            for record in records
+            if isinstance(record, dict)
+            and record.get("planID") == plan_id
+            and record.get("operationID") == intent_id
+        ]
+        if len(created) != desired - original:
+            raise ActionBlocked("RECOVERY_CREATE_EVIDENCE_INCOMPLETE")
+        created_uids = {record.get("podUID") for record in created}
+        if len(created_uids) != len(created) or not all(
+            isinstance(uid, str) for uid in created_uids
+        ):
+            raise ActionBlocked("RECOVERY_CREATE_IDENTITY_DUPLICATED")
+
+        result = self._json(
+            "get",
+            "pods",
+            "-n",
+            self.namespace,
+            "-l",
+            f"{WORKLOAD_UID_LABEL}={observed['uid']}",
+            "-o",
+            "json",
+        )
+        items = result.get("items")
+        if not isinstance(items, list):
+            raise TargetUnavailable("recovery Pod inventory is unavailable")
+        if any(not isinstance(pod, dict) for pod in items):
+            raise ActionBlocked("RECOVERY_POD_INVENTORY_INVALID")
+        live = []
+        for pod in items:
+            status = pod.get("status", {})
+            if not isinstance(status, dict):
+                raise ActionBlocked("RECOVERY_POD_IDENTITY_INVALID")
+            if status.get("phase") not in {"Succeeded", "Failed"}:
+                live.append(pod)
+        if len(live) != desired:
+            raise ActionBlocked("RECOVERY_LIVE_POD_COUNT_CHANGED")
+
+        topology = observed.get("placement_topology")
+        topology_key = payload.get("topology_key")
+        minimum_domains = payload.get("minimum_topology_domains", 0)
+        maximum_skew = payload.get("maximum_topology_skew")
+        recovery_node_objects: dict[str, dict[str, Any]] = {}
+        if topology_key:
+            if (
+                not isinstance(topology, dict)
+                or topology.get("key") != topology_key
+                or type(minimum_domains) is not int
+                or type(maximum_skew) is not int
+                or topology.get("maxSkew", 1) != maximum_skew
+                or topology.get("minDomains", 0) != minimum_domains
+            ):
+                raise ActionBlocked("RECOVERY_TOPOLOGY_POLICY_CHANGED")
+            for name, uid in recovery.items():
+                node = self._json("get", "node", _checked_name(name, "Node name"), "-o", "json")
+                metadata, status = node.get("metadata", {}), node.get("status", {})
+                if (
+                    not isinstance(metadata, dict)
+                    or not isinstance(status, dict)
+                    or metadata.get("uid") != uid
+                    or not any(
+                        isinstance(condition, dict)
+                        and condition.get("type") == "Ready"
+                        and condition.get("status") == "True"
+                        for condition in status.get("conditions", [])
+                    )
+                ):
+                    raise ActionBlocked("RECOVERY_NODE_IDENTITY_OR_READINESS_CHANGED")
+                recovery_node_objects[name] = node
+        node_cache: dict[str, dict[str, Any]] = dict(recovery_node_objects)
+        domains: dict[str, int] = {}
+        if topology_key:
+            for node in recovery_node_objects.values():
+                metadata = node["metadata"]
+                labels_on_node = metadata.get("labels", {})
+                domain = (
+                    labels_on_node.get(topology_key) if isinstance(labels_on_node, dict) else None
+                )
+                if not isinstance(domain, str) or not domain:
+                    raise ActionBlocked("RECOVERY_TOPOLOGY_LABEL_MISSING")
+                domains.setdefault(domain, 0)
+        seen_slots: set[str] = set()
+        seen_pod_uids: set[str] = set()
+        retired = {
+            slot.get("replicaID")
+            for slot in observed.get("retired_replica_slots", [])
+            if isinstance(slot, dict)
+        }
+        for pod in live:
+            metadata, spec, status = (
+                pod.get("metadata", {}),
+                pod.get("spec", {}),
+                pod.get("status", {}),
+            )
+            labels = metadata.get("labels", {}) if isinstance(metadata, dict) else {}
+            annotations = metadata.get("annotations", {}) if isinstance(metadata, dict) else {}
+            if not all(
+                isinstance(value, dict) for value in (metadata, spec, status, labels, annotations)
+            ):
+                raise ActionBlocked("RECOVERY_POD_IDENTITY_INVALID")
+            slot, uid, name, node_name = (
+                labels.get(REPLICA_ID_LABEL),
+                metadata.get("uid"),
+                metadata.get("name"),
+                spec.get("nodeName"),
+            )
+            record = next(
+                (
+                    item
+                    for item in records
+                    if isinstance(item, dict)
+                    and item.get("podUID") == uid
+                    and item.get("podName") == name
+                    and item.get("replicaID") == slot
+                ),
+                None,
+            )
+            owners = metadata.get("ownerReferences", [])
+            if (
+                not isinstance(slot, str)
+                or slot in seen_slots
+                or slot in retired
+                or not isinstance(uid, str)
+                or not isinstance(name, str)
+                or not isinstance(node_name, str)
+                or approved.get(node_name) is None
+                or not isinstance(record, dict)
+                or record.get("workloadUID") != observed["uid"]
+                or type(record.get("workloadGeneration")) is not int
+                or annotations.get(WORKLOAD_GENERATION_ANNOTATION)
+                != str(record.get("workloadGeneration"))
+                or annotations.get(POD_CREATE_PLAN_ANNOTATION) != record.get("planID")
+                or annotations.get(POD_CREATE_OPERATION_ANNOTATION) != record.get("operationID")
+                or annotations.get(POD_CREATE_ATTEMPT_ANNOTATION) != record.get("createID")
+                or labels.get(WORKLOAD_UID_LABEL) != observed["uid"]
+                or not isinstance(owners, list)
+                or not any(
+                    isinstance(owner, dict)
+                    and owner.get("apiVersion") == "fleetright.io/v1alpha1"
+                    and owner.get("kind") == "FleetRightWorkload"
+                    and owner.get("name") == action.get("workload_id")
+                    and owner.get("uid") == observed["uid"]
+                    and owner.get("controller") is True
+                    for owner in owners
+                )
+                or metadata.get("deletionTimestamp") is not None
+                or status.get("phase") != "Running"
+                or not any(
+                    isinstance(condition, dict)
+                    and condition.get("type") == "Ready"
+                    and condition.get("status") == "True"
+                    for condition in status.get("conditions", [])
+                )
+            ):
+                raise ActionBlocked("RECOVERY_POD_IDENTITY_OR_READINESS_CHANGED")
+            seen_slots.add(slot)
+            seen_pod_uids.add(uid)
+            if uid in created_uids and recovery.get(node_name) != approved.get(node_name):
+                raise ActionBlocked("RECOVERY_POD_DESTINATION_CHANGED")
+            if node_name not in node_cache:
+                node = self._json(
+                    "get", "node", _checked_name(node_name, "Node name"), "-o", "json"
+                )
+                node_metadata, node_status = node.get("metadata", {}), node.get("status", {})
+                if (
+                    not isinstance(node_metadata, dict)
+                    or not isinstance(node_status, dict)
+                    or node_metadata.get("uid") != approved[node_name]
+                    or not any(
+                        isinstance(condition, dict)
+                        and condition.get("type") == "Ready"
+                        and condition.get("status") == "True"
+                        for condition in node_status.get("conditions", [])
+                    )
+                ):
+                    raise ActionBlocked("RECOVERY_NODE_IDENTITY_OR_READINESS_CHANGED")
+                node_cache[node_name] = node
+            if topology_key:
+                labels_on_node = node_cache[node_name]["metadata"].get("labels", {})
+                domain = (
+                    labels_on_node.get(topology_key) if isinstance(labels_on_node, dict) else None
+                )
+                if not isinstance(domain, str) or not domain:
+                    raise ActionBlocked("RECOVERY_TOPOLOGY_LABEL_MISSING")
+                if domain in domains:
+                    domains[domain] += 1
+
+        if topology_key:
+            if (
+                type(minimum_domains) is not int
+                or type(maximum_skew) is not int
+                or len(domains) < minimum_domains
+                or max(domains.values(), default=0) - min(domains.values(), default=0)
+                > maximum_skew
+            ):
+                raise ActionBlocked("RECOVERY_TOPOLOGY_REQUIREMENT_CHANGED")
+        if created_uids - seen_pod_uids:
+            raise ActionBlocked("RECOVERY_CREATED_POD_NOT_LIVE")
+
     def _verify_retirement_source(
         self, workload_uid: str, workload_id: str, payload: dict[str, Any]
     ) -> None:
@@ -1913,6 +2186,7 @@ class FleetRightWorkloadTarget(KubernetesTarget):
             "authorized_pod_creates": authorized_pod_creates,
             "retired_replica_slots": retired_slots,
             "approved_nodes": approved_nodes,
+            "placement_topology": placement.get("topology"),
             "surge_budget": spec.get("surgeBudget", 0),
             "pod_create_admission_protocol": spec.get("podCreateAdmissionProtocol"),
         }

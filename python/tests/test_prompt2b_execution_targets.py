@@ -36,7 +36,9 @@ from fleetright.workload_controller import (
     POD_CREATE_ATTEMPT_ANNOTATION,
     POD_CREATE_OPERATION_ANNOTATION,
     POD_CREATE_PLAN_ANNOTATION,
+    REPLICA_ID_LABEL,
     WORKLOAD_GENERATION_ANNOTATION,
+    WORKLOAD_UID_LABEL,
     _pod_name,
     _pod_object,
 )
@@ -974,6 +976,141 @@ def test_source_retirement_binds_observed_ready_replacement_uid_and_node(
         "resourceVersion": "3",
     }
     assert eviction["metadata"]["annotations"]["fleetright.io/fencing-token"] == "13"
+
+
+@pytest.mark.parametrize(
+    ("node_b_uid", "expected_reason"),
+    [
+        ("recreated-node-b-uid", "RECOVERY_NODE_IDENTITY_OR_READINESS_CHANGED"),
+        ("node-b-uid", "RECOVERY_TOPOLOGY_REQUIREMENT_CHANGED"),
+    ],
+)
+def test_recovery_verification_rejects_recreated_node_and_empty_topology_domain(
+    monkeypatch: pytest.MonkeyPatch, node_b_uid: str, expected_reason: str
+) -> None:
+    target = FleetRightWorkloadTarget(namespace="fleetright-v2")
+    records = [
+        {
+            "workloadUID": "workload-uid",
+            "podUID": f"pod-uid-{ordinal}",
+            "podName": _pod_name("workload-uid", ordinal),
+            "replicaID": f"cpu-api-{ordinal}",
+            "workloadGeneration": generation,
+            "planID": plan_id,
+            "operationID": operation_id,
+            "createID": f"create-{ordinal}",
+        }
+        for ordinal, generation, plan_id, operation_id in (
+            (0, 4, "bootstrap-plan", "bootstrap-op"),
+            (1, 5, "recovery-plan", "recovery-op"),
+        )
+    ]
+    pods = {
+        "items": [
+            {
+                "metadata": {
+                    "name": record["podName"],
+                    "uid": record["podUID"],
+                    "labels": {
+                        WORKLOAD_UID_LABEL: "workload-uid",
+                        REPLICA_ID_LABEL: record["replicaID"],
+                    },
+                    "annotations": {
+                        WORKLOAD_GENERATION_ANNOTATION: str(record["workloadGeneration"]),
+                        POD_CREATE_PLAN_ANNOTATION: record["planID"],
+                        POD_CREATE_OPERATION_ANNOTATION: record["operationID"],
+                        POD_CREATE_ATTEMPT_ANNOTATION: record["createID"],
+                    },
+                    "ownerReferences": [
+                        {
+                            "apiVersion": "fleetright.io/v1alpha1",
+                            "kind": "FleetRightWorkload",
+                            "name": "cpu-api",
+                            "uid": "workload-uid",
+                            "controller": True,
+                        }
+                    ],
+                },
+                "spec": {"nodeName": "worker-a"},
+                "status": {
+                    "phase": "Running",
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                },
+            }
+            for record in records
+        ]
+    }
+    nodes = {
+        "worker-a": {
+            "metadata": {"uid": "node-a-uid", "labels": {"zone": "east"}},
+            "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+        },
+        "worker-b": {
+            "metadata": {"uid": node_b_uid, "labels": {"zone": "west"}},
+            "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+        },
+    }
+
+    def get_json(*args: str) -> dict[str, object]:
+        if args[1] == "pods":
+            return pods
+        if args[1] == "node":
+            return nodes[args[2]]
+        raise AssertionError(f"unexpected Kubernetes request: {args}")
+
+    monkeypatch.setattr(target, "_json", get_json)
+    destination_nodes = [
+        {"name": "worker-a", "uid": "node-a-uid"},
+        {"name": "worker-b", "uid": "node-b-uid"},
+    ]
+    observation = {
+        "uid": "workload-uid",
+        "execution_request": {
+            "planID": "recovery-plan",
+            "operationID": "recovery-op",
+            "generation": 9,
+            "expectedReplicas": 1,
+            "targetReplicas": 2,
+            "destinationNodes": destination_nodes,
+        },
+        "execution_fence": {
+            "planID": "recovery-plan",
+            "operationID": "recovery-op",
+            "generation": 9,
+            "expectedGeneration": 8,
+            "expectedReplicas": 1,
+            "fencedGeneration": 9,
+        },
+        "fencing_token": 9,
+        "generation": 9,
+        "execution": {
+            "planID": "recovery-plan",
+            "operationID": "recovery-op",
+            "generation": 9,
+            "targetReplicas": 2,
+            "phase": "APPLIED",
+        },
+        "approved_nodes": destination_nodes,
+        "authorized_pod_creates": records,
+        "retired_replica_slots": [],
+        "placement_topology": {"key": "zone", "minDomains": 1, "maxSkew": 1},
+    }
+    action = {
+        "intent_id": "recovery-op",
+        "workload_id": "cpu-api",
+        "payload": {
+            "target_precondition": {"uid": "workload-uid", "generation": 8, "replicas": 1},
+            "current_replicas": 1,
+            "proposed_replicas": 2,
+            "destination_nodes": destination_nodes,
+            "topology_key": "zone",
+            "minimum_topology_domains": 1,
+            "maximum_topology_skew": 1,
+        },
+    }
+
+    with pytest.raises(ActionBlocked, match=expected_reason):
+        target.verify_recovery("recovery-plan", action, observation)
 
 
 def test_source_retirement_rejects_unapproved_replacement_destination(

@@ -417,6 +417,14 @@ class ExecutionController:
                 except TargetNotFound:
                     self._fail_safe(plan_id, token, "target-deleted-during-recovery-verification")
                     return
+                except ActionBlocked as error:
+                    self._fail_safe(plan_id, token, error.reason)
+                    return
+                except TargetPreconditionFailed as error:
+                    self._fail_safe(plan_id, token, str(error))
+                    return
+                except TargetError:
+                    return
                 self._transition(plan_id, token, "COMPENSATING", "COMPENSATED", recovery)
             return
 
@@ -2056,6 +2064,9 @@ class ExecutionController:
             compensation_payload.update(
                 proposed_replicas=compensation_target,
                 destination_nodes=recovery_nodes,
+                topology_key=payload.get("topology_key", ""),
+                minimum_topology_domains=payload.get("minimum_topology_domains", 0),
+                maximum_topology_skew=payload.get("maximum_topology_skew"),
             )
         try:
             with self.repository.transaction() as conn:
@@ -2206,17 +2217,27 @@ class ExecutionController:
     def _observe_recovery(self, plan_id: str) -> dict[str, Any]:
         with self.repository.transaction() as conn:
             actions = conn.execute(
-                "SELECT workload_id, payload FROM action_intents WHERE plan_id = %s "
+                "SELECT intent_id, workload_id, payload FROM action_intents WHERE plan_id = %s "
                 "AND compensates_intent_id IS NOT NULL ORDER BY action_sequence",
                 (plan_id,),
             ).fetchall()
         observations = []
         for action in actions:
             observed = self.target.observe_scale(action["workload_id"])
-            if observed["replicas"] != action["payload"][
-                "proposed_replicas"
-            ] or not self._capacity_ready(observed):
+            payload = action["payload"]
+            precondition = payload.get("target_precondition")
+            if (
+                not isinstance(precondition, dict)
+                or observed.get("uid") != precondition.get("uid")
+                or observed.get("replicas") != payload.get("proposed_replicas")
+                or not self._capacity_ready(observed)
+            ):
                 raise TargetUnavailable("compensation target is not ready")
+            if getattr(self.target, "supports_workload_execution", False):
+                verify = getattr(self.target, "verify_recovery", None)
+                if not callable(verify):
+                    raise ActionBlocked("RECOVERY_TARGET_VERIFICATION_UNAVAILABLE")
+                verify(plan_id, action, observed)
             observations.append(observed)
         if not observations or not all(self._health_payload_ok(action) for action in actions):
             raise TargetUnavailable("health recovery is not confirmed")
