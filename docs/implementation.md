@@ -197,10 +197,12 @@ requires the prior operation to be `APPLIED`, the current availability floor to 
 workload to report `Reconciled=True`.
 
 Earlier authenticated API and direct-adapter evidence used a Kubernetes Deployment target on a
-different disposable kind cluster. That target is disabled at this HEAD, so those results do not
-qualify the current `FleetRightWorkload` target. The current API approval/journal/takeover flow has
-not yet been run end-to-end against a live `FleetRightWorkload` controller under crash and lost
-response.
+different disposable kind cluster; that target is disabled and those results do not qualify the
+current `FleetRightWorkload` target. The authenticated API approval/journal/takeover path passed
+against a live `FleetRightWorkload` in the isolated kind lab on 2026-10-10, for monotonic scale-up
+and process recovery only. The 2026-10-11 opt-in live test was not rerun because the existing
+workload was already 4/4 Ready while the test requires a 3/3 baseline. No destructive operation
+was qualified by that run.
 
 At this HEAD, the API rejects `MOVE_REPLICA`, `DEACTIVATE_NODE`, and resource resizing before
 claiming execution. No Pod eviction or Node-cordon mutator is present in the current target, and the

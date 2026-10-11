@@ -12,6 +12,7 @@ import pytest
 from fleetright.api import create_app
 from fleetright.execution import (
     _WORKLOAD_EXECUTION_RULES,
+    _WORKLOAD_PENDING_CREATE_RULE,
     ActionBlocked,
     DockerComposeTarget,
     FleetRightWorkloadTarget,
@@ -481,12 +482,11 @@ def _execution_crd(rules: set[str]) -> dict[str, object]:
                     "name": "v1alpha1",
                     "schema": {
                         "openAPIV3Schema": {
+                            "x-kubernetes-validations": [{"rule": _WORKLOAD_PENDING_CREATE_RULE}],
                             "properties": {
                                 "spec": {
                                     "properties": {
-                                        "executionProtocol": {
-                                            "enum": ["monotonic-scale-up-v1"]
-                                        },
+                                        "executionProtocol": {"enum": ["monotonic-scale-up-v1"]},
                                         "executionRequest": {
                                             "required": [
                                                 "planID",
@@ -507,11 +507,21 @@ def _execution_crd(rules: set[str]) -> dict[str, object]:
                                             ]
                                         },
                                     },
-                                    "x-kubernetes-validations": [
-                                        {"rule": rule} for rule in rules
-                                    ],
-                                }
-                            }
+                                    "x-kubernetes-validations": [{"rule": rule} for rule in rules],
+                                },
+                                "status": {
+                                    "properties": {
+                                        "pendingPodCreate": {
+                                            "required": [
+                                                "workloadUID",
+                                                "workloadGeneration",
+                                                "podName",
+                                                "replicaID",
+                                            ]
+                                        }
+                                    }
+                                },
+                            },
                         }
                     },
                 }
@@ -569,6 +579,166 @@ def test_workload_preflight_requires_complete_execution_request_schema(
 
     with pytest.raises(TargetPreconditionFailed, match="execution CRD is not installed"):
         target._require_fencing_schema()
+
+
+def test_workload_preflight_requires_pending_pod_create_status_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = FleetRightWorkloadTarget(namespace="fleetright-v2")
+    crd = _execution_crd(_WORKLOAD_EXECUTION_RULES)
+    status = crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["status"]
+    status["properties"]["pendingPodCreate"]["required"].remove("podName")
+    monkeypatch.setattr(target, "_json", lambda *_args: crd)
+
+    with pytest.raises(TargetPreconditionFailed, match="execution CRD is not installed"):
+        target._require_fencing_schema()
+
+
+def test_workload_preflight_requires_root_pending_create_spec_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = FleetRightWorkloadTarget(namespace="fleetright-v2")
+    crd = _execution_crd(_WORKLOAD_EXECUTION_RULES)
+    root = crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]
+    root["x-kubernetes-validations"].clear()
+    monkeypatch.setattr(target, "_json", lambda *_args: crd)
+
+    with pytest.raises(TargetPreconditionFailed, match="execution CRD is not installed"):
+        target._require_fencing_schema()
+
+
+@pytest.mark.parametrize("method", ["fence_scale", "authorize_scale"])
+def test_workload_authority_blocks_while_pod_create_outcome_is_unknown(
+    monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
+    target = FleetRightWorkloadTarget(namespace="fleetright-v2")
+    state = _workload_object()
+    state["status"]["pendingPodCreate"] = {
+        "workloadUID": "workload-uid",
+        "workloadGeneration": 4,
+        "podName": "frw-workload-r2",
+        "replicaID": "cpu-api-2",
+    }
+    observed = target._observe(state, "cpu-api")
+    monkeypatch.setattr(target, "observe_scale", lambda _: observed)
+    monkeypatch.setattr(target, "_require_fencing_schema", lambda: None)
+
+    with pytest.raises(ActionBlocked, match="POD_CREATE_OUTCOME_UNKNOWN"):
+        getattr(target, method)(
+            "cpu-api",
+            12,
+            expected=observed,
+            plan_id="plan-1",
+            operation_id="action-1",
+            target_replicas=3,
+        )
+
+
+def test_pending_create_reservation_wins_authority_resource_version_cas(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = FleetRightWorkloadTarget(namespace="fleetright-v2")
+    _skip_fencing_crd_preflight(monkeypatch, target)
+    state = _workload_object()
+
+    def apply(*args: str) -> dict[str, object]:
+        if args[0] == "get":
+            return deepcopy(state)
+        patch = json.loads(args[args.index("-p") + 1])
+        state["status"]["pendingPodCreate"] = {
+            "workloadUID": "workload-uid",
+            "workloadGeneration": 4,
+            "podName": "frw-workload-r2",
+            "replicaID": "cpu-api-2",
+        }  # type: ignore[index]
+        state["metadata"]["resourceVersion"] = "8"  # type: ignore[index]
+        if patch["metadata"]["resourceVersion"] != "8":
+            raise TargetPreconditionFailed("target resource version changed")
+        state["spec"].update(patch["spec"])  # type: ignore[index]
+        return deepcopy(state)
+
+    monkeypatch.setattr(target, "_json", apply)
+    before = target.observe_scale("cpu-api")
+
+    with pytest.raises(TargetPreconditionFailed, match="resource version changed"):
+        target.authorize_scale(
+            "cpu-api",
+            12,
+            expected=before,
+            plan_id="plan-1",
+            operation_id="action-1",
+            target_replicas=3,
+        )
+
+    assert state["spec"]["replicas"] == 2  # type: ignore[index]
+    assert "executionRequest" not in state["spec"]  # type: ignore[operator]
+
+
+def test_authority_patch_wins_and_stale_create_reservation_cannot_post(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fleetright.workload_controller import ApiError as ControllerApiError
+    from fleetright.workload_controller import _write_pending_pod_create
+
+    target = FleetRightWorkloadTarget(namespace="fleetright-v2")
+    _skip_fencing_crd_preflight(monkeypatch, target)
+    state = _workload_object()
+
+    def apply(*args: str) -> dict[str, object]:
+        if args[0] == "get":
+            return deepcopy(state)
+        patch = json.loads(args[args.index("-p") + 1])
+        if patch["metadata"]["resourceVersion"] != state["metadata"]["resourceVersion"]:  # type: ignore[index]
+            raise TargetPreconditionFailed("target resource version changed")
+        state["spec"].update(patch["spec"])  # type: ignore[index]
+        state["metadata"]["generation"] += 1  # type: ignore[index]
+        state["metadata"]["resourceVersion"] = str(  # type: ignore[index]
+            int(state["metadata"]["resourceVersion"]) + 1  # type: ignore[index]
+        )
+        return deepcopy(state)
+
+    monkeypatch.setattr(target, "_json", apply)
+    before = target.observe_scale("cpu-api")
+    target.authorize_scale(
+        "cpu-api",
+        12,
+        expected=before,
+        plan_id="plan-1",
+        operation_id="action-1",
+        target_replicas=3,
+    )
+    create_calls = 0
+
+    class StatusAPI:
+        def patch_status(
+            self, _name: str, resource_version: str, _status: dict[str, object]
+        ) -> dict[str, object]:
+            if resource_version != state["metadata"]["resourceVersion"]:  # type: ignore[index]
+                raise ControllerApiError(409, "resourceVersion conflict")
+            return {"metadata": {"resourceVersion": "9"}, "status": {}}
+
+        def create_pod(self, _pod: dict[str, object]) -> None:
+            nonlocal create_calls
+            create_calls += 1
+
+    workload = {
+        "metadata": {"name": "cpu-api", "resourceVersion": "7"},
+        "status": {},
+    }
+    with pytest.raises(ControllerApiError, match="resourceVersion conflict"):
+        _write_pending_pod_create(
+            StatusAPI(),
+            workload,
+            {
+                "workloadUID": "workload-uid",
+                "workloadGeneration": 4,
+                "podName": "frw-workload-r2",
+                "replicaID": "cpu-api-2",
+            },
+        )
+
+    assert create_calls == 0
+    assert state["spec"]["replicas"] == 3  # type: ignore[index]
 
 
 def test_workload_takeover_fence_changes_authority_without_scaling(

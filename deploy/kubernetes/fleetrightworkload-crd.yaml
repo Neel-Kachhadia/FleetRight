@@ -41,6 +41,9 @@ spec:
         openAPIV3Schema:
           type: object
           required: [spec]
+          x-kubernetes-validations:
+            - rule: "!has(oldSelf.status) || !has(oldSelf.status.pendingPodCreate) || self.spec == oldSelf.spec"
+              message: spec cannot change while a Pod create outcome is unresolved
           properties:
             spec:
               type: object
@@ -438,6 +441,29 @@ spec:
                         type: integer
                         format: int32
                         minimum: 0
+                pendingPodCreate:
+                  type: object
+                  required: [workloadUID, workloadGeneration, podName, replicaID]
+                  properties:
+                    workloadUID:
+                      type: string
+                      minLength: 1
+                    workloadGeneration:
+                      type: integer
+                      format: int64
+                      minimum: 1
+                    podName:
+                      type: string
+                      minLength: 1
+                    replicaID:
+                      type: string
+                      minLength: 1
+                    planID:
+                      type: string
+                      minLength: 1
+                    operationID:
+                      type: string
+                      minLength: 1
                 execution:
                   type: object
                   required: [planID, operationID, generation, targetReplicas, phase]

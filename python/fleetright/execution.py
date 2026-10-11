@@ -106,6 +106,9 @@ _WORKLOAD_EXECUTION_RULES = {
         "self.executionFence.operationID == self.executionRequest.operationID)"
     ),
 }
+_WORKLOAD_PENDING_CREATE_RULE = (
+    "!has(oldSelf.status) || !has(oldSelf.status.pendingPodCreate) || self.spec == oldSelf.spec"
+)
 
 # ponytail: ceilings cover three checked-in workloads; add one with each new target.
 EXECUTION_HEALTH_CEILINGS = {
@@ -496,27 +499,46 @@ class FleetRightWorkloadTarget(KubernetesTarget):
         if not isinstance(schema, dict):
             schema = {}
         root_properties = schema.get("properties")
+        root_rules = schema.get("x-kubernetes-validations", [])
         spec = root_properties.get("spec", {}) if isinstance(root_properties, dict) else {}
+        status = root_properties.get("status", {}) if isinstance(root_properties, dict) else {}
         rules = spec.get("x-kubernetes-validations", []) if isinstance(spec, dict) else []
         properties = spec.get("properties", {}) if isinstance(spec, dict) else {}
+        status_properties = status.get("properties", {}) if isinstance(status, dict) else {}
         fence = properties.get("executionFence", {}) if isinstance(properties, dict) else {}
         request = properties.get("executionRequest", {}) if isinstance(properties, dict) else {}
         protocol = properties.get("executionProtocol", {}) if isinstance(properties, dict) else {}
+        pending = (
+            status_properties.get("pendingPodCreate", {})
+            if isinstance(status_properties, dict)
+            else {}
+        )
         if not isinstance(rules, list):
             rules = []
+        if not isinstance(root_rules, list):
+            root_rules = []
         required_fence_fields = fence.get("required", []) if isinstance(fence, dict) else []
         required_request_fields = request.get("required", []) if isinstance(request, dict) else []
+        required_pending_fields = pending.get("required", []) if isinstance(pending, dict) else []
         if not isinstance(required_fence_fields, list):
             required_fence_fields = []
         if not isinstance(required_request_fields, list):
             required_request_fields = []
+        if not isinstance(required_pending_fields, list):
+            required_pending_fields = []
         installed_rules = {
             rule.get("rule")
             for rule in rules
             if isinstance(rule, dict) and isinstance(rule.get("rule"), str)
         }
+        installed_root_rules = {
+            rule.get("rule")
+            for rule in root_rules
+            if isinstance(rule, dict) and isinstance(rule.get("rule"), str)
+        }
         if not (
             _WORKLOAD_EXECUTION_RULES <= installed_rules
+            and _WORKLOAD_PENDING_CREATE_RULE in installed_root_rules
             and isinstance(fence, dict)
             and set(required_fence_fields)
             >= {
@@ -532,6 +554,9 @@ class FleetRightWorkloadTarget(KubernetesTarget):
             >= {"planID", "operationID", "generation", "expectedReplicas", "targetReplicas"}
             and isinstance(protocol, dict)
             and protocol.get("enum") == ["monotonic-scale-up-v1"]
+            and isinstance(pending, dict)
+            and set(required_pending_fields)
+            >= {"workloadUID", "workloadGeneration", "podName", "replicaID"}
         ):
             raise TargetPreconditionFailed("FleetRightWorkload execution CRD is not installed")
 
@@ -573,6 +598,10 @@ class FleetRightWorkloadTarget(KubernetesTarget):
             or (request is not None and not isinstance(request, dict))
             or (fence is not None and not isinstance(fence, dict))
             or (execution is not None and not isinstance(execution, dict))
+            or (
+                status.get("pendingPodCreate") is not None
+                and not isinstance(status.get("pendingPodCreate"), dict)
+            )
         ):
             raise TargetError("FleetRightWorkload identity or status is invalid")
         if metadata.get("name") != name:
@@ -645,6 +674,7 @@ class FleetRightWorkloadTarget(KubernetesTarget):
             "execution_request": request,
             "execution_fence": fence,
             "execution": execution,
+            "pending_pod_create": status.get("pendingPodCreate"),
         }
 
     def fence_scale(
@@ -666,6 +696,8 @@ class FleetRightWorkloadTarget(KubernetesTarget):
         ):
             raise TargetPreconditionFailed("invalid workload execution fence")
         current = self.observe_scale(workload_id)
+        if current["pending_pod_create"] is not None:
+            raise ActionBlocked("POD_CREATE_OUTCOME_UNKNOWN")
         if current["uid"] != expected.get("uid"):
             raise TargetPreconditionFailed("FleetRightWorkload identity changed")
         request = current["execution_request"]
@@ -805,6 +837,8 @@ class FleetRightWorkloadTarget(KubernetesTarget):
         ):
             raise TargetPreconditionFailed("invalid durable workload authorization")
         current = self.observe_scale(workload_id)
+        if current["pending_pod_create"] is not None:
+            raise ActionBlocked("POD_CREATE_OUTCOME_UNKNOWN")
         request = current["execution_request"]
         same = (
             isinstance(request, dict)
@@ -1088,9 +1122,7 @@ class DockerComposeTarget:
             if not isinstance(state, dict) or state.get("Running") is not True:
                 continue
             health = state.get("Health")
-            if health is None or (
-                isinstance(health, dict) and health.get("Status") == "healthy"
-            ):
+            if health is None or (isinstance(health, dict) and health.get("Status") == "healthy"):
                 ready += 1
         return {
             "uid": identity,
@@ -1115,9 +1147,7 @@ class DockerComposeTarget:
         service = self._service(workload_id)
         if replicas > 1:
             try:
-                output = self._compose(
-                    "config", "--no-interpolate", "--format", "json"
-                ).stdout
+                output = self._compose("config", "--no-interpolate", "--format", "json").stdout
                 config = json.loads(output)
                 ports = config["services"][service].get("ports", [])
             except (AttributeError, json.JSONDecodeError, KeyError, TypeError) as error:

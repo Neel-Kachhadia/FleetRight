@@ -45,10 +45,9 @@ execution and scale-down are disabled. Kubernetes execution requires an explicit
 kubeconfig and narrowly scoped RBAC.
 
 The 2026-10-10 live Kind qualification passed authenticated API-to-PostgreSQL-to-Kubernetes
-scale-up and process takeover. On 2026-10-11 the three lab Nodes were still Ready, but CoreDNS was
-0/2 Ready, kube-proxy was failing on all three Nodes, and local-path storage was restarting. The
-existing FleetRight controller and workload were Running, with `cpu-api` at 4/4 Ready; the opt-in
-scale-up test requires a 3/3 baseline and was not run. The saved live negative control from
+scale-up and process takeover. A read on 2026-10-11 found all three lab Nodes Ready, all system
+Pods Running/Ready, and the existing `cpu-api` workload at 4/4 Ready. The opt-in scale-up test
+requires a 3/3 baseline and was not rerun. The saved live negative control from
 2026-10-08 demonstrates that an unready same-UID Pod
 under `IfHealthyBudget` can be evicted after its resourceVersion changes even when the PDB reports
 zero allowed disruptions. PostgreSQL leases, a Pod UID, and a resourceVersion check do not fence
@@ -72,18 +71,22 @@ owner/logical-slot identity. The API, C++ planner, and independent verifier reje
 Deployment/ReplicaSet owner fields. This resolves the inventory owner-shape mismatch for planning;
 it does not establish destructive execution authority. The FleetRightWorkload PDB still uses
 `replicas - availabilityFloor` for `maxUnavailable`; it does not encode the profile-derived minimum
-replicas or N-1 reserve required by V2. The stale in-flight Pod CREATE regression still permits an
-old request to recreate a removed ordinal after takeover. Keep staged replacement, Eviction, and node
-drain disabled.
+replicas or N-1 reserve required by V2. The 2026-10-11 worktree journals new Pod CREATE intents in
+workload status, retains unresolved outcomes, and blocks scale-authority updates while an intent is
+pending. A CRD root validation rule prevents spec changes during that window. This does not cancel a
+pre-upgrade or already admitted CREATE and does not add a retired-slot tombstone; the delayed-CREATE
+regression for a removed ordinal remains a safety failure. An unresolved marker can block
+reconciliation indefinitely. Keep staged replacement, Eviction, and node drain disabled.
 
 V2 `MOVE_REPLICA`, `DEACTIVATE_NODE`, and resource resizing are rejected during planning admission
 and again before execution-journal creation. Durable staged replacement, PDB-safe eviction,
 partial-drain recovery, and live compensation are not implemented. The V2 contract and independent
 C++ verifier cover bounded placement/resource/topology/N-1 outcomes, but V2 plans remain inadmissible
 for execution because no target enforces the required operation authority and staged mutation
-protocol. The complete authenticated API-to-live-Kubernetes-workload takeover path is also not yet
-qualified. Docker process-crash takeover and target timeout after a real scale-up are tested, but
-only for monotonic scale-up; destructive-operation recovery and compensation remain unqualified.
+protocol. The authenticated API-to-live-Kubernetes scale-up and takeover path passed on 2026-10-10;
+it does not qualify destructive operations. Docker process-crash takeover and target timeout after
+a real scale-up are tested, but only for monotonic scale-up; destructive-operation recovery and
+compensation remain unqualified.
 The local Deployment recipe is a health fixture, not a current EXECUTE target; there is no checked-in
 sample `FleetRightWorkload` resource or turnkey live setup recipe yet.
 See [ADR-008](adr/008-staged-evacuation-execution.md).

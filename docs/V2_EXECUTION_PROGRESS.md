@@ -1,5 +1,76 @@
 # V2 Execution Progress
 
+## 2026-10-11 Prompt 2B continuation — partial CREATE intent barrier
+
+**Scope:** Prompt 2B only. Prompt 3 has not started.
+
+**Session start:** 2026-10-11 08:16:37 UTC; target finish 13:46:37 UTC;
+absolute hard stop 14:16:37 UTC.
+
+**Branch / starting HEAD:** `phase4/safe-execution-reconciliation` /
+`33c2870ac57bbca703c172d13937c849b75a05e9`. Tracked worktree was clean at
+start; pre-existing untracked `graphify-out/` was preserved. No push or
+milestone-4 tag was made.
+
+**Decision:** INCOMPLETE. The current worktree adds a bounded pending-Pod-CREATE
+barrier for new controller requests and rejects duplicate Node UIDs in V2
+snapshots. It does not fence a pre-upgrade request already admitted by
+Kubernetes and does not implement retired-slot tombstones, staged replacement,
+Eviction, node drain, or destructive compensation. Keep destructive V2 actions
+disabled.
+
+### Implementation and evidence
+
+| Check | Result | Evidence |
+|---|---|---|
+| V2 identity | PASS | Existing owner-contract v1 remains in use; the planner now rejects duplicate Node UIDs. `EvacuationV2Test.RejectsDuplicateNodeUids` plus the existing owner-drift tests pass. |
+| New controller CREATE protocol | PASS, unit-level | `status.pendingPodCreate` binds workload UID, generation, deterministic Pod name, and logical slot. The controller reserves it before POST, retains it on unknown outcomes, observes the exact owner/slot/generation and approved placement after restart, and clears it only after known resolution. Tests cover delayed response, lost reservation response, lost CREATE response, CAS conflict, wrong generation, and definitive rejection. |
+| Legacy delayed CREATE after slot removal | FAIL, reproduced | `test_pre_upgrade_inflight_create_can_recreate_a_retired_slot` models a CREATE admitted before the marker protocol; after takeover and source removal it creates a new Pod UID whose allowed placement still includes the source Node. This is a passing reproduction of the unsafe behavior, not a safety pass. |
+| Target/CRD guard | PASS, unit/API dry-run | Target preflight requires the pending marker schema and root CEL rule; target fence/authorization reject a pending marker. The API-server accepted `kubectl apply --dry-run=server -f deploy/kubernetes/fleetrightworkload-crd.yaml`. The updated CRD/controller were not deployed to the cluster. |
+| Python + PostgreSQL | PASS, 181 passed, 4 skipped, 1 warning | `.venv/bin/python -m pytest -q python/tests`; captured at `/tmp/fleetright-pytest-final.log`. The configured isolated `fleetright_test` database was accessed by the real test driver. Skips are opt-in Docker/Kind cases. |
+| Docker Compose E2E + PostgreSQL | PASS, 184 passed, 1 skipped, 1 warning | `FLEETRIGHT_RUN_DOCKER_E2E=1 .venv/bin/python -m pytest -q python/tests`; captured at `/tmp/fleetright-docker-e2e-final.log`. The remaining skip is the opt-in Kind E2E. |
+| C++ | PASS, 38/38 | `cmake --build build --target fleetright_cpp_tests fleetright-plan fleetright-verify -j2`; `ctest --test-dir build --output-on-failure`. |
+| Ruff / compile / diff | PASS, changed files | `ruff check python`, changed-file `ruff format --check`, Python `compileall`, and `git diff --check` pass. Repository-wide format check still reports three untouched files: `experiment.py`, `reconciler.py`, and `test_prompt2b_journal.py`. |
+| Safety-lab read | PASS, read-only | 3/3 Nodes Ready, all listed system Pods Running/Ready, controller 1/1, `cpu-api` 4/4 Ready in `fleetright-v2`. The opt-in live test requires 3/3, so it was not run. No Kind resource was mutated this session. |
+
+The reservation protocol is intentionally limited. The CRD root validation
+prevents spec changes while a new, journaled CREATE is unresolved. It cannot
+cancel an old admitted request that has no marker; an unresolved marker may
+block reconciliation indefinitely. This does not prove source retirement or
+make eviction safe.
+
+### Current operation boundary
+
+| Operation | State |
+|---|---|
+| `SCALE_UP` | ENABLED for existing monotonic Kubernetes and supported Docker paths; Docker regression passed in this session. The current Kind scale-up/takeover test was not rerun. |
+| `SCALE_DOWN` | Docker admission remains evidence-gated; Kubernetes DISABLED. No new live scale-down qualification. |
+| `MOVE_REPLICA` | DISABLED |
+| `EVICT_SOURCE` | DISABLED |
+| `DEACTIVATE_NODE` | UNSUPPORTED / rejected |
+| `DRAIN_NODE` | DISABLED |
+| destructive `COMPENSATE` | DISABLED / not implemented |
+
+### Skills and independent review
+
+- Frontier Engineering Max instructions and actual local interfaces were
+  inspected; this session did not run as the requested GPT-6 Luna Max executor.
+- Caveman Ultra and Ponytail full remained active. The existing Graphify map
+  was reused; it was not regenerated.
+- GPT-6.1 Sol High reviewed the V2 owner/controller contract and supplied the
+  duplicate-Node-UID fix and test. GPT-6.1 Sol Max reviewed the CREATE fence;
+  findings on Merge Patch deletion, unresolved outcomes, CAS orderings, and
+  mixed-version spec writes were addressed in code/tests.
+- The Claude Sonnet 5.5 High wrapper verified first-party subscription access,
+  but the inference request failed with DNS `EAI_AGAIN` before review; no
+  Claude result is claimed. Opus was not invoked because no destructive
+  execution implementation reached its review boundary.
+
+**Next exact task:** prove a retirement/quiescence protocol that also handles a
+CREATE admitted before controller takeover, or keep retired-slot mutation and
+all dependent destructive actions disabled. Prompt 2B remains incomplete; do
+not create `milestone-4-safe-control-plane`.
+
 ## 2026-10-11 Prompt 2B continuation — owner contract and safety gate
 
 **Session start:** 2026-10-11 07:41:47 UTC; target finish 13:11:47 UTC;

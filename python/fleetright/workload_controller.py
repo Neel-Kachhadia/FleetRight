@@ -304,6 +304,23 @@ def _pod_name(workload_uid: str, ordinal: int) -> str:
     return f"frw-{identity}-r{ordinal}"
 
 
+def _pod_create_intent(workload: dict[str, Any], ordinal: int) -> dict[str, Any]:
+    metadata, spec = workload["metadata"], workload["spec"]
+    intent = {
+        "workloadUID": metadata["uid"],
+        "workloadGeneration": metadata["generation"],
+        "podName": _pod_name(metadata["uid"], ordinal),
+        "replicaID": f"{spec['workloadID']}-{ordinal}",
+    }
+    request = spec.get("executionRequest")
+    if isinstance(request, dict):
+        intent.update(
+            planID=request["planID"],
+            operationID=request["operationID"],
+        )
+    return intent
+
+
 def _selector(workload_uid: str) -> str:
     return f"{WORKLOAD_UID_LABEL}={workload_uid}"
 
@@ -412,6 +429,7 @@ def _pod_object(workload: dict[str, Any], ordinal: int) -> dict[str, Any]:
             "annotations": {
                 **template.get("annotations", {}),
                 TEMPLATE_HASH_ANNOTATION: _placement_fingerprint(spec, template),
+                WORKLOAD_GENERATION_ANNOTATION: str(metadata["generation"]),
             },
             "ownerReferences": [_owner_reference(workload)],
         },
@@ -731,6 +749,8 @@ def _status(
     }
     if isinstance(old.get("execution"), dict):
         status["execution"] = old["execution"]
+    if isinstance(old.get("pendingPodCreate"), dict):
+        status["pendingPodCreate"] = old["pendingPodCreate"]
     return status
 
 
@@ -843,6 +863,56 @@ def _write_execution_phase(api: Any, workload: dict[str, Any], phase: str) -> No
     workload["status"] = status
 
 
+def _write_pending_pod_create(api: Any, workload: dict[str, Any], intent: dict[str, Any]) -> None:
+    # shortcut: old CREATEs lack a marker; add retirement fencing before destructive actions.
+    old_status = workload.get("status", {})
+    if old_status.get("pendingPodCreate") is not None:
+        raise SafetyError("PodCreateOutcomeUnknown", "another Pod create outcome is unresolved")
+    status = {**old_status, "pendingPodCreate": intent}
+    result = api.patch_status(
+        workload["metadata"]["name"], workload["metadata"]["resourceVersion"], status
+    )
+    metadata = result.get("metadata", {}) if isinstance(result, dict) else {}
+    returned_status = result.get("status") if isinstance(result, dict) else None
+    if (
+        not isinstance(metadata.get("resourceVersion"), str)
+        or not isinstance(returned_status, dict)
+        or returned_status.get("pendingPodCreate") != intent
+    ):
+        raise SafetyError(
+            "PodCreateOutcomeUnknown", "Kubernetes did not confirm the durable Pod create intent"
+        )
+    workload["metadata"]["resourceVersion"] = metadata["resourceVersion"]
+    workload["status"] = status
+
+
+def _clear_pending_pod_create(api: Any, workload: dict[str, Any]) -> bool:
+    status = dict(workload.get("status", {}))
+    status["pendingPodCreate"] = None
+    try:
+        result = api.patch_status(
+            workload["metadata"]["name"], workload["metadata"]["resourceVersion"], status
+        )
+    except ApiError as error:
+        if error.status == 409:
+            return False
+        raise
+    metadata = result.get("metadata", {}) if isinstance(result, dict) else {}
+    returned_status = result.get("status") if isinstance(result, dict) else None
+    if (
+        not isinstance(metadata.get("resourceVersion"), str)
+        or not isinstance(returned_status, dict)
+        or returned_status.get("pendingPodCreate") is not None
+    ):
+        raise SafetyError(
+            "PodCreateOutcomeUnknown", "Kubernetes did not confirm Pod create intent resolution"
+        )
+    workload["metadata"]["resourceVersion"] = metadata["resourceVersion"]
+    status.pop("pendingPodCreate")
+    workload["status"] = status
+    return True
+
+
 def _ensure_pdb(api: Any, workload: dict[str, Any]) -> None:
     desired = _pdb_object(workload)
     name = desired["metadata"]["name"]
@@ -903,6 +973,48 @@ def reconcile_workload(api: Any, workload: dict[str, Any], nodes: list[dict[str,
             raise SafetyError("InvalidIdentity", "workload UID is required")
         pods = api.list_pods(uid)
         _, approved_uids = _validate_spec(workload, nodes)
+
+        pending = workload.get("status", {}).get("pendingPodCreate")
+        if pending is not None:
+            if (
+                not isinstance(pending, dict)
+                or not all(
+                    isinstance(pending.get(key), str) and pending[key]
+                    for key in ("workloadUID", "podName", "replicaID")
+                )
+                or type(pending.get("workloadGeneration")) is not int
+            ):
+                raise SafetyError(
+                    "PodCreateIdentityConflict", "pending Pod create identity is invalid"
+                )
+            if pending["workloadUID"] != uid:
+                raise SafetyError(
+                    "PodCreateIdentityConflict", "pending Pod create workload changed"
+                )
+            if (pending.get("planID") is None) != (pending.get("operationID") is None):
+                raise SafetyError(
+                    "PodCreateIdentityConflict", "pending Pod create operation is invalid"
+                )
+            pending_pod = api.get_pod(pending["podName"])
+            if pending_pod is None:
+                return
+            ordinal = _check_existing_pod(pending_pod, workload)
+            annotations = pending_pod.get("metadata", {}).get("annotations", {})
+            if (
+                pending["podName"] != _pod_name(uid, ordinal)
+                or pending["replicaID"] != f"{workload['spec']['workloadID']}-{ordinal}"
+                or annotations.get(WORKLOAD_GENERATION_ANNOTATION)
+                != str(pending["workloadGeneration"])
+            ):
+                raise SafetyError(
+                    "PodCreateIdentityConflict", "observed Pod does not match its create intent"
+                )
+            _validate_scheduled_pod(pending_pod, approved_uids, nodes)
+            if all(pod.get("metadata", {}).get("name") != pending["podName"] for pod in pods):
+                pods.append(pending_pod)
+            if not _clear_pending_pod_create(api, workload):
+                return
+
         _validate_execution_request(workload)
         _ensure_pdb(api, workload)
         pods_by_ordinal: dict[int, dict[str, Any]] = {}
@@ -995,6 +1107,8 @@ def reconcile_workload(api: Any, workload: dict[str, Any], nodes: list[dict[str,
                 pods.append(pod)
                 live_count += 1
                 continue
+            intent = _pod_create_intent(workload, ordinal)
+            _write_pending_pod_create(api, workload, intent)
             try:
                 created = api.create_pod(_pod_object(workload, ordinal))
             except ApiError as error:
@@ -1006,17 +1120,30 @@ def reconcile_workload(api: Any, workload: dict[str, Any], nodes: list[dict[str,
                             "Pod create conflicted but the deterministic name is not observable",
                         ) from error
                     _check_existing_pod(existing, workload)
+                    if existing.get("metadata", {}).get("annotations", {}).get(
+                        WORKLOAD_GENERATION_ANNOTATION
+                    ) != str(intent["workloadGeneration"]):
+                        raise SafetyError(
+                            "PodCreateIdentityConflict",
+                            "existing Pod does not match the pending create generation",
+                        ) from error
                     _validate_scheduled_pod(existing, approved_uids, nodes)
+                    if not _clear_pending_pod_create(api, workload):
+                        return
                     pods_by_ordinal[ordinal] = existing
                     pods.append(existing)
                     live_count += 1
                     continue
-                if error.status in {400, 403, 422}:
+                if error.status in {400, 403, 422, 429}:
+                    if not _clear_pending_pod_create(api, workload):
+                        return
                     raise SafetyError(
                         "PodCreateRejectedByAPIServer",
                         f"Kubernetes API rejected Pod creation (HTTP {error.status})",
                     ) from error
                 raise
+            if not _clear_pending_pod_create(api, workload):
+                return
             pods_by_ordinal[ordinal] = created
             pods.append(created)
             live_count += 1

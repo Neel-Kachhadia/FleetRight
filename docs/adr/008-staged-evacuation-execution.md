@@ -13,9 +13,14 @@ workload owner; it does not authorize destructive execution.
 
 The delayed-CREATE regression still demonstrates that an old admitted Pod
 request can complete after takeover and source-slot removal. The current
-workload object CAS is not atomic with Pod CREATE or Eviction storage. No
-target-side dispatch authority or retired-slot exclusion barrier has been
-implemented, and destructive V2 actions remain disabled.
+workload object CAS is not atomic with Pod CREATE or Eviction storage. The
+current worktree adds a `status.pendingPodCreate` reservation before new
+controller CREATE requests, retains it on unknown outcomes, and blocks
+scale-authority changes while it is present. A root CRD validation rule keeps
+the workload spec unchanged until that intent is resolved. This is a limited
+barrier for participating, upgraded writers; it neither cancels an already
+admitted request nor represents retired-slot intent. Destructive V2 actions
+remain disabled.
 
 ## Context
 
