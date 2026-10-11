@@ -1113,7 +1113,7 @@ def _write_execution_phase(api: Any, workload: dict[str, Any], phase: str) -> No
 
 
 def _write_pending_pod_create(api: Any, workload: dict[str, Any], intent: dict[str, Any]) -> None:
-    # shortcut: old CREATEs lack a marker; add retirement fencing before destructive actions.
+    # shortcut: reservation covers participating writers; add API-server fencing before retirement.
     old_status = workload.get("status", {})
     if old_status.get("pendingPodCreate") is not None:
         raise SafetyError("PodCreateOutcomeUnknown", "another Pod create outcome is unresolved")
@@ -1222,7 +1222,7 @@ def _write_retired_slot_tombstone(
     operation_id: str,
     nodes: list[dict[str, Any]],
 ) -> None:
-    # The durable tombstone must win before any source Pod deletion is attempted.
+    # shortcut: CR status cannot fence admitted CREATE; upgrade before enabling retirement.
     if not all(isinstance(value, str) and value for value in (plan_id, operation_id)):
         raise SafetyError("InvalidRetirementIntent", "retirement operation identity is required")
     _, approved_uids = _validate_spec(workload, nodes)
@@ -1233,7 +1233,34 @@ def _write_retired_slot_tombstone(
         raise SafetyError(
             "PodCreateHistoryUncertain", "unresolved Pod create history blocks retirement"
         )
-    metadata = pod["metadata"]
+    _check_existing_pod(pod, workload)
+    supplied_metadata = pod["metadata"]
+    supplied_record = {
+        "workloadUID": workload["metadata"]["uid"],
+        "replicaID": supplied_metadata["labels"][REPLICA_ID_LABEL],
+        "podUID": supplied_metadata["uid"],
+        "workloadGeneration": int(supplied_metadata["annotations"][WORKLOAD_GENERATION_ANNOTATION]),
+        "planID": plan_id,
+        "operationID": operation_id,
+    }
+    retired = list(_retired_replica_slots(workload))
+    existing = next(
+        (item for item in retired if item["replicaID"] == supplied_record["replicaID"]), None
+    )
+    if existing is not None and existing != supplied_record:
+        raise SafetyError(
+            "RetirementIdentityConflict", "logical slot already has another tombstone"
+        )
+    current = api.get_pod(supplied_metadata["name"])
+    if current is None:
+        if existing is not None:
+            return
+        raise SafetyError("RetirementIdentityConflict", "source Pod disappeared before tombstoning")
+    if current.get("metadata", {}).get("uid") != supplied_metadata.get("uid"):
+        raise SafetyError("RetirementIdentityConflict", "source Pod UID changed before tombstoning")
+    _check_existing_pod(current, workload)
+    _validate_scheduled_pod(current, approved_uids, nodes)
+    metadata = current["metadata"]
     annotations = metadata["annotations"]
     record = {
         "workloadUID": workload["metadata"]["uid"],
@@ -1243,19 +1270,12 @@ def _write_retired_slot_tombstone(
         "planID": plan_id,
         "operationID": operation_id,
     }
-    retired = list(_retired_replica_slots(workload))
-    existing = next((item for item in retired if item["replicaID"] == record["replicaID"]), None)
     if existing is not None and existing != record:
         raise SafetyError(
             "RetirementIdentityConflict", "logical slot already has another tombstone"
         )
     if existing is not None:
         return
-    _check_existing_pod(pod, workload)
-    _validate_scheduled_pod(pod, approved_uids, nodes)
-    current = api.get_pod(pod["metadata"]["name"])
-    if current is None or current.get("metadata", {}).get("uid") != pod["metadata"]["uid"]:
-        raise SafetyError("RetirementIdentityConflict", "source Pod UID changed before tombstoning")
     retired.append(record)
     status = {**old_status, "retiredReplicaSlots": retired}
     result = api.patch_status(

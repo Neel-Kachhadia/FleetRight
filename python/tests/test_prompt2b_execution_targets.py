@@ -1184,6 +1184,37 @@ def test_workload_scale_down_is_rejected_before_any_mutation(
         )
 
 
+def test_workload_scale_down_is_blocked_while_pod_create_is_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = FleetRightWorkloadTarget(namespace="fleetright-v2")
+    state = _workload_object()
+    state["status"]["pendingPodCreate"] = {
+        "workloadUID": "workload-uid",
+        "workloadGeneration": 4,
+        "podName": "frw-pending",
+        "replicaID": "cpu-api-2",
+        "planID": "plan-1",
+        "operationID": "action-1",
+        "createID": "attempt-1",
+    }
+    before = target._observe(state, "cpu-api")
+    monkeypatch.setattr(target, "observe_scale", lambda _name: before)
+    monkeypatch.setattr(
+        target, "_json", lambda *_args: pytest.fail("pending CREATE reached a Kubernetes patch")
+    )
+
+    with pytest.raises(ActionBlocked, match="POD_CREATE_OUTCOME_UNKNOWN"):
+        target.authorize_scale(
+            "cpu-api",
+            13,
+            expected=before,
+            plan_id="plan-1",
+            operation_id="retire-1",
+            target_replicas=1,
+        )
+
+
 def test_workload_takeover_blocks_new_operation_until_prior_request_is_applied(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

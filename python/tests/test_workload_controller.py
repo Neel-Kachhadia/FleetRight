@@ -24,6 +24,7 @@ from fleetright.workload_controller import (
     _pod_name,
     _pod_object,
     _validate_spec,
+    _write_pending_pod_create,
     _write_retired_slot_tombstone,
     reconcile_workload,
 )
@@ -521,6 +522,131 @@ def test_retired_slot_tombstone_survives_controller_takeover_and_blocks_recreati
     assert api.pods == {}
     assert api.status["retiredReplicaSlots"][0]["replicaID"] == "api-0"
     assert api.status["conditions"][2]["reason"] == "RetiredReplicaRequiresNewOperation"
+
+
+def test_retirement_replay_revalidates_live_source_uid() -> None:
+    api = FakeAPI()
+    workload = _workload()
+    reconcile_workload(api, workload, _nodes())
+    source = deepcopy(next(iter(api.pods.values())))
+    _write_retired_slot_tombstone(api, workload, source, "plan-retire", "retire-1", _nodes())
+
+    api.pods[source["metadata"]["name"]]["metadata"]["uid"] = "replacement-pod-uid"
+
+    with pytest.raises(SafetyError, match="source Pod UID changed"):
+        _write_retired_slot_tombstone(api, workload, source, "plan-retire", "retire-1", _nodes())
+
+
+def test_retirement_rejects_unresolved_current_create() -> None:
+    api = FakeAPI()
+    workload = _workload()
+    reconcile_workload(api, workload, _nodes())
+    source = deepcopy(next(iter(api.pods.values())))
+    workload["status"]["pendingPodCreate"] = {
+        "workloadUID": workload["metadata"]["uid"],
+        "workloadGeneration": workload["metadata"]["generation"],
+        "podName": _pod_name(workload["metadata"]["uid"], 1),
+        "replicaID": "api-1",
+        "planID": "plan-1",
+        "operationID": "scale-up-1",
+        "createID": "attempt-1",
+    }
+
+    with pytest.raises(SafetyError, match="unresolved Pod create history blocks retirement"):
+        _write_retired_slot_tombstone(api, workload, source, "plan-retire", "retire-1", _nodes())
+
+    assert not api.status.get("retiredReplicaSlots")
+
+
+def test_retirement_rejects_legacy_create_provenance() -> None:
+    api = FakeAPI()
+    workload = _workload()
+    reconcile_workload(api, workload, _nodes())
+    source = deepcopy(next(iter(api.pods.values())))
+    legacy = deepcopy(workload)
+    legacy["spec"].pop("podCreateProtocol")
+
+    with pytest.raises(SafetyError, match="legacy workload UID has untracked Pod CREATE history"):
+        _write_retired_slot_tombstone(api, legacy, source, "plan-retire", "retire-1", _nodes())
+
+    assert not api.status.get("retiredReplicaSlots")
+
+
+@pytest.mark.parametrize("winner", ["retirement", "reservation"])
+def test_retirement_and_create_reservation_race_uses_status_cas(winner: str) -> None:
+    class CASAPI(FakeAPI):
+        def __init__(self) -> None:
+            super().__init__()
+            self.cas_version: str | None = None
+            self.cas_lock = threading.Lock()
+            self.entered = {name: Event() for name in ("retirement", "reservation")}
+            self.release = {name: Event() for name in ("retirement", "reservation")}
+
+        def patch_status(
+            self, name: str, resource_version: str, status: dict[str, Any]
+        ) -> dict[str, Any]:
+            if self.cas_version is None:
+                return super().patch_status(name, resource_version, status)
+            kind = "retirement" if "retiredReplicaSlots" in status else "reservation"
+            self.entered[kind].set()
+            assert self.release[kind].wait(timeout=3)
+            with self.cas_lock:
+                if resource_version != self.cas_version:
+                    raise ApiError(409, "resourceVersion conflict")
+                result = super().patch_status(name, resource_version, status)
+                self.cas_version = str(int(resource_version) + 1)
+                return result
+
+    api = CASAPI()
+    workload = _workload()
+    reconcile_workload(api, workload, _nodes())
+    api.cas_version = workload["metadata"]["resourceVersion"]
+    source = next(iter(api.pods.values()))
+    retirement_workload = deepcopy(workload)
+    reservation_workload = deepcopy(workload)
+    intent = {
+        "workloadUID": workload["metadata"]["uid"],
+        "workloadGeneration": workload["metadata"]["generation"],
+        "podName": _pod_name(workload["metadata"]["uid"], 1),
+        "replicaID": "api-1",
+        "planID": "plan-scale-up",
+        "operationID": "scale-up-1",
+        "createID": "attempt-1",
+    }
+
+    def persist_retirement() -> str:
+        try:
+            _write_retired_slot_tombstone(
+                api, retirement_workload, source, "plan-retire", "retire-1", _nodes()
+            )
+            return "persisted"
+        except ApiError as error:
+            assert error.status == 409
+            return "conflict"
+
+    def persist_reservation() -> str:
+        try:
+            _write_pending_pod_create(api, reservation_workload, intent)
+            return "persisted"
+        except ApiError as error:
+            assert error.status == 409
+            return "conflict"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        retirement = pool.submit(persist_retirement)
+        reservation = pool.submit(persist_reservation)
+        assert api.entered["retirement"].wait(timeout=3)
+        assert api.entered["reservation"].wait(timeout=3)
+        api.release[winner].set()
+        winner_future = reservation if winner == "reservation" else retirement
+        assert winner_future.result(timeout=3) == "persisted"
+        loser = retirement if winner == "reservation" else reservation
+        api.release["retirement" if winner == "reservation" else "reservation"].set()
+        assert loser.result(timeout=3) == "conflict"
+
+    assert len(api.pods) == 1
+    assert bool(api.status.get("retiredReplicaSlots")) == (winner == "retirement")
+    assert (api.status.get("pendingPodCreate") is not None) == (winner == "reservation")
 
 
 def test_authorized_create_history_capacity_blocks_before_pod_post() -> None:
