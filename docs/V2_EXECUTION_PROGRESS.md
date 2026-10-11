@@ -26,6 +26,8 @@ untracked `graphify-out/` was preserved.
   `VALIDATE_REPLACEMENT` with `REPLACEMENT_POD_IDENTITY_UNAVAILABLE`. Even with
   a replacement identity, the target retains the separate
   `POD_CREATE_PERSISTENCE_FENCE_UNPROVEN` block before any tombstone write.
+- A target regression supplies a stable replacement Pod UID and confirms the
+  production adapter still blocks at `POD_CREATE_PERSISTENCE_FENCE_UNPROVEN`.
 - Read-only retirement actions recover after takeover: the new controller
   records a `no_target_mutation` receipt, rechecks the workload, and resumes the
   gate. Mutating target adapters are not takeover-qualified. Pause/cancel
@@ -75,7 +77,7 @@ untracked `graphify-out/` was preserved.
 
 | Check | Result | Evidence / limit |
 |---|---|---|
-| Affected Python suites | PASS, 185 passed / 4 skipped | Workload controller, execution targets, V2 planner, PostgreSQL journal and control API. Four optional E2E tests skipped; one existing Starlette deprecation warning. |
+| Affected Python suites | PASS, 186 passed / 4 skipped | Workload controller, execution targets, V2 planner, PostgreSQL journal and control API. Four optional E2E tests skipped; one existing Starlette deprecation warning. |
 | PostgreSQL journal and API | PASS | Full affected suite ran against the authenticated local PostgreSQL test DB; includes failed-safe admission, duplicate execute, unknown outcome, crash/takeover, and pause recovery. |
 | Production API -> journal -> controller -> target | PASS, fail-closed | V2 plan action matches reverified artifacts; live-source identity reads pass in the deterministic adapter, missing replacement UID is recorded as `VALIDATE_REPLACEMENT`, and plan ends `FAILED_SAFE`. This is not a successful retirement preparation. |
 | Original delayed CREATE race | PASS as a hazard reproduction | Late Pod UID remains unverified and does not count as Ready capacity. |
