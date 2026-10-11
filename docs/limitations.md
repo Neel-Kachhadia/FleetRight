@@ -73,10 +73,12 @@ it does not establish destructive execution authority. The FleetRightWorkload PD
 `replicas - availabilityFloor` for `maxUnavailable`; it does not encode the profile-derived minimum
 replicas or N-1 reserve required by V2. The 2026-10-11 worktree journals new Pod CREATE intents in
 workload status, retains unresolved outcomes, and blocks scale-authority updates while an intent is
-pending. A CRD root validation rule prevents spec changes during that window. This does not cancel a
-pre-upgrade or already admitted CREATE and does not add a retired-slot tombstone; the delayed-CREATE
-regression for a removed ordinal remains a safety failure. An unresolved marker can block
-reconciliation indefinitely. Keep staged replacement, Eviction, and node drain disabled.
+pending. The additive CRD rule is installed in the isolated lab and a live server-side update probe
+confirmed it rejects spec changes while the marker exists; the new controller code itself was not
+deployed. This does not cancel a pre-upgrade or already admitted CREATE and does not add a
+retired-slot tombstone; the delayed-CREATE regression for a removed ordinal remains a safety
+failure. An unresolved marker can block reconciliation indefinitely. Keep staged replacement,
+Eviction, and node drain disabled.
 
 V2 `MOVE_REPLICA`, `DEACTIVATE_NODE`, and resource resizing are rejected during planning admission
 and again before execution-journal creation. Durable staged replacement, PDB-safe eviction,
