@@ -50,6 +50,8 @@ enum IntermediateStateKind {
 message ControllerIdentity {
   string workload_id = 1;
   string namespace = 2;
+  // Legacy Deployment/ReplicaSet identity fields; new snapshots must leave
+  // these and active_replicaset_count empty and use the explicit owner fields.
   string deployment_name = 3;
   string deployment_uid = 4;
   string deployment_resource_version = 5;
@@ -63,6 +65,13 @@ message ControllerIdentity {
   uint32 pdb_allowed_disruptions = 13;
   string pdb_resource_version = 14;
   uint64 observed_at_ms = 15;
+  string owner_kind = 16;
+  string owner_name = 17;
+  string owner_uid = 18;
+  string owner_resource_version = 19;
+  uint64 owner_generation = 20;
+  string controller_type = 21;
+  string execution_protocol = 22;
 }
 
 message PodIdentity {
@@ -74,6 +83,10 @@ message PodIdentity {
   string controller_uid = 6;
   bool ready = 7;
   bool terminating = 8;
+  string owner_kind = 9;
+  string owner_name = 10;
+  string owner_uid = 11;
+  string logical_slot_id = 12;
 }
 
 message NodeIdentity {
@@ -93,6 +106,7 @@ message EvacuationSnapshot {
   repeated PodIdentity pods = 7;
   repeated NodeIdentity nodes = 8;
   string content_sha256 = 9;
+  uint32 owner_contract_version = 10;
 }
 
 message CapacityProfileBinding {
@@ -168,6 +182,10 @@ message EvacuationOperation {
   FailureBehavior on_failure = 31;
   // N-1 means one node-label value is unavailable as a single failure domain.
   string n_minus_1_failure_domain_key = 32;
+  string source_owner_kind = 33;
+  string source_owner_name = 34;
+  string source_owner_uid = 35;
+  string source_logical_slot_id = 36;
 }
 
 message EvacuationPlan {

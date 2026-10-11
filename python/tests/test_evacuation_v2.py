@@ -2,12 +2,22 @@ from __future__ import annotations
 
 from copy import deepcopy
 
+import pytest
 from fleetright import api as api_module
 from fleetright.contracts import decode_text, encode_text
 from fleetright.scenario import oracle_snapshot_fields
 
 
-def _v2_snapshot(now_ms: int | None = None) -> tuple[dict[str, object], bytes, dict[str, object]]:
+def _v2_snapshot(
+    now_ms: int | None = None,
+    *,
+    owner_contract_version: int = 1,
+    owner_kind: str = "FleetRightWorkload",
+    owner_uid: str = "workload-uid",
+    pod_owner_uid: str = "workload-uid",
+    controller_observed_at_ms: int | None = None,
+    include_legacy_owner: bool = False,
+) -> tuple[dict[str, object], bytes, dict[str, object]]:
     fields = oracle_snapshot_fields()
     now_ms = int(fields["evaluation_time_ms"]) if now_ms is None else now_ms
     fields.update(
@@ -29,23 +39,28 @@ def _v2_snapshot(now_ms: int | None = None) -> tuple[dict[str, object], bytes, d
         "cluster_uid": "cluster-python-test",
         "namespace": "default",
         "inventory_observed_at_ms": now_ms - 1_000,
+        "owner_contract_version": owner_contract_version,
         "controllers": [
             {
                 "workload_id": workload["workload_id"],
                 "namespace": "default",
-                "deployment_name": "api",
-                "deployment_uid": "deployment-uid",
-                "deployment_resource_version": "deployment-rv",
-                "deployment_generation": 1,
-                "replicaset_name": "api-1",
-                "replicaset_uid": "replicaset-uid",
-                "replicaset_resource_version": "replicaset-rv",
+                "owner_kind": owner_kind,
+                "owner_name": workload["workload_id"],
+                "owner_uid": owner_uid,
+                "owner_resource_version": "workload-rv",
+                "owner_generation": 1,
+                "controller_type": "fleetright-workload-controller/v1",
+                "execution_protocol": "monotonic-scale-up-v1",
                 "pod_template_sha256": "template-digest",
                 "desired_replicas": len(fields["current_placements"]),
-                "active_replicaset_count": 1,
                 "pdb_allowed_disruptions": 1,
                 "pdb_resource_version": "pdb-rv",
-                "observed_at_ms": now_ms - 1_000,
+                "observed_at_ms": (
+                    now_ms - 1_000
+                    if controller_observed_at_ms is None
+                    else controller_observed_at_ms
+                ),
+                **({"replicaset_uid": "legacy-replicaset-uid"} if include_legacy_owner else {}),
             }
         ],
         "pods": [
@@ -53,7 +68,10 @@ def _v2_snapshot(now_ms: int | None = None) -> tuple[dict[str, object], bytes, d
                 **placement,
                 "pod_name": placement["replica_id"],
                 "pod_uid": f"{placement['replica_id']}-uid",
-                "controller_uid": "replicaset-uid",
+                "owner_kind": owner_kind,
+                "owner_name": workload["workload_id"],
+                "owner_uid": pod_owner_uid,
+                "logical_slot_id": placement["replica_id"],
                 "ready": True,
                 "terminating": False,
             }
@@ -76,6 +94,59 @@ def _v2_snapshot(now_ms: int | None = None) -> tuple[dict[str, object], bytes, d
     normalized_source, payload, normalized = api_module._validate_snapshot(request_snapshot, now_ms)
     assert normalized_source["snapshot_id"] == fields["snapshot_id"]
     return normalized_source, payload, normalized
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "detail"),
+    [
+        ({"owner_contract_version": 2}, "unsupported-v2-owner-contract"),
+        ({"owner_kind": "Deployment"}, "unsupported-v2-controller-state"),
+        (
+            {"owner_uid": "new-workload-uid", "pod_owner_uid": "old-workload-uid"},
+            "v2-pod-inventory-mismatch",
+        ),
+        ({"include_legacy_owner": True}, "unknown-fields-in-v2-controller-identity"),
+    ],
+)
+def test_v2_owner_contract_rejects_legacy_or_mismatched_identity(
+    kwargs: dict[str, object], detail: str
+) -> None:
+    with pytest.raises(api_module.HTTPException) as error:
+        _v2_snapshot(**kwargs)
+    assert error.value.status_code == 422
+    assert error.value.detail == detail
+
+
+def test_v2_inventory_rejects_stale_controller_observation() -> None:
+    fields = oracle_snapshot_fields()
+    now_ms = int(fields["evaluation_time_ms"])
+    maximum_age_ms = int(fields["policy"]["maximum_snapshot_age_ms"])
+    with pytest.raises(api_module.HTTPException) as error:
+        _v2_snapshot(
+            now_ms,
+            controller_observed_at_ms=now_ms - maximum_age_ms - 1,
+        )
+    assert error.value.status_code == 409
+    assert error.value.detail == "v2-controller-observation-stale"
+
+
+def test_v2_inventory_rejects_duplicate_controller_owner_uid() -> None:
+    fields = oracle_snapshot_fields()
+    now_ms = int(fields["evaluation_time_ms"])
+    _, _, normalized = _v2_snapshot(now_ms)
+    inventory = deepcopy(normalized["evacuation_v2"])
+    existing_placements = list(fields["current_placements"])
+    fields["current_placements"] = existing_placements + [
+        {**placement, "workload_id": "worker"} for placement in existing_placements
+    ]
+    inventory["controllers"].append(
+        {**inventory["controllers"][0], "workload_id": "worker", "owner_name": "worker"}
+    )
+
+    with pytest.raises(api_module.HTTPException) as error:
+        api_module._validate_evacuation_inventory(inventory, fields, now_ms)
+    assert error.value.status_code == 422
+    assert error.value.detail == "duplicate-v2-controller-owner-uid"
 
 
 def test_v2_snapshot_hash_round_trip_and_cpp_planner_verifier() -> None:

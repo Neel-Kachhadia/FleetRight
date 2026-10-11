@@ -608,8 +608,9 @@ bool PlannerNMinusOneRecoverySafe(const EvacuationSnapshot &snapshot, const Work
 
 bool SnapshotValid(const EvacuationSnapshot &snapshot) {
   const auto &model = snapshot.model_snapshot();
-  if (snapshot.schema_version() != 2 || snapshot.cluster_uid().empty() ||
-      snapshot.namespace_().empty() || model.schema_version() != 1 || model.snapshot_id().empty() ||
+  if (snapshot.schema_version() != 2 || snapshot.owner_contract_version() != 1 ||
+      snapshot.cluster_uid().empty() || snapshot.namespace_().empty() ||
+      model.schema_version() != 1 || model.snapshot_id().empty() ||
       model.policy().schema_version() != 1 || model.machine_catalog().schema_version() != 1 ||
       model.policy().headroom_ppm() > kPpm || model.evaluation_time_ms() < model.observed_at_ms() ||
       model.expires_at_ms() <= model.evaluation_time_ms() ||
@@ -705,28 +706,36 @@ bool SnapshotValid(const EvacuationSnapshot &snapshot) {
                  p.node_id() == pod.node_id();
         });
     if (pod.workload_id().empty() || pod.replica_id().empty() || pod.pod_name().empty() ||
-        pod.pod_uid().empty() || pod.controller_uid().empty() || node == nullptr || !matches ||
-        !pod.ready() || pod.terminating() || !pod_uids.insert(pod.pod_uid()).second ||
+        pod.pod_uid().empty() || pod.owner_kind().empty() || pod.owner_name().empty() ||
+        pod.owner_uid().empty() || pod.logical_slot_id() != pod.replica_id() ||
+        !pod.controller_uid().empty() || node == nullptr || !matches || !pod.ready() ||
+        pod.terminating() || !pod_uids.insert(pod.pod_uid()).second ||
         !pod_names.insert(pod.pod_name()).second || !pod_by_key.emplace(key, &pod).second)
       return false;
   }
   std::set<std::string> controller_ids;
-  std::set<std::string> deployment_uids;
-  std::set<std::string> replicaset_uids;
+  std::set<std::string> owner_uids;
   for (const auto &controller : snapshot.controllers()) {
     if (controller.workload_id().empty() || !workload_ids.contains(controller.workload_id()) ||
-        controller.namespace_() != snapshot.namespace_() || controller.deployment_name().empty() ||
-        controller.deployment_uid().empty() || controller.deployment_resource_version().empty() ||
-        controller.deployment_generation() == 0 || controller.replicaset_name().empty() ||
-        controller.replicaset_uid().empty() || controller.replicaset_resource_version().empty() ||
-        controller.pod_template_sha256().empty() || controller.desired_replicas() == 0 ||
-        controller.active_replicaset_count() != 1 || controller.pdb_resource_version().empty() ||
+        controller.namespace_() != snapshot.namespace_() ||
+        controller.owner_kind() != "FleetRightWorkload" || controller.owner_name().empty() ||
+        controller.owner_uid().empty() || controller.owner_resource_version().empty() ||
+        controller.owner_generation() == 0 ||
+        controller.controller_type() != "fleetright-workload-controller/v1" ||
+        controller.execution_protocol() != "monotonic-scale-up-v1" ||
+        !controller.deployment_name().empty() || !controller.deployment_uid().empty() ||
+        !controller.deployment_resource_version().empty() ||
+        controller.deployment_generation() != 0 || !controller.replicaset_name().empty() ||
+        !controller.replicaset_uid().empty() || !controller.replicaset_resource_version().empty() ||
+        controller.active_replicaset_count() != 0 || controller.pod_template_sha256().empty() ||
+        controller.desired_replicas() == 0 || controller.pdb_resource_version().empty() ||
         controller.observed_at_ms() > model.evaluation_time_ms() ||
         model.evaluation_time_ms() - controller.observed_at_ms() >
             model.policy().maximum_snapshot_age_ms() ||
         !controller_ids.insert(controller.workload_id()).second ||
-        !deployment_uids.insert(controller.deployment_uid()).second ||
-        !replicaset_uids.insert(controller.replicaset_uid()).second)
+        !owner_uids.insert(controller.owner_uid()).second)
+      return false;
+    if (controller.owner_name() != controller.workload_id())
       return false;
   }
   if (controller_ids.size() != workload_ids.size())
@@ -743,7 +752,9 @@ bool SnapshotValid(const EvacuationSnapshot &snapshot) {
       return false;
     for (const auto &pod : snapshot.pods())
       if (pod.workload_id() == workload.workload_id() &&
-          pod.controller_uid() != controller->replicaset_uid())
+          (pod.owner_kind() != controller->owner_kind() ||
+           pod.owner_name() != controller->owner_name() ||
+           pod.owner_uid() != controller->owner_uid()))
         return false;
   }
   return true;
@@ -820,7 +831,10 @@ bool CompleteCandidate(const EvacuationSnapshot &snapshot, const WorkloadSpec &w
   operation->set_replica_id(source.replica_id());
   operation->set_source_pod_name(source.pod_name());
   operation->set_source_pod_uid(source.pod_uid());
-  operation->set_source_controller_uid(controller.replicaset_uid());
+  operation->set_source_owner_kind(controller.owner_kind());
+  operation->set_source_owner_name(controller.owner_name());
+  operation->set_source_owner_uid(controller.owner_uid());
+  operation->set_source_logical_slot_id(source.logical_slot_id());
   operation->set_source_node_id(source.node_id());
   for (const auto &node : snapshot.nodes())
     if (node.node_id() == source.node_id())
@@ -990,7 +1004,10 @@ v2::EvacuationPlan PlanEvacuationV2(const EvacuationSnapshot &snapshot) {
       // ponytail: one source UID per plan; expand to multiple sources only after outcome products
       // for concurrent evictions are independently enumerated and bounded.
       const auto *controller = controller_it->second;
-      if (controller->replicaset_uid() != source->controller_uid() ||
+      if (controller->owner_kind() != source->owner_kind() ||
+          controller->owner_name() != source->owner_name() ||
+          controller->owner_uid() != source->owner_uid() ||
+          source->logical_slot_id() != source->replica_id() ||
           controller->pdb_allowed_disruptions() < 1) {
         rejection_reason = "source Pod owner or observed PDB disruption is unsupported";
         continue;

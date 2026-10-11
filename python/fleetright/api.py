@@ -738,6 +738,7 @@ _EVACUATION_V2_KEYS = {
     "cluster_uid",
     "namespace",
     "inventory_observed_at_ms",
+    "owner_contract_version",
     "controllers",
     "pods",
     "nodes",
@@ -745,16 +746,15 @@ _EVACUATION_V2_KEYS = {
 _CONTROLLER_IDENTITY_KEYS = {
     "workload_id",
     "namespace",
-    "deployment_name",
-    "deployment_uid",
-    "deployment_resource_version",
-    "deployment_generation",
-    "replicaset_name",
-    "replicaset_uid",
-    "replicaset_resource_version",
+    "owner_kind",
+    "owner_name",
+    "owner_uid",
+    "owner_resource_version",
+    "owner_generation",
+    "controller_type",
+    "execution_protocol",
     "pod_template_sha256",
     "desired_replicas",
-    "active_replicaset_count",
     "pdb_allowed_disruptions",
     "pdb_resource_version",
     "observed_at_ms",
@@ -765,7 +765,10 @@ _POD_IDENTITY_KEYS = {
     "node_id",
     "pod_name",
     "pod_uid",
-    "controller_uid",
+    "owner_kind",
+    "owner_name",
+    "owner_uid",
+    "logical_slot_id",
     "ready",
     "terminating",
 }
@@ -816,6 +819,11 @@ def _validate_evacuation_inventory(
 
     cluster_uid = text(inventory.get("cluster_uid"), "cluster-uid")
     namespace = text(inventory.get("namespace"), "namespace")
+    owner_contract_version = integer(
+        inventory.get("owner_contract_version"), "owner-contract-version", 1
+    )
+    if owner_contract_version != 1:
+        raise HTTPException(status_code=422, detail="unsupported-v2-owner-contract")
     observed_at_ms = integer(inventory.get("inventory_observed_at_ms"), "inventory-time")
     maximum_age_ms = int(fields["policy"]["maximum_snapshot_age_ms"])
     if observed_at_ms > now_ms or now_ms - observed_at_ms > maximum_age_ms:
@@ -838,6 +846,7 @@ def _validate_evacuation_inventory(
 
     controllers: list[dict[str, object]] = []
     controller_by_workload: dict[str, dict[str, object]] = {}
+    owner_uids: set[str] = set()
     for raw in controllers_value:
         item = _check_keys(raw, _CONTROLLER_IDENTITY_KEYS, "v2-controller-identity")
         controller = {key: item.get(key) for key in _CONTROLLER_IDENTITY_KEYS}
@@ -847,31 +856,42 @@ def _validate_evacuation_inventory(
         if text(controller["namespace"], "controller-namespace") != namespace:
             raise HTTPException(status_code=422, detail="v2-controller-namespace-mismatch")
         for name in (
-            "deployment_name",
-            "deployment_uid",
-            "deployment_resource_version",
-            "replicaset_name",
-            "replicaset_uid",
-            "replicaset_resource_version",
+            "owner_kind",
+            "owner_name",
+            "owner_resource_version",
+            "controller_type",
+            "execution_protocol",
             "pod_template_sha256",
             "pdb_resource_version",
         ):
             text(controller[name], f"controller-{name}")
         for name in (
-            "deployment_generation",
+            "owner_generation",
             "desired_replicas",
-            "active_replicaset_count",
             "pdb_allowed_disruptions",
             "observed_at_ms",
         ):
             integer(
                 controller[name],
                 f"controller-{name}",
-                1
-                if name in {"deployment_generation", "desired_replicas", "active_replicaset_count"}
-                else 0,
+                1 if name in {"owner_generation", "desired_replicas"} else 0,
             )
-        if controller["active_replicaset_count"] != 1 or controller["observed_at_ms"] > now_ms:
+        owner_uid = text(controller["owner_uid"], "controller-owner-uid")
+        controller_observed_at_ms = int(controller["observed_at_ms"])
+        if (
+            controller_observed_at_ms > now_ms
+            or now_ms - controller_observed_at_ms > maximum_age_ms
+        ):
+            raise HTTPException(status_code=409, detail="v2-controller-observation-stale")
+        if owner_uid in owner_uids:
+            raise HTTPException(status_code=422, detail="duplicate-v2-controller-owner-uid")
+        owner_uids.add(owner_uid)
+        if (
+            controller["owner_kind"] != "FleetRightWorkload"
+            or controller["owner_name"] != workload_id
+            or controller["controller_type"] != "fleetright-workload-controller/v1"
+            or controller["execution_protocol"] != "monotonic-scale-up-v1"
+        ):
             raise HTTPException(status_code=422, detail="unsupported-v2-controller-state")
         if controller["desired_replicas"] != workload_counts[workload_id]:
             raise HTTPException(status_code=422, detail="v2-controller-replica-count-mismatch")
@@ -893,7 +913,10 @@ def _validate_evacuation_inventory(
             "node_id",
             "pod_name",
             "pod_uid",
-            "controller_uid",
+            "owner_kind",
+            "owner_name",
+            "owner_uid",
+            "logical_slot_id",
         ):
             text(pod[name], f"pod-{name}")
         if not isinstance(pod["ready"], bool) or not isinstance(pod["terminating"], bool):
@@ -906,7 +929,10 @@ def _validate_evacuation_inventory(
             or pod["pod_uid"] in pod_uids
             or pod["pod_name"] in pod_names
             or controller is None
-            or pod["controller_uid"] != controller["replicaset_uid"]
+            or pod["owner_kind"] != controller["owner_kind"]
+            or pod["owner_name"] != controller["owner_name"]
+            or pod["owner_uid"] != controller["owner_uid"]
+            or pod["logical_slot_id"] != pod["replica_id"]
             or not pod["ready"]
             or pod["terminating"]
         ):
@@ -946,6 +972,7 @@ def _validate_evacuation_inventory(
         "cluster_uid": cluster_uid,
         "namespace": namespace,
         "inventory_observed_at_ms": observed_at_ms,
+        "owner_contract_version": owner_contract_version,
         "controllers": controllers,
         "pods": pods,
         "nodes": nodes,

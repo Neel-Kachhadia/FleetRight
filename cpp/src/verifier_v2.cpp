@@ -729,8 +729,9 @@ bool ExactStages(const EvacuationOperation &operation, std::uint32_t count,
 
 bool SnapshotIdentityValid(const EvacuationSnapshot &snapshot) {
   const auto &model = snapshot.model_snapshot();
-  if (snapshot.schema_version() != 2 || snapshot.cluster_uid().empty() ||
-      snapshot.namespace_().empty() || model.schema_version() != 1 || model.snapshot_id().empty() ||
+  if (snapshot.schema_version() != 2 || snapshot.owner_contract_version() != 1 ||
+      snapshot.cluster_uid().empty() || snapshot.namespace_().empty() ||
+      model.schema_version() != 1 || model.snapshot_id().empty() ||
       model.policy().schema_version() != 1 || model.machine_catalog().schema_version() != 1 ||
       model.nodes_size() == 0 || model.nodes_size() > static_cast<int>(kMaxV2Nodes) ||
       model.workloads_size() == 0 || model.workloads_size() > static_cast<int>(kMaxV2Workloads) ||
@@ -829,29 +830,35 @@ bool SnapshotIdentityValid(const EvacuationSnapshot &snapshot) {
                                                  item.node_id() == pod.node_id();
                                         });
     if (placement == model.current_placements().end() || pod.pod_name().empty() ||
-        pod.pod_uid().empty() || pod.controller_uid().empty() || !pod.ready() ||
-        pod.terminating() || !pod_uids.insert(pod.pod_uid()).second ||
-        !pod_names.insert(pod.pod_name()).second ||
+        pod.pod_uid().empty() || pod.owner_kind().empty() || pod.owner_name().empty() ||
+        pod.owner_uid().empty() || pod.logical_slot_id() != pod.replica_id() ||
+        !pod.controller_uid().empty() || !pod.ready() || pod.terminating() ||
+        !pod_uids.insert(pod.pod_uid()).second || !pod_names.insert(pod.pod_name()).second ||
         !pod_replica_ids.insert(ReplicaKey(pod.workload_id(), pod.replica_id())).second)
       return false;
   }
   std::set<std::string> controllers;
-  std::set<std::string> deployment_uids;
-  std::set<std::string> replicaset_uids;
+  std::set<std::string> owner_uids;
   for (const auto &controller : snapshot.controllers())
     if (controller.workload_id().empty() || !workloads.contains(controller.workload_id()) ||
-        controller.namespace_() != snapshot.namespace_() || controller.deployment_name().empty() ||
-        controller.deployment_uid().empty() || controller.deployment_resource_version().empty() ||
-        controller.deployment_generation() == 0 || controller.replicaset_name().empty() ||
-        controller.replicaset_uid().empty() || controller.replicaset_resource_version().empty() ||
-        controller.pod_template_sha256().empty() || controller.desired_replicas() == 0 ||
-        controller.active_replicaset_count() != 1 || controller.pdb_resource_version().empty() ||
+        controller.namespace_() != snapshot.namespace_() ||
+        controller.owner_kind() != "FleetRightWorkload" || controller.owner_name().empty() ||
+        controller.owner_uid().empty() || controller.owner_resource_version().empty() ||
+        controller.owner_generation() == 0 ||
+        controller.controller_type() != "fleetright-workload-controller/v1" ||
+        controller.execution_protocol() != "monotonic-scale-up-v1" ||
+        !controller.deployment_name().empty() || !controller.deployment_uid().empty() ||
+        !controller.deployment_resource_version().empty() ||
+        controller.deployment_generation() != 0 || !controller.replicaset_name().empty() ||
+        !controller.replicaset_uid().empty() || !controller.replicaset_resource_version().empty() ||
+        controller.active_replicaset_count() != 0 || controller.pod_template_sha256().empty() ||
+        controller.desired_replicas() == 0 || controller.pdb_resource_version().empty() ||
         controller.observed_at_ms() > model.evaluation_time_ms() ||
         model.evaluation_time_ms() - controller.observed_at_ms() >
             model.policy().maximum_snapshot_age_ms() ||
         !controllers.insert(controller.workload_id()).second ||
-        !deployment_uids.insert(controller.deployment_uid()).second ||
-        !replicaset_uids.insert(controller.replicaset_uid()).second)
+        !owner_uids.insert(controller.owner_uid()).second ||
+        controller.owner_name() != controller.workload_id())
       return false;
   if (controllers.size() != workloads.size())
     return false;
@@ -867,7 +874,9 @@ bool SnapshotIdentityValid(const EvacuationSnapshot &snapshot) {
       return false;
     for (const auto &pod : snapshot.pods())
       if (pod.workload_id() == workload.workload_id() &&
-          pod.controller_uid() != controller->replicaset_uid())
+          (pod.owner_kind() != controller->owner_kind() ||
+           pod.owner_name() != controller->owner_name() ||
+           pod.owner_uid() != controller->owner_uid()))
         return false;
   }
   return true;
@@ -957,13 +966,20 @@ v2::VerificationResult VerifyEvacuationV2(const EvacuationSnapshot &snapshot,
         source->node_id() == operation.source_node_id() &&
         source->pod_name() == operation.source_pod_name() &&
         source->pod_uid() == operation.source_pod_uid() &&
-        source->controller_uid() == operation.source_controller_uid() &&
-        controller->replicaset_uid() == operation.source_controller_uid() &&
+        operation.source_controller_uid().empty() &&
+        source->owner_kind() == operation.source_owner_kind() &&
+        source->owner_name() == operation.source_owner_name() &&
+        source->owner_uid() == operation.source_owner_uid() &&
+        source->logical_slot_id() == operation.source_logical_slot_id() &&
+        source->logical_slot_id() == source->replica_id() &&
+        controller->owner_kind() == operation.source_owner_kind() &&
+        controller->owner_name() == operation.source_owner_name() &&
+        controller->owner_uid() == operation.source_owner_uid() &&
         source_node_identity->node_uid() == operation.source_node_uid() && source_node->active() &&
         source_node->health() == v1::NODE_HEALTH_HEALTHY && source->ready() &&
         !source->terminating() && controller->pdb_allowed_disruptions() >= 1 &&
         controller->desired_replicas() == operation.baseline_replicas() &&
-        controller->active_replicaset_count() == 1;
+        operation.source_owner_kind() == "FleetRightWorkload";
     AddInvariant(&result, "v2_source_pod_owner_and_node_uid", source_bound,
                  source_bound
                      ? "source Pod UID, owner UID, logical replica and node UID are bound"

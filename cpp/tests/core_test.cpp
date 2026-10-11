@@ -10,9 +10,11 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <random>
 #include <string>
+#include <vector>
 
 namespace {
 using fleetright::v1::OptimizationSnapshot;
@@ -179,6 +181,7 @@ void SealEvacuationSnapshot(fleetright::v2::EvacuationSnapshot *snapshot) {
 fleetright::v2::EvacuationSnapshot EvacuationFixture() {
   fleetright::v2::EvacuationSnapshot snapshot;
   snapshot.set_schema_version(2);
+  snapshot.set_owner_contract_version(1);
   snapshot.set_cluster_uid("cluster-uid");
   snapshot.set_namespace_("test");
   snapshot.set_inventory_observed_at_ms(1'000);
@@ -208,16 +211,15 @@ fleetright::v2::EvacuationSnapshot EvacuationFixture() {
   auto *controller = snapshot.add_controllers();
   controller->set_workload_id("api");
   controller->set_namespace_("test");
-  controller->set_deployment_name("api");
-  controller->set_deployment_uid("deployment-uid");
-  controller->set_deployment_resource_version("deployment-rv");
-  controller->set_deployment_generation(1);
-  controller->set_replicaset_name("api-1");
-  controller->set_replicaset_uid("replicaset-uid");
-  controller->set_replicaset_resource_version("replicaset-rv");
+  controller->set_owner_kind("FleetRightWorkload");
+  controller->set_owner_name("api");
+  controller->set_owner_uid("workload-uid");
+  controller->set_owner_resource_version("workload-rv");
+  controller->set_owner_generation(1);
+  controller->set_controller_type("fleetright-workload-controller/v1");
+  controller->set_execution_protocol("monotonic-scale-up-v1");
   controller->set_pod_template_sha256("template-sha256");
   controller->set_desired_replicas(3);
-  controller->set_active_replicaset_count(1);
   controller->set_pdb_allowed_disruptions(1);
   controller->set_pdb_resource_version("pdb-rv");
   controller->set_observed_at_ms(1'000);
@@ -228,7 +230,10 @@ fleetright::v2::EvacuationSnapshot EvacuationFixture() {
     pod->set_node_id(placement.node_id());
     pod->set_pod_name(placement.replica_id());
     pod->set_pod_uid(placement.replica_id() + "-uid");
-    pod->set_controller_uid("replicaset-uid");
+    pod->set_owner_kind("FleetRightWorkload");
+    pod->set_owner_name("api");
+    pod->set_owner_uid("workload-uid");
+    pod->set_logical_slot_id(placement.replica_id());
     pod->set_ready(true);
     pod->set_terminating(false);
   }
@@ -324,16 +329,107 @@ TEST(EvacuationV2Test, RejectsUnsupportedSchemaUnknownFieldsAndTampering) {
   EXPECT_FALSE(fleetright::VerifyEvacuationV2(snapshot, plan).accepted());
 }
 
-TEST(EvacuationV2Test, RejectsControllerNamespaceAndPodOwnerMismatches) {
+TEST(EvacuationV2Test, RejectsControllerNamespaceAndOwnerContractMismatches) {
   auto snapshot = EvacuationFixture();
   snapshot.mutable_controllers(0)->set_namespace_("other-namespace");
   SealEvacuationSnapshot(&snapshot);
   EXPECT_FALSE(fleetright::PlanEvacuationV2(snapshot).feasible());
 
   snapshot = EvacuationFixture();
-  snapshot.mutable_pods(0)->set_controller_uid("different-replicaset-uid");
+  snapshot.mutable_pods(0)->set_owner_uid("different-workload-uid");
   SealEvacuationSnapshot(&snapshot);
   EXPECT_FALSE(fleetright::PlanEvacuationV2(snapshot).feasible());
+
+  snapshot = EvacuationFixture();
+  snapshot.mutable_controllers(0)->set_owner_kind("Deployment");
+  SealEvacuationSnapshot(&snapshot);
+  EXPECT_FALSE(fleetright::PlanEvacuationV2(snapshot).feasible());
+
+  snapshot = EvacuationFixture();
+  snapshot.set_owner_contract_version(0);
+  SealEvacuationSnapshot(&snapshot);
+  EXPECT_FALSE(fleetright::PlanEvacuationV2(snapshot).feasible());
+
+  const std::vector<std::function<void(fleetright::v2::EvacuationSnapshot &)>> legacy_fields = {
+      [](auto &value) { value.mutable_controllers(0)->set_deployment_name("legacy"); },
+      [](auto &value) { value.mutable_controllers(0)->set_deployment_uid("legacy"); },
+      [](auto &value) { value.mutable_controllers(0)->set_deployment_resource_version("legacy"); },
+      [](auto &value) { value.mutable_controllers(0)->set_deployment_generation(1); },
+      [](auto &value) { value.mutable_controllers(0)->set_replicaset_name("legacy"); },
+      [](auto &value) { value.mutable_controllers(0)->set_replicaset_uid("legacy"); },
+      [](auto &value) { value.mutable_controllers(0)->set_replicaset_resource_version("legacy"); },
+      [](auto &value) { value.mutable_controllers(0)->set_active_replicaset_count(1); },
+      [](auto &value) { value.mutable_pods(0)->set_controller_uid("legacy"); },
+  };
+  for (std::size_t index = 0; index < legacy_fields.size(); ++index) {
+    snapshot = EvacuationFixture();
+    legacy_fields[index](snapshot);
+    SealEvacuationSnapshot(&snapshot);
+    EXPECT_FALSE(fleetright::PlanEvacuationV2(snapshot).feasible()) << index;
+  }
+}
+
+TEST(EvacuationV2Test, IndependentVerifierRejectsOwnerContractDrift) {
+  const auto snapshot = EvacuationFixture();
+  const auto plan = FeasibleEvacuationPlan(snapshot);
+
+  auto stale_owner = snapshot;
+  stale_owner.mutable_controllers(0)->set_owner_uid("replacement-workload-uid");
+  for (auto &pod : *stale_owner.mutable_pods())
+    pod.set_owner_uid("replacement-workload-uid");
+  SealEvacuationSnapshot(&stale_owner);
+  auto stale_owner_plan = plan;
+  stale_owner_plan.set_snapshot_sha256(stale_owner.content_sha256());
+  SealEvacuationPlan(&stale_owner_plan);
+  const auto owner_drift = fleetright::VerifyEvacuationV2(stale_owner, stale_owner_plan);
+  EXPECT_FALSE(owner_drift.accepted());
+  const auto snapshot_check = std::find_if(
+      owner_drift.invariants().begin(), owner_drift.invariants().end(), [](const auto &invariant) {
+        return invariant.invariant() == "v2_snapshot_identity_inventory_and_hash";
+      });
+  ASSERT_NE(snapshot_check, owner_drift.invariants().end());
+  EXPECT_TRUE(snapshot_check->passed());
+  const auto plan_check = std::find_if(
+      owner_drift.invariants().begin(), owner_drift.invariants().end(), [](const auto &invariant) {
+        return invariant.invariant() == "v2_plan_canonical_binding_and_replay";
+      });
+  ASSERT_NE(plan_check, owner_drift.invariants().end());
+  EXPECT_TRUE(plan_check->passed());
+  const auto source_check = std::find_if(
+      owner_drift.invariants().begin(), owner_drift.invariants().end(), [](const auto &invariant) {
+        return invariant.invariant() == "v2_source_pod_owner_and_node_uid";
+      });
+  ASSERT_NE(source_check, owner_drift.invariants().end());
+  EXPECT_FALSE(source_check->passed());
+
+  auto legacy_owner = snapshot;
+  legacy_owner.mutable_controllers(0)->set_replicaset_uid("legacy-replicaset-uid");
+  SealEvacuationSnapshot(&legacy_owner);
+  auto legacy_owner_plan = plan;
+  legacy_owner_plan.set_snapshot_sha256(legacy_owner.content_sha256());
+  SealEvacuationPlan(&legacy_owner_plan);
+  const auto legacy_result = fleetright::VerifyEvacuationV2(legacy_owner, legacy_owner_plan);
+  EXPECT_FALSE(legacy_result.accepted());
+  const auto legacy_snapshot_check =
+      std::find_if(legacy_result.invariants().begin(), legacy_result.invariants().end(),
+                   [](const auto &invariant) {
+                     return invariant.invariant() == "v2_snapshot_identity_inventory_and_hash";
+                   });
+  ASSERT_NE(legacy_snapshot_check, legacy_result.invariants().end());
+  EXPECT_FALSE(legacy_snapshot_check->passed());
+
+  auto legacy_operation_plan = plan;
+  legacy_operation_plan.mutable_operations(0)->set_source_controller_uid("legacy");
+  SealEvacuationPlan(&legacy_operation_plan);
+  const auto operation_result = fleetright::VerifyEvacuationV2(snapshot, legacy_operation_plan);
+  EXPECT_FALSE(operation_result.accepted());
+  const auto operation_source_check =
+      std::find_if(operation_result.invariants().begin(), operation_result.invariants().end(),
+                   [](const auto &invariant) {
+                     return invariant.invariant() == "v2_source_pod_owner_and_node_uid";
+                   });
+  ASSERT_NE(operation_source_check, operation_result.invariants().end());
+  EXPECT_FALSE(operation_source_check->passed());
 }
 
 TEST(EvacuationV2Test, RejectsTopologyThatCannotSurviveTheMove) {
