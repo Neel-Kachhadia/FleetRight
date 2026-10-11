@@ -1,6 +1,109 @@
 # V2 Execution Progress
 
-## 2026-10-11 Prompt 2B — source-retirement admission audit
+## 2026-10-11 Prompt 2B — journaled source-retirement preparation gate
+
+**Session start:** 10:35:07 UTC. **Starting SHA:**
+`a484abf22cdfcd36ddb609b8cd7be0922443c074` on
+`phase4/safe-execution-reconciliation`. Prompt 3 and milestone 4 were not
+started. No push or destructive Kubernetes action was performed. Existing
+untracked `graphify-out/` was preserved.
+
+### Production path added
+
+- A verified V2 plan with exactly one supported `FleetRightWorkload`
+  evacuation now produces one `PREPARE_SOURCE_RETIREMENT` journal intent.
+  V2 deactivation and eviction actions are not emitted. Approval and execution
+  re-verify the plan; approval binds the live workload UID and generation to
+  the verified operation.
+- `/v1/plans/{plan_id}/execute` -> `ExecutionController._start_action` ->
+  `FleetRightWorkloadTarget.prepare_source_retirement` is the production call
+  path. The controller records `RETIREMENT_REQUESTED` in the PostgreSQL action
+  journal before the target call. Approval and execution bind the journal
+  payload field-for-field to the independently reverified V2 operation.
+- The target checks workload UID/generation, CREATE protocol and reservations,
+  tombstones, and the live source Pod UID/owner/slot plus Node UID. The current
+  V2 action has no observed replacement Pod UID, so it blocks at
+  `VALIDATE_REPLACEMENT` with `REPLACEMENT_POD_IDENTITY_UNAVAILABLE`. Even with
+  a replacement identity, the target retains the separate
+  `POD_CREATE_PERSISTENCE_FENCE_UNPROVEN` block before any tombstone write.
+- Read-only retirement actions recover after takeover: the new controller
+  records a `no_target_mutation` receipt, rechecks the workload, and resumes the
+  gate. Mutating target adapters are not takeover-qualified. Pause/cancel
+  settles a read-only pending action before entering the requested state.
+- The gate runs before any Kubernetes write. This path does not call
+  `_write_retired_slot_tombstone`, does not report `READY_FOR_SAFE_EVICTION`,
+  and cannot make an ordinary controller stop healing a desired slot.
+  Tombstone integration remains BLOCKED; no retirement intent was persisted in
+  the workload object.
+
+### Delayed CREATE evidence and result
+
+- The preserved executable counterexample remains
+  `test_pre_upgrade_inflight_create_can_recreate_a_retired_slot`. It holds an
+  unreserved Pod CREATE after admission, writes the tombstone, removes the
+  source, and then allows the old request to create a new Pod UID. Reconcile
+  marks the Pod unverified and `BLOCKED`; it does not count it as ready
+  capacity. A workload status resourceVersion CAS cannot prove this request
+  has finished.
+- `test_retirement_and_create_reservation_race_uses_status_cas` still tests
+  both winners for participating reservation/tombstone writes. That is not a
+  persistence fence and does not override the delayed-request counterexample.
+- The new-protocol barrier test holds a CREATE after its durable reservation,
+  has the takeover attempt retirement, and proves retirement is rejected
+  while the reservation is pending. After release, the Pod authorization stays
+  bound to the original scale-up operation; no retirement tombstone or
+  eviction occurs. The separate legacy regression still proves a late Pod is
+  unverified after an unsafe tombstone/source-removal sequence.
+- The real current `fleetright-v2/cpu-api` is legacy: UID
+  `48fdf658-8ed9-4c42-9016-e345bfe37ef5`, generation 5, no
+  `podCreateProtocol`. The live target rejected it with
+  `FleetRightWorkload Pod CREATE history is uncertain` before any mutation.
+- Read-only lab inventory captured five `cpu-api` Pods, owned by that legacy
+  workload UID: `r0` `f3db00c3-5ec2-4ba0-b4d7-03e8776c915d`, `r1`
+  `d1cc449e-3249-4933-b500-b1e3bf6d1824`, `r2`
+  `7f58a2d5-b3ca-46b1-acb3-8f96d9802e4f`, `r3`
+  `3a9a9932-6da3-420e-92cf-8252751f9cee`, `r4`
+  `5a5f847a-c8fd-417b-8b78-e3a94e12c1f0`. They remained on workers 1/2;
+  no live writes were made. The new read-only Pod/Node RBAC rules were not
+  applied to the lab.
+- No supported live workload reached a successful preparation state. The
+  end-to-end API/PostgreSQL/controller test uses the production
+  `FleetRightWorkloadTarget` with deterministic Kubernetes reads and fails
+  closed at `VALIDATE_REPLACEMENT`. No success is fabricated.
+
+### Verification
+
+| Check | Result | Evidence / limit |
+|---|---|---|
+| Affected Python suites | PASS, 185 passed / 4 skipped | Workload controller, execution targets, V2 planner, PostgreSQL journal and control API. Four optional E2E tests skipped; one existing Starlette deprecation warning. |
+| PostgreSQL journal and API | PASS | Full affected suite ran against the authenticated local PostgreSQL test DB; includes failed-safe admission, duplicate execute, unknown outcome, crash/takeover, and pause recovery. |
+| Production API -> journal -> controller -> target | PASS, fail-closed | V2 plan action matches reverified artifacts; live-source identity reads pass in the deterministic adapter, missing replacement UID is recorded as `VALIDATE_REPLACEMENT`, and plan ends `FAILED_SAFE`. This is not a successful retirement preparation. |
+| Original delayed CREATE race | PASS as a hazard reproduction | Late Pod UID remains unverified and does not count as Ready capacity. |
+| Ruff, format, Python compilation, diff check | PASS | Changed Python files; full repository compile and final diff check recorded at commit. |
+| Safety-lab health | PASS | 3 Nodes Ready, kube-proxy 3/3/3, authenticated PostgreSQL `SELECT 1` returned 1. |
+| Live workload admission probe | BLOCKED | The only existing candidate workload is legacy and was rejected without mutation. |
+| Live kind SCALE_UP / retirement E2E | NOT RUN | The dedicated least-privilege executor kubeconfig and health URL are unavailable; the provided admin kubeconfig was used only for read-only checks. |
+
+### Prompt 2B gate decision
+
+| Requirement | Result | Evidence |
+|---|---|---|
+| Retirement admission into `READY_FOR_SAFE_EVICTION` | BLOCKED | Production API/controller action is wired, but the V2 operation does not carry an observed replacement Pod UID; the target then also requires a CREATE persistence fence. |
+| CREATE/retirement serialization | UNPROVEN | A pending new-protocol CREATE blocks admission; a late completion remains bound to its original operation. The legacy/stale-request counterexample creates a different UID after tombstone/source absence. No enforceable storage fence is proven. |
+| Tombstone integration in production admission | BLOCKED | The production caller deliberately does not invoke the tombstone helper while the CREATE persistence fence is unproven. |
+| Crash/takeover state preservation | PASS, read-only path | Operation identity and `OUTCOME_UNKNOWN` survive; a deterministic crash-before-target test recovers the read-only gate, and pause settles without dispatch. No mutating retirement adapter is qualified. |
+| Live API/PostgreSQL/controller/kind transition | NOT RUN | No supported live workload and no separate executor kubeconfig/health endpoint. |
+| Source eviction | DISABLED | No PDB eviction, Pod delete, scale-down, drain, deactivation or destructive compensation was enabled. |
+
+**Next exact critical task:** add the missing journaled surge/readiness stage
+that captures a verified replacement Pod UID, then prove an API-server
+persistence fence for every Pod CREATE writer before writing a retirement
+tombstone. Keep eviction disabled until its separate authority and PDB gate is
+proven.
+
+---
+
+## Historical checkpoint before Prompt 2B production wiring
 
 **Scope:** Prompt 2B only. Prompt 3 has not started. No destructive action was
 enabled. Session started at 10:10:39 UTC from
