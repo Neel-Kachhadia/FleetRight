@@ -399,9 +399,34 @@ def _evacuation_plan_summary(plan_text: str) -> dict[str, object]:
     deactivated: list[str] = []
     for block in _proto_blocks(plan_text, "operations"):
         destination_blocks = _proto_blocks(block, "destinations")
-        destination_ids = (
-            _proto_scalars(destination_blocks[0], "allowed_node_ids") if destination_blocks else []
-        )
+        resource_blocks = _proto_blocks(block, "replica_requests")
+        destinations = destination_blocks[0] if destination_blocks else ""
+        resources = resource_blocks[0] if resource_blocks else ""
+        destination_ids = _proto_scalars(destinations, "allowed_node_ids") if destinations else []
+        intermediate_states = [
+            {
+                key: _proto_scalar(state, key, default)
+                for key, default in (
+                    ("kind", 0),
+                    ("minimum_ready_replicas", 0),
+                    ("maximum_live_replicas", 0),
+                    ("source_pod_consumes_resources", False),
+                    ("source_pod_counts_as_available", False),
+                )
+            }
+            for state in _proto_blocks(block, "permitted_intermediate_states")
+        ]
+        actions = [
+            {
+                "sequence": _proto_scalar(action, "sequence", 0),
+                "action_id": _proto_scalar(action, "action_id", ""),
+                "stage": _proto_scalar(action, "stage", 0),
+                "depends_on_sequences": _proto_scalars(action, "depends_on_sequences"),
+                "expected_postcondition": _proto_scalar(action, "expected_postcondition", ""),
+                "on_failure": _proto_scalar(action, "on_failure", 0),
+            }
+            for action in _proto_blocks(block, "actions")
+        ]
         evacuation = {
             "sequence": _proto_scalar(block, "sequence", 0),
             "workload_id": _proto_scalar(block, "workload_id", ""),
@@ -417,6 +442,49 @@ def _evacuation_plan_summary(plan_text: str) -> dict[str, object]:
             "source_owner_uid": _proto_scalar(block, "source_owner_uid", ""),
             "source_logical_slot_id": _proto_scalar(block, "source_logical_slot_id", ""),
             "destination_node_ids": destination_ids,
+            "destination_mode": _proto_scalar(destinations, "mode", 0),
+            "exact_destination_node_id": _proto_scalar(
+                destinations, "exact_destination_node_id", ""
+            ),
+            "require_hard_pod_anti_affinity": _proto_scalar(
+                destinations, "require_hard_pod_anti_affinity", False
+            ),
+            "exclude_source_node": _proto_scalar(destinations, "exclude_source_node", False),
+            "replica_requests": {
+                key: _proto_scalar(resources, key, 0)
+                for key in ("cpu_millicores", "memory_mib", "network_mbps")
+            },
+            **{
+                key: _proto_scalar(block, key, 0)
+                for key in (
+                    "baseline_replicas",
+                    "surge_desired_replicas",
+                    "final_desired_replicas",
+                    "maximum_live_replicas",
+                    "maximum_temporary_surge_replicas",
+                    "required_pdb_disruptions",
+                    "maximum_concurrent_disruptions",
+                    "availability_floor_replicas",
+                    "profile_required_replicas",
+                    "readiness_stabilization_ms",
+                    "readiness_timeout_ms",
+                    "minimum_topology_domains",
+                    "maximum_topology_skew",
+                    "n_minus_1_recovery_target_replicas",
+                )
+            },
+            "topology_key": _proto_scalar(block, "topology_key", ""),
+            "failure_tolerance": _proto_scalar(block, "failure_tolerance", 0),
+            "recovery_destination_node_ids": _proto_scalars(block, "recovery_destination_node_ids"),
+            "deactivate_source_node_after_empty": _proto_scalar(
+                block, "deactivate_source_node_after_empty", False
+            ),
+            "permitted_intermediate_states": intermediate_states,
+            "actions": actions,
+            "on_failure": _proto_scalar(block, "on_failure", 0),
+            "n_minus_1_failure_domain_key": _proto_scalar(
+                block, "n_minus_1_failure_domain_key", ""
+            ),
         }
         evacuations.append(evacuation)
         if _proto_scalar(block, "deactivate_source_node_after_empty", False):
@@ -1309,6 +1377,20 @@ def _valid_source_retirement_action(workload_id: object, payload: object) -> boo
         "source_logical_slot_id",
     )
     destinations = payload.get("destination_node_ids")
+    recovery_ids = payload.get("recovery_destination_node_ids")
+    recovery_nodes = payload.get("recovery_destination_nodes")
+    recovery_identity_valid = (
+        isinstance(recovery_ids, list)
+        and isinstance(recovery_nodes, list)
+        and len(recovery_ids) == len(recovery_nodes)
+        and all(
+            isinstance(item, dict)
+            and item.get("name") == name
+            and isinstance(item.get("uid"), str)
+            and item["uid"]
+            for name, item in zip(recovery_ids, recovery_nodes, strict=True)
+        )
+    )
     return (
         all(isinstance(payload.get(key), str) and payload[key] for key in text_fields)
         and type(payload.get("sequence")) is int
@@ -1319,10 +1401,37 @@ def _valid_source_retirement_action(workload_id: object, payload: object) -> boo
         and payload["source_owner_name"] == workload_id
         and payload["source_owner_uid"] == payload["source_controller_uid"]
         and payload["source_logical_slot_id"] == payload["replica_id"]
+        and valid_execution_health_policy(workload_id, payload.get("health"))
+        and type(payload.get("baseline_replicas")) is int
+        and payload["baseline_replicas"] >= 1
+        and payload.get("surge_desired_replicas") == payload["baseline_replicas"] + 1
+        and payload.get("final_desired_replicas") == payload["surge_desired_replicas"]
+        and type(payload.get("maximum_live_replicas")) is int
+        and type(payload.get("maximum_temporary_surge_replicas")) is int
+        and payload["maximum_live_replicas"]
+        <= (payload["baseline_replicas"] + payload["maximum_temporary_surge_replicas"])
+        and recovery_identity_valid
         and isinstance(destinations, list)
         and bool(destinations)
         and all(isinstance(node_id, str) and node_id for node_id in destinations)
     )
+
+
+def _destination_node_identities(
+    destination_ids: object, nodes: list[dict[str, object]]
+) -> list[dict[str, str]]:
+    by_name = {node.get("node_id"): node.get("node_uid") for node in nodes}
+    if not isinstance(destination_ids, list) or not destination_ids:
+        raise ControlError("verified evacuation has no destination Node identities")
+    result = []
+    for name in destination_ids:
+        uid = by_name.get(name)
+        if not isinstance(name, str) or not name or not isinstance(uid, str) or not uid:
+            raise ControlError("verified evacuation destination Node identity is missing")
+        result.append({"name": name, "uid": uid})
+    if len({item["name"] for item in result}) != len(result):
+        raise ControlError("verified evacuation destination Node identities are duplicated")
+    return result
 
 
 def _verify_source_retirement_actions(
@@ -1360,14 +1469,39 @@ def _verify_source_retirement_actions(
         _proto_scalar(block, "workload_id", ""): _proto_scalar(block, "owner_generation", 0)
         for block in _proto_blocks(snapshot_text, "controllers")
     }
+    nodes = [
+        {
+            "node_id": _proto_scalar(block, "node_id", ""),
+            "node_uid": _proto_scalar(block, "node_uid", ""),
+        }
+        for block in _proto_blocks(snapshot_text, "nodes")
+    ]
+    try:
+        source_snapshot = json.loads(artifacts["source_snapshot.json"])
+        source_workloads = {item["workload_id"]: item for item in source_snapshot["workloads"]}
+    except (KeyError, TypeError, ValueError) as error:
+        raise ControlError("source-retirement health policy cannot be verified") from error
     expected: dict[str, tuple[str, dict[str, object]]] = {}
     for operation in plan["evacuations"]:
         sequence = operation["sequence"]
         operation_id = hashlib.sha256(f"{plan_id}:retirement:{sequence}".encode()).hexdigest()
         payload = {
             **operation,
+            "destination_nodes": _destination_node_identities(
+                operation["destination_node_ids"], nodes
+            ),
+            "recovery_destination_nodes": (
+                _destination_node_identities(operation["recovery_destination_node_ids"], nodes)
+                if operation["recovery_destination_node_ids"]
+                else []
+            ),
             "operation_id": operation_id,
             "workload_generation": generations.get(operation["workload_id"]),
+            "health": bounded_execution_health_policy(
+                operation["workload_id"],
+                source_workloads.get(operation["workload_id"], {}).get("latency_slo_ms"),
+                source_workloads.get(operation["workload_id"], {}).get("error_slo_ppm"),
+            ),
         }
         expected[operation_id] = (operation["workload_id"], payload)
     if len(actions) != len(expected) or len(retirements) != len(actions):
@@ -1929,6 +2063,7 @@ def create_app(
                         item["workload_id"]: item
                         for item in source_fields["evacuation_v2"]["controllers"]
                     }
+                    node_identities = source_fields["evacuation_v2"]["nodes"]
                     for evacuation in summary["evacuations"]:
                         sequence = int(evacuation["sequence"])
                         operation_id = hashlib.sha256(
@@ -1941,10 +2076,30 @@ def create_app(
                                 "workload_id": evacuation["workload_id"],
                                 "payload": {
                                     **evacuation,
+                                    "destination_nodes": _destination_node_identities(
+                                        evacuation["destination_node_ids"], node_identities
+                                    ),
+                                    "recovery_destination_nodes": (
+                                        _destination_node_identities(
+                                            evacuation["recovery_destination_node_ids"],
+                                            node_identities,
+                                        )
+                                        if evacuation["recovery_destination_node_ids"]
+                                        else []
+                                    ),
                                     "operation_id": operation_id,
                                     "workload_generation": controller_by_workload[
                                         evacuation["workload_id"]
                                     ]["owner_generation"],
+                                    "health": bounded_execution_health_policy(
+                                        evacuation["workload_id"],
+                                        current_workloads[evacuation["workload_id"]][
+                                            "latency_slo_ms"
+                                        ],
+                                        current_workloads[evacuation["workload_id"]][
+                                            "error_slo_ppm"
+                                        ],
+                                    ),
                                 },
                             }
                         )

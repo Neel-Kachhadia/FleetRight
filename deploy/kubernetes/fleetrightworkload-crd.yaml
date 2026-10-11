@@ -44,6 +44,64 @@ spec:
           x-kubernetes-validations:
             - rule: "!has(oldSelf.status) || !has(oldSelf.status.pendingPodCreate) || self.spec == oldSelf.spec"
               message: spec cannot change while a Pod create outcome is unresolved
+            - rule: >-
+                !has(oldSelf.status) || !has(oldSelf.status.pendingPodCreate) || (has(self.status) &&
+                ((has(self.status.pendingPodCreate) && (self.status.pendingPodCreate ==
+                oldSelf.status.pendingPodCreate || (!has(oldSelf.status.pendingPodCreate.admissionUID) &&
+                has(self.status.pendingPodCreate.admissionUID) && self.status.pendingPodCreate.workloadUID ==
+                oldSelf.status.pendingPodCreate.workloadUID && self.status.pendingPodCreate.workloadGeneration
+                == oldSelf.status.pendingPodCreate.workloadGeneration && self.status.pendingPodCreate.podName ==
+                oldSelf.status.pendingPodCreate.podName && self.status.pendingPodCreate.replicaID ==
+                oldSelf.status.pendingPodCreate.replicaID && self.status.pendingPodCreate.planID ==
+                oldSelf.status.pendingPodCreate.planID && self.status.pendingPodCreate.operationID ==
+                oldSelf.status.pendingPodCreate.operationID && self.status.pendingPodCreate.createID ==
+                oldSelf.status.pendingPodCreate.createID))) || (!has(self.status.pendingPodCreate) &&
+                ((has(self.status.authorizedPodCreates) && self.status.authorizedPodCreates.exists(record,
+                record.workloadUID == oldSelf.status.pendingPodCreate.workloadUID && record.workloadGeneration
+                == oldSelf.status.pendingPodCreate.workloadGeneration && record.podName ==
+                oldSelf.status.pendingPodCreate.podName && record.replicaID ==
+                oldSelf.status.pendingPodCreate.replicaID && record.planID ==
+                oldSelf.status.pendingPodCreate.planID && record.operationID ==
+                oldSelf.status.pendingPodCreate.operationID && record.createID ==
+                oldSelf.status.pendingPodCreate.createID)) || (has(self.status.lastRejectedPodCreate) &&
+                (self.status.lastRejectedPodCreate.intent.workloadUID ==
+                oldSelf.status.pendingPodCreate.workloadUID &&
+                self.status.lastRejectedPodCreate.intent.workloadGeneration ==
+                oldSelf.status.pendingPodCreate.workloadGeneration &&
+                self.status.lastRejectedPodCreate.intent.podName == oldSelf.status.pendingPodCreate.podName &&
+                self.status.lastRejectedPodCreate.intent.replicaID == oldSelf.status.pendingPodCreate.replicaID
+                && self.status.lastRejectedPodCreate.intent.planID == oldSelf.status.pendingPodCreate.planID &&
+                self.status.lastRejectedPodCreate.intent.operationID ==
+                oldSelf.status.pendingPodCreate.operationID && self.status.lastRejectedPodCreate.intent.createID
+                == oldSelf.status.pendingPodCreate.createID &&
+                ((!has(self.status.lastRejectedPodCreate.intent.admissionUID) &&
+                !has(oldSelf.status.pendingPodCreate.admissionUID)) ||
+                (has(self.status.lastRejectedPodCreate.intent.admissionUID) &&
+                has(oldSelf.status.pendingPodCreate.admissionUID) &&
+                self.status.lastRejectedPodCreate.intent.admissionUID ==
+                oldSelf.status.pendingPodCreate.admissionUID))))))))
+              message: pending Pod create can only be cleared by its exact authorized or rejected resolution
+            - rule: >-
+                !has(oldSelf.status) || !has(oldSelf.status.lastRejectedPodCreate) || (has(self.status) &&
+                has(self.status.lastRejectedPodCreate) && (self.status.lastRejectedPodCreate ==
+                oldSelf.status.lastRejectedPodCreate || (has(oldSelf.status.pendingPodCreate) &&
+                self.status.lastRejectedPodCreate.intent.workloadUID ==
+                oldSelf.status.pendingPodCreate.workloadUID &&
+                self.status.lastRejectedPodCreate.intent.workloadGeneration ==
+                oldSelf.status.pendingPodCreate.workloadGeneration &&
+                self.status.lastRejectedPodCreate.intent.podName == oldSelf.status.pendingPodCreate.podName &&
+                self.status.lastRejectedPodCreate.intent.replicaID == oldSelf.status.pendingPodCreate.replicaID
+                && self.status.lastRejectedPodCreate.intent.planID == oldSelf.status.pendingPodCreate.planID &&
+                self.status.lastRejectedPodCreate.intent.operationID ==
+                oldSelf.status.pendingPodCreate.operationID && self.status.lastRejectedPodCreate.intent.createID
+                == oldSelf.status.pendingPodCreate.createID &&
+                ((!has(self.status.lastRejectedPodCreate.intent.admissionUID) &&
+                !has(oldSelf.status.pendingPodCreate.admissionUID)) ||
+                (has(self.status.lastRejectedPodCreate.intent.admissionUID) &&
+                has(oldSelf.status.pendingPodCreate.admissionUID) &&
+                self.status.lastRejectedPodCreate.intent.admissionUID ==
+                oldSelf.status.pendingPodCreate.admissionUID)))))
+              message: rejection evidence can only change to resolve the pending Pod create
             - rule: "!has(oldSelf.status) || !has(oldSelf.status.authorizedPodCreates) || (has(self.status) && has(self.status.authorizedPodCreates) && self.status.authorizedPodCreates + oldSelf.status.authorizedPodCreates == self.status.authorizedPodCreates)"
               message: authorized Pod create records cannot be removed or changed
             - rule: "!has(oldSelf.status) || !has(oldSelf.status.retiredReplicaSlots) || (has(self.status) && has(self.status.retiredReplicaSlots) && self.status.retiredReplicaSlots + oldSelf.status.retiredReplicaSlots == self.status.retiredReplicaSlots)"
@@ -79,6 +137,9 @@ spec:
                 - rule: "oldSelf.hasValue() ? (!has(oldSelf.value().podCreateProtocol) ? !has(self.podCreateProtocol) : self.podCreateProtocol == oldSelf.value().podCreateProtocol) : self.podCreateProtocol == 'reserved-create-v1'"
                   optionalOldSelf: true
                   message: Pod create protocol is immutable and legacy workloads cannot be enrolled
+                - rule: "oldSelf.hasValue() ? (!has(oldSelf.value().podCreateAdmissionProtocol) ? !has(self.podCreateAdmissionProtocol) : self.podCreateAdmissionProtocol == oldSelf.value().podCreateAdmissionProtocol) : self.podCreateAdmissionProtocol == 'claimed-create-v1'"
+                  optionalOldSelf: true
+                  message: Pod create admission protocol is immutable and legacy workloads cannot be enrolled
                 - rule: "!has(self.executionRequest) || self.executionProtocol == 'monotonic-scale-up-v1'"
                   message: execution requests require a workload created for monotonic scale-up
                 - rule: "!has(oldSelf.executionProtocol) || self.executionProtocol == oldSelf.executionProtocol"
@@ -93,6 +154,8 @@ spec:
                   message: changing operation identity requires a higher execution generation
                 - rule: "!has(oldSelf.executionRequest) || !has(self.executionRequest) || self.executionRequest.generation > oldSelf.executionRequest.generation || self.executionRequest == oldSelf.executionRequest"
                   message: changing an execution request requires a higher generation
+                - rule: "!has(oldSelf.executionRequest) || !has(self.executionRequest) || oldSelf.executionRequest.planID != self.executionRequest.planID || oldSelf.executionRequest.operationID != self.executionRequest.operationID || (has(oldSelf.executionRequest.minimumReadyReplicas) == has(self.executionRequest.minimumReadyReplicas) && (!has(oldSelf.executionRequest.minimumReadyReplicas) || self.executionRequest.minimumReadyReplicas == oldSelf.executionRequest.minimumReadyReplicas))"
+                  message: an operation cannot lower or change its persisted ready floor
                 - rule: "!has(oldSelf.executionFence) || has(self.executionFence)"
                   message: executionFence cannot be removed
                 - rule: "!has(oldSelf.executionFence) || !has(self.executionFence) || self.executionFence.generation >= oldSelf.executionFence.generation"
@@ -111,6 +174,8 @@ spec:
                   message: equal execution generations require matching identities
                 - rule: "!has(self.executionRequest) || self.executionRequest.targetReplicas == self.replicas"
                   message: execution request target must equal desired replicas
+                - rule: "!has(self.executionRequest) || self.executionRequest.purpose != 'staged-replacement-v1' || (has(self.executionRequest.minimumReadyReplicas) && self.executionRequest.minimumReadyReplicas >= self.availabilityFloor && self.executionRequest.minimumReadyReplicas <= self.executionRequest.targetReplicas)"
+                  message: staged replacement must persist its approved ready replica floor
                 - rule: "self.replicas <= oldSelf.replicas || (self.executionProtocol == 'monotonic-scale-up-v1' && has(self.executionRequest) && self.executionRequest.expectedReplicas == oldSelf.replicas && self.executionRequest.targetReplicas == self.replicas && (!has(oldSelf.executionRequest) || self.executionRequest.generation > oldSelf.executionRequest.generation))"
                   message: replica growth requires a new durable execution request
                 - rule: self.availabilityFloor <= self.replicas
@@ -124,6 +189,10 @@ spec:
                   type: string
                   enum: [reserved-create-v1]
                   description: Must be set when the workload UID is created; legacy owners remain uncertain.
+                podCreateAdmissionProtocol:
+                  type: string
+                  enum: [claimed-create-v1]
+                  description: Requires one durable admission request UID per CREATE; legacy owners cannot be enrolled.
                 workloadID:
                   type: string
                   minLength: 1
@@ -162,6 +231,33 @@ spec:
                       format: int32
                       minimum: 0
                       maximum: 1000
+                    purpose:
+                      type: string
+                      enum: [staged-replacement-v1]
+                    minimumReadyReplicas:
+                      type: integer
+                      format: int32
+                      minimum: 0
+                      maximum: 1000
+                    destinationNodes:
+                      type: array
+                      minItems: 1
+                      maxItems: 8
+                      x-kubernetes-list-type: map
+                      x-kubernetes-list-map-keys: [name]
+                      items:
+                        type: object
+                        required: [name, uid]
+                        properties:
+                          name:
+                            type: string
+                            minLength: 1
+                            maxLength: 253
+                            pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'
+                          uid:
+                            type: string
+                            minLength: 1
+                            maxLength: 128
                 executionFence:
                   type: object
                   required: [planID, operationID, generation, expectedGeneration, expectedReplicas, fencedGeneration]
@@ -467,6 +563,7 @@ spec:
                     workloadUID:
                       type: string
                       minLength: 1
+                      maxLength: 128
                     workloadGeneration:
                       type: integer
                       format: int64
@@ -474,19 +571,70 @@ spec:
                     podName:
                       type: string
                       minLength: 1
+                      maxLength: 253
                     replicaID:
                       type: string
                       minLength: 1
+                      maxLength: 63
                     planID:
                       type: string
                       minLength: 1
+                      maxLength: 253
                     operationID:
                       type: string
                       minLength: 1
+                      maxLength: 253
                     createID:
                       type: string
                       minLength: 1
                       maxLength: 64
+                    admissionUID:
+                      type: string
+                      minLength: 1
+                      maxLength: 64
+                lastRejectedPodCreate:
+                  type: object
+                  required: [intent, httpStatus]
+                  properties:
+                    httpStatus:
+                      type: integer
+                      enum: [400, 403, 422, 429]
+                    intent:
+                      type: object
+                      required: [workloadUID, workloadGeneration, podName, replicaID, planID, operationID, createID]
+                      properties:
+                        workloadUID:
+                          type: string
+                          minLength: 1
+                          maxLength: 128
+                        workloadGeneration:
+                          type: integer
+                          format: int64
+                          minimum: 1
+                        podName:
+                          type: string
+                          minLength: 1
+                          maxLength: 253
+                        replicaID:
+                          type: string
+                          minLength: 1
+                          maxLength: 63
+                        planID:
+                          type: string
+                          minLength: 1
+                          maxLength: 253
+                        operationID:
+                          type: string
+                          minLength: 1
+                          maxLength: 253
+                        createID:
+                          type: string
+                          minLength: 1
+                          maxLength: 64
+                        admissionUID:
+                          type: string
+                          minLength: 1
+                          maxLength: 64
                 authorizedPodCreates:
                   type: array
                   x-kubernetes-list-type: map
@@ -550,6 +698,34 @@ spec:
                       operationID:
                         type: string
                         minLength: 1
+                      sourceNodeName:
+                        type: string
+                        minLength: 1
+                      sourceNodeUID:
+                        type: string
+                        minLength: 1
+                      replacementPodUID:
+                        type: string
+                        minLength: 1
+                      replacementPodName:
+                        type: string
+                        minLength: 1
+                      replacementReplicaID:
+                        type: string
+                        minLength: 1
+                      replacementNodeName:
+                        type: string
+                        minLength: 1
+                      replacementNodeUID:
+                        type: string
+                        minLength: 1
+                      replacementCreateID:
+                        type: string
+                        minLength: 1
+                      replacementWorkloadGeneration:
+                        type: integer
+                        format: int64
+                        minimum: 1
                 execution:
                   type: object
                   required: [planID, operationID, generation, targetReplicas, phase]
@@ -566,6 +742,9 @@ spec:
                       type: integer
                       format: int32
                       minimum: 0
+                    purpose:
+                      type: string
+                      enum: [staged-replacement-v1]
                     phase:
                       type: string
                       enum: [RECONCILING, APPLIED, BLOCKED]

@@ -32,7 +32,72 @@ POD_CREATE_PLAN_ANNOTATION = "fleetright.io/pod-create-plan"
 POD_CREATE_OPERATION_ANNOTATION = "fleetright.io/pod-create-operation"
 POD_CREATE_ATTEMPT_ANNOTATION = "fleetright.io/pod-create-attempt"
 POD_CREATE_PROTOCOL = "reserved-create-v1"
+POD_CREATE_ADMISSION_PROTOCOL = "claimed-create-v1"
+POD_ADMISSION_PROBE_MARKER = "FLEETRIGHT_POD_ADMISSION_PROBE_REJECTED"
+POD_CREATE_ADMISSION_PROTOCOL_RULE = (
+    "oldSelf.hasValue() ? (!has(oldSelf.value().podCreateAdmissionProtocol) ? "
+    "!has(self.podCreateAdmissionProtocol) : "
+    "self.podCreateAdmissionProtocol == oldSelf.value().podCreateAdmissionProtocol) : "
+    "self.podCreateAdmissionProtocol == 'claimed-create-v1'"
+)
+_REJECTED_PENDING_CREATE_MATCH = (
+    "self.status.lastRejectedPodCreate.intent.workloadUID == "
+    "oldSelf.status.pendingPodCreate.workloadUID && "
+    "self.status.lastRejectedPodCreate.intent.workloadGeneration == "
+    "oldSelf.status.pendingPodCreate.workloadGeneration && "
+    "self.status.lastRejectedPodCreate.intent.podName == "
+    "oldSelf.status.pendingPodCreate.podName && "
+    "self.status.lastRejectedPodCreate.intent.replicaID == "
+    "oldSelf.status.pendingPodCreate.replicaID && "
+    "self.status.lastRejectedPodCreate.intent.planID == "
+    "oldSelf.status.pendingPodCreate.planID && "
+    "self.status.lastRejectedPodCreate.intent.operationID == "
+    "oldSelf.status.pendingPodCreate.operationID && "
+    "self.status.lastRejectedPodCreate.intent.createID == "
+    "oldSelf.status.pendingPodCreate.createID && "
+    "((!has(self.status.lastRejectedPodCreate.intent.admissionUID) && "
+    "!has(oldSelf.status.pendingPodCreate.admissionUID)) || "
+    "(has(self.status.lastRejectedPodCreate.intent.admissionUID) && "
+    "has(oldSelf.status.pendingPodCreate.admissionUID) && "
+    "self.status.lastRejectedPodCreate.intent.admissionUID == "
+    "oldSelf.status.pendingPodCreate.admissionUID))"
+)
+POD_CREATE_RESOLUTION_RULE = (
+    "!has(oldSelf.status) || !has(oldSelf.status.pendingPodCreate) || "
+    "(has(self.status) && ((has(self.status.pendingPodCreate) && "
+    "(self.status.pendingPodCreate == oldSelf.status.pendingPodCreate || "
+    "(!has(oldSelf.status.pendingPodCreate.admissionUID) && "
+    "has(self.status.pendingPodCreate.admissionUID) && "
+    "self.status.pendingPodCreate.workloadUID == oldSelf.status.pendingPodCreate.workloadUID && "
+    "self.status.pendingPodCreate.workloadGeneration == "
+    "oldSelf.status.pendingPodCreate.workloadGeneration && "
+    "self.status.pendingPodCreate.podName == oldSelf.status.pendingPodCreate.podName && "
+    "self.status.pendingPodCreate.replicaID == oldSelf.status.pendingPodCreate.replicaID && "
+    "self.status.pendingPodCreate.planID == oldSelf.status.pendingPodCreate.planID && "
+    "self.status.pendingPodCreate.operationID == oldSelf.status.pendingPodCreate.operationID && "
+    "self.status.pendingPodCreate.createID == oldSelf.status.pendingPodCreate.createID))) || "
+    "(!has(self.status.pendingPodCreate) && "
+    "((has(self.status.authorizedPodCreates) && "
+    "self.status.authorizedPodCreates.exists(record, "
+    "record.workloadUID == oldSelf.status.pendingPodCreate.workloadUID && "
+    "record.workloadGeneration == oldSelf.status.pendingPodCreate.workloadGeneration && "
+    "record.podName == oldSelf.status.pendingPodCreate.podName && "
+    "record.replicaID == oldSelf.status.pendingPodCreate.replicaID && "
+    "record.planID == oldSelf.status.pendingPodCreate.planID && "
+    "record.operationID == oldSelf.status.pendingPodCreate.operationID && "
+    "record.createID == oldSelf.status.pendingPodCreate.createID)) || "
+    f"(has(self.status.lastRejectedPodCreate) && "
+    f"({_REJECTED_PENDING_CREATE_MATCH}))))))"
+)
+POD_CREATE_REJECTION_RULE = (
+    "!has(oldSelf.status) || !has(oldSelf.status.lastRejectedPodCreate) || "
+    "(has(self.status) && has(self.status.lastRejectedPodCreate) && "
+    "(self.status.lastRejectedPodCreate == oldSelf.status.lastRejectedPodCreate || "
+    "(has(oldSelf.status.pendingPodCreate) && "
+    f"{_REJECTED_PENDING_CREATE_MATCH})))"
+)
 _DNS_LABEL = re.compile(r"[a-z0-9](?:[-a-z0-9]*[a-z0-9])?\Z")
+_POD_GENERATION = re.compile(r"[1-9][0-9]{0,18}\Z")
 _QUANTITY = re.compile(r"([0-9]+(?:\.[0-9]+)?|\.[0-9]+)(n|u|m|Ki|Mi|Gi|Ti|Pi|Ei|K|M|G|T|P|E)?\Z")
 _DECIMAL_MULTIPLIERS = {
     None: Decimal(1),
@@ -55,8 +120,11 @@ _DECIMAL_MULTIPLIERS = {
 
 
 class ApiError(RuntimeError):
-    def __init__(self, status: int, message: str):
+    def __init__(self, status: int, message: str, *, status_message: str | None = None):
         self.status = status
+        self.status_message = (
+            POD_ADMISSION_PROBE_MARKER if status_message == POD_ADMISSION_PROBE_MARKER else None
+        )
         super().__init__(message)
 
 
@@ -118,7 +186,22 @@ class KubernetesAPI:
             with self.opener.open(request, timeout=10) as response:
                 content = response.read()
         except HTTPError as error:
-            raise ApiError(error.code, f"Kubernetes API returned HTTP {error.code}") from error
+            status_message = None
+            try:
+                status_body = json.loads(error.read(8_192))
+                raw_message = status_body.get("message") if isinstance(status_body, dict) else None
+                if isinstance(raw_message, str) and POD_ADMISSION_PROBE_MARKER in raw_message:
+                    status_message = POD_ADMISSION_PROBE_MARKER
+            except (OSError, ValueError):
+                pass
+            finally:
+                status_body = raw_message = None
+                error.close()
+            raise ApiError(
+                error.code,
+                f"Kubernetes API returned HTTP {error.code}",
+                status_message=status_message,
+            ) from error
         except (TimeoutError, URLError, OSError) as error:
             raise RuntimeError("Kubernetes API request failed") from error
         if not content:
@@ -134,6 +217,10 @@ class KubernetesAPI:
     def list_workloads(self) -> list[dict[str, Any]]:
         path = f"{GROUP_VERSION_PATH}/namespaces/{self.namespace}/fleetrightworkloads"
         return self.request("GET", path).get("items", [])
+
+    def get_workload(self, name: str) -> dict[str, Any]:
+        path = f"{GROUP_VERSION_PATH}/namespaces/{self.namespace}/fleetrightworkloads/{name}"
+        return self.request("GET", path)
 
     def list_nodes(self) -> list[dict[str, Any]]:
         return self.request("GET", "/api/v1/nodes").get("items", [])
@@ -154,6 +241,20 @@ class KubernetesAPI:
 
     def create_pod(self, pod: dict[str, Any]) -> dict[str, Any]:
         path = f"/api/v1/namespaces/{self.namespace}/pods"
+        probe = deepcopy(pod)
+        probe["metadata"]["name"] = "fleetright-pod-admission-probe"
+        probe["metadata"]["annotations"][POD_CREATE_ATTEMPT_ANNOTATION] = "admission-probe"
+        try:
+            self.request("POST", f"{path}?dryRun=All", probe)
+        except ApiError as error:
+            if error.status != 403 or error.status_message != POD_ADMISSION_PROBE_MARKER:
+                raise SafetyError(
+                    "PodAdmissionFenceUnavailable", "mandatory Pod CREATE admission is unconfirmed"
+                ) from error
+        else:
+            raise SafetyError(
+                "PodAdmissionFenceUnavailable", "mandatory Pod CREATE admission is unconfirmed"
+            )
         return self.request("POST", path, pod)
 
     def get_pdb(self, name: str) -> dict[str, Any] | None:
@@ -367,7 +468,9 @@ def _pod_object(
     metadata, spec = workload["metadata"], workload["spec"]
     template = _validate_template(spec.get("podTemplate"))
     placement = spec["placement"]
-    allowed_nodes = [node["name"] for node in placement["allowedNodes"]]
+    request = spec.get("executionRequest")
+    destinations = request.get("destinationNodes") if isinstance(request, dict) else None
+    allowed_nodes = [node["name"] for node in (destinations or placement["allowedNodes"])]
     labels = _pod_labels(workload, ordinal)
     intent = intent or _pod_create_intent(workload, ordinal)
     topology = placement.get("topology")
@@ -451,9 +554,14 @@ def _pod_object(
 def _pdb_object(workload: dict[str, Any]) -> dict[str, Any]:
     metadata, spec = workload["metadata"], workload["spec"]
     disruption = spec["disruption"]
+    request = spec.get("executionRequest")
+    minimum_ready = max(
+        spec["availabilityFloor"],
+        request.get("minimumReadyReplicas", 0) if isinstance(request, dict) else 0,
+    )
     max_unavailable = min(
         disruption["maxConcurrentDisruptions"],
-        spec["replicas"] - spec["availabilityFloor"],
+        spec["replicas"] - minimum_ready,
     )
     return {
         "apiVersion": "policy/v1",
@@ -467,6 +575,7 @@ def _pdb_object(workload: dict[str, Any]) -> dict[str, Any]:
         "spec": {
             "maxUnavailable": max_unavailable,
             "selector": {"matchLabels": {WORKLOAD_UID_LABEL: metadata["uid"]}},
+            "unhealthyPodEvictionPolicy": "IfHealthyBudget",
         },
     }
 
@@ -582,7 +691,8 @@ def _check_existing_pod_identity(pod: dict[str, Any], workload: dict[str, Any]) 
     if (
         not isinstance(annotations, dict)
         or not isinstance(annotations.get(WORKLOAD_GENERATION_ANNOTATION), str)
-        or not annotations[WORKLOAD_GENERATION_ANNOTATION].isdecimal()
+        or not _POD_GENERATION.fullmatch(annotations[WORKLOAD_GENERATION_ANNOTATION])
+        or int(annotations[WORKLOAD_GENERATION_ANNOTATION]) > 2**63 - 1
         or not all(
             isinstance(annotations.get(key), str) and annotations[key]
             for key in (
@@ -607,12 +717,12 @@ def _check_existing_pod_identity(pod: dict[str, Any], workload: dict[str, Any]) 
 def _has_create_authorization(pod: dict[str, Any], workload: dict[str, Any]) -> bool:
     try:
         _check_existing_pod_identity(pod, workload)
-    except (SafetyError, AttributeError, TypeError):
+        metadata = pod["metadata"]
+        annotations = metadata["annotations"]
+        generation = int(annotations[WORKLOAD_GENERATION_ANNOTATION])
+    except (SafetyError, AttributeError, TypeError, ValueError):
         return False
-    metadata = pod["metadata"]
-    annotations = metadata["annotations"]
     logical_id = metadata["labels"][REPLICA_ID_LABEL]
-    generation = int(annotations[WORKLOAD_GENERATION_ANNOTATION])
     records = workload.get("status", {}).get("authorizedPodCreates", [])
     if not isinstance(records, list):
         return False
@@ -659,11 +769,42 @@ def _allowed_nodes(
             )
         names.append(name)
         uids[name] = uid
+    request = workload["spec"].get("executionRequest")
+    destinations = request.get("destinationNodes") if isinstance(request, dict) else None
+    if destinations is not None:
+        if (
+            not isinstance(destinations, list)
+            or not destinations
+            or len(destinations) > 8
+            or any(
+                not isinstance(node, dict)
+                or not isinstance(node.get("name"), str)
+                or node.get("name") not in uids
+                or node.get("uid") != uids[node["name"]]
+                for node in destinations
+            )
+            or len({node["name"] for node in destinations}) != len(destinations)
+        ):
+            raise SafetyError(
+                "InvalidDestinationNodes",
+                "destination Nodes must be a nonempty subset of approved Node identities",
+            )
+        names = [node["name"] for node in destinations]
     return names, uids
 
 
 def _retired_replica_slots(workload: dict[str, Any]) -> list[dict[str, Any]]:
     slots = workload.get("status", {}).get("retiredReplicaSlots", [])
+    replacement_fields = (
+        "replacementPodUID",
+        "replacementPodName",
+        "replacementReplicaID",
+        "replacementNodeName",
+        "replacementNodeUID",
+        "replacementCreateID",
+        "replacementWorkloadGeneration",
+    )
+    source_fields = ("sourceNodeName", "sourceNodeUID")
     if not isinstance(slots, list) or any(
         not isinstance(record, dict)
         or not all(
@@ -677,6 +818,20 @@ def _retired_replica_slots(workload: dict[str, Any]) -> list[dict[str, Any]]:
             )
         )
         or type(record.get("workloadGeneration")) is not int
+        or (
+            any(key in record for key in source_fields)
+            and not all(isinstance(record.get(key), str) and record[key] for key in source_fields)
+        )
+        or (
+            any(key in record for key in replacement_fields)
+            and (
+                not all(
+                    isinstance(record.get(key), str) and record[key]
+                    for key in replacement_fields[:-1]
+                )
+                or type(record.get("replacementWorkloadGeneration")) is not int
+            )
+        )
         for record in slots
     ):
         raise SafetyError("InvalidRetirementHistory", "retired replica slot history is invalid")
@@ -720,6 +875,11 @@ def _validate_spec(
         raise SafetyError(
             "LegacyPodCreateUncertain",
             "legacy workload UID has untracked Pod CREATE history; create a new workload UID",
+        )
+    if spec.get("podCreateAdmissionProtocol") != POD_CREATE_ADMISSION_PROTOCOL:
+        raise SafetyError(
+            "LegacyPodCreateUncertain",
+            "legacy workload UID has no claimed Pod CREATE admission; create a new workload UID",
         )
     if workload.get("status", {}).get("podCreateHistoryUncertain") is True:
         raise SafetyError(
@@ -779,6 +939,17 @@ def _validate_spec(
         or type(execution.get("targetReplicas")) is not int
         or execution["targetReplicas"] != spec["replicas"]
         or execution["expectedReplicas"] > execution["targetReplicas"]
+        or execution.get("purpose") not in (None, "staged-replacement-v1")
+        or (
+            execution.get("purpose") == "staged-replacement-v1"
+            and (
+                execution["targetReplicas"] != execution["expectedReplicas"] + 1
+                or spec.get("surgeBudget", 0) < 1
+                or type(execution.get("minimumReadyReplicas")) is not int
+                or execution["minimumReadyReplicas"] < spec["availabilityFloor"]
+                or execution["minimumReadyReplicas"] > execution["targetReplicas"]
+            )
+        )
     ):
         raise SafetyError(
             "InvalidExecutionRequest", "execution request identity or target is invalid"
@@ -906,20 +1077,10 @@ def _status(
         }
         or bool(unverified_pods)
     )
-    retired_ids = {
-        record.get("replicaID")
-        for record in old.get("retiredReplicaSlots", [])
-        if isinstance(record, dict)
-    }
-    retired_in_desired_range = any(
-        f"{workload.get('spec', {}).get('workloadID')}-{ordinal}" in retired_ids
-        for ordinal in range(desired)
-    )
     counts_are_trustworthy = (
         reason in {"Reconciled", "ScaleDownRequiresStagedExecution"}
         and not unverified_pods
         and not history_uncertain
-        and not retired_in_desired_range
     )
     ready = counts_are_trustworthy and ready_replicas >= desired
     available = counts_are_trustworthy and ready_replicas >= floor
@@ -979,6 +1140,8 @@ def _status(
         status["execution"] = old["execution"]
     if isinstance(old.get("pendingPodCreate"), dict):
         status["pendingPodCreate"] = old["pendingPodCreate"]
+    if isinstance(old.get("lastRejectedPodCreate"), dict):
+        status["lastRejectedPodCreate"] = old["lastRejectedPodCreate"]
     if history_uncertain:
         status["podCreateHistoryUncertain"] = True
     if isinstance(old.get("authorizedPodCreates"), list):
@@ -998,8 +1161,19 @@ def _validate_execution_request(workload: dict[str, Any]) -> None:
     observed_generation = status.get("observedGeneration")
     expected = request["expectedReplicas"]
     fence = spec.get("executionFence")
+    if isinstance(fence, dict) and (
+        fence.get("generation", 0) > request["generation"]
+        or (
+            fence.get("generation") == request["generation"]
+            and (fence.get("planID"), fence.get("operationID"))
+            != (request["planID"], request["operationID"])
+        )
+    ):
+        raise SafetyError(
+            "StaleExecutionAuthority", "execution request was superseded by a newer fence"
+        )
     same_operation = isinstance(previous, dict) and all(
-        previous.get(key) == request[key] for key in ("planID", "operationID")
+        previous.get(key) == request.get(key) for key in ("planID", "operationID", "purpose")
     )
     if same_operation and (
         type(previous.get("generation")) is int
@@ -1082,6 +1256,8 @@ def _write_status(
             },
             "phase": execution_phase,
         }
+        if "purpose" in request:
+            desired["execution"]["purpose"] = request["purpose"]
     if desired != old:
         result = api.patch_status(metadata["name"], metadata["resourceVersion"], desired)
         result_metadata = result.get("metadata", {}) if isinstance(result, dict) else {}
@@ -1098,6 +1274,8 @@ def _write_execution_phase(api: Any, workload: dict[str, Any], phase: str) -> No
     identity = {
         key: request[key] for key in ("planID", "operationID", "generation", "targetReplicas")
     }
+    if "purpose" in request:
+        identity["purpose"] = request["purpose"]
     execution = {**identity, "phase": phase}
     old_status = workload.get("status", {})
     if old_status.get("execution") == execution:
@@ -1138,8 +1316,13 @@ def _write_pending_pod_create(api: Any, workload: dict[str, Any], intent: dict[s
     workload["status"] = status
 
 
-def _clear_pending_pod_create(api: Any, workload: dict[str, Any]) -> bool:
+def _clear_pending_pod_create(api: Any, workload: dict[str, Any], http_status: int) -> bool:
     status = dict(workload.get("status", {}))
+    intent = status.get("pendingPodCreate")
+    if not isinstance(intent, dict) or http_status not in {400, 403, 422, 429}:
+        raise SafetyError("PodCreateOutcomeUnknown", "Pod create has no definitive rejection")
+    rejection = {"intent": intent, "httpStatus": http_status}
+    status["lastRejectedPodCreate"] = rejection
     status["pendingPodCreate"] = None
     try:
         result = api.patch_status(
@@ -1155,6 +1338,7 @@ def _clear_pending_pod_create(api: Any, workload: dict[str, Any]) -> bool:
         not isinstance(metadata.get("resourceVersion"), str)
         or not isinstance(returned_status, dict)
         or returned_status.get("pendingPodCreate") is not None
+        or returned_status.get("lastRejectedPodCreate") != rejection
     ):
         raise SafetyError(
             "PodCreateOutcomeUnknown", "Kubernetes did not confirm Pod create intent resolution"
@@ -1168,6 +1352,27 @@ def _clear_pending_pod_create(api: Any, workload: dict[str, Any]) -> bool:
 def _authorize_pending_pod_create(
     api: Any, workload: dict[str, Any], intent: dict[str, Any], pod: dict[str, Any]
 ) -> None:
+    get_workload = getattr(api, "get_workload", None)
+    if callable(get_workload):
+        current = get_workload(workload["metadata"]["name"])
+        metadata = current.get("metadata", {})
+        status = current.get("status", {})
+        pending = status.get("pendingPodCreate") if isinstance(status, dict) else None
+        if (
+            not isinstance(metadata, dict)
+            or metadata.get("uid") != intent["workloadUID"]
+            or not isinstance(metadata.get("resourceVersion"), str)
+            or not isinstance(pending, dict)
+            or not isinstance(pending.get("admissionUID"), str)
+            or not pending["admissionUID"]
+            or ("admissionUID" in intent and intent["admissionUID"] != pending["admissionUID"])
+            or pending != {**intent, "admissionUID": pending["admissionUID"]}
+        ):
+            raise SafetyError(
+                "PodCreateOutcomeUnknown", "the exact API-server admission claim is unresolved"
+            )
+        workload["metadata"] = metadata
+        workload["status"] = status
     _check_pending_pod(pod, workload, intent)
     annotations = pod["metadata"]["annotations"]
     record = {
@@ -1221,8 +1426,9 @@ def _write_retired_slot_tombstone(
     plan_id: str,
     operation_id: str,
     nodes: list[dict[str, Any]],
+    replacement: dict[str, Any] | None = None,
 ) -> None:
-    # shortcut: CR status cannot fence admitted CREATE; upgrade before enabling retirement.
+    # shortcut: legacy or unresolved CREATE history cannot be fenced by a retirement status CAS.
     if not all(isinstance(value, str) and value for value in (plan_id, operation_id)):
         raise SafetyError("InvalidRetirementIntent", "retirement operation identity is required")
     _, approved_uids = _validate_spec(workload, nodes)
@@ -1235,6 +1441,10 @@ def _write_retired_slot_tombstone(
         )
     _check_existing_pod(pod, workload)
     supplied_metadata = pod["metadata"]
+    source_node_name = pod.get("spec", {}).get("nodeName")
+    source_node_uid = approved_uids.get(source_node_name)
+    if not isinstance(source_node_name, str) or not isinstance(source_node_uid, str):
+        raise SafetyError("RetirementIdentityConflict", "source Node identity is not approved")
     supplied_record = {
         "workloadUID": workload["metadata"]["uid"],
         "replicaID": supplied_metadata["labels"][REPLICA_ID_LABEL],
@@ -1242,7 +1452,50 @@ def _write_retired_slot_tombstone(
         "workloadGeneration": int(supplied_metadata["annotations"][WORKLOAD_GENERATION_ANNOTATION]),
         "planID": plan_id,
         "operationID": operation_id,
+        "sourceNodeName": source_node_name,
+        "sourceNodeUID": source_node_uid,
     }
+    if replacement is not None:
+        identity = {
+            "replacementPodUID": replacement.get("replacement_pod_uid"),
+            "replacementPodName": replacement.get("replacement_pod_name"),
+            "replacementReplicaID": replacement.get("replacement_replica_id"),
+            "replacementNodeName": replacement.get("replacement_node_id"),
+            "replacementNodeUID": replacement.get("replacement_node_uid"),
+            "replacementCreateID": replacement.get("replacement_create_id"),
+            "replacementWorkloadGeneration": replacement.get("replacement_workload_generation"),
+        }
+        if (
+            not all(
+                isinstance(identity[key], str) and identity[key]
+                for key in (
+                    "replacementPodUID",
+                    "replacementPodName",
+                    "replacementReplicaID",
+                    "replacementNodeName",
+                    "replacementNodeUID",
+                    "replacementCreateID",
+                )
+            )
+            or type(identity["replacementWorkloadGeneration"]) is not int
+            or approved_uids.get(identity["replacementNodeName"]) != identity["replacementNodeUID"]
+            or not any(
+                record.get("workloadUID") == workload["metadata"]["uid"]
+                and record.get("podUID") == identity["replacementPodUID"]
+                and record.get("podName") == identity["replacementPodName"]
+                and record.get("replicaID") == identity["replacementReplicaID"]
+                and record.get("workloadGeneration") == identity["replacementWorkloadGeneration"]
+                and record.get("planID") == plan_id
+                and record.get("operationID") == operation_id
+                and record.get("createID") == identity["replacementCreateID"]
+                for record in _authorized_pod_creates(workload)
+            )
+        ):
+            raise SafetyError(
+                "RetirementReplacementIdentityInvalid",
+                "replacement identity is not authorized for this operation",
+            )
+        supplied_record.update(identity)
     retired = list(_retired_replica_slots(workload))
     existing = next(
         (item for item in retired if item["replicaID"] == supplied_record["replicaID"]), None
@@ -1269,7 +1522,13 @@ def _write_retired_slot_tombstone(
         "workloadGeneration": int(annotations[WORKLOAD_GENERATION_ANNOTATION]),
         "planID": plan_id,
         "operationID": operation_id,
+        "sourceNodeName": source_node_name,
+        "sourceNodeUID": source_node_uid,
     }
+    if replacement is not None:
+        record.update(
+            {key: value for key, value in supplied_record.items() if key.startswith("replacement")}
+        )
     if existing is not None and existing != record:
         raise SafetyError(
             "RetirementIdentityConflict", "logical slot already has another tombstone"
@@ -1340,6 +1599,8 @@ def _ensure_pdb(api: Any, workload: dict[str, Any]) -> None:
     if (
         existing_spec.get("selector") != desired["spec"]["selector"]
         or existing_spec.get("maxUnavailable") != desired["spec"]["maxUnavailable"]
+        or existing_spec.get("unhealthyPodEvictionPolicy")
+        != desired["spec"]["unhealthyPodEvictionPolicy"]
         or workload_generation > int(raw_generation)
     ):
         api.patch_pdb(name, version, desired["spec"], desired["metadata"]["annotations"])
@@ -1354,7 +1615,7 @@ def reconcile_workload(api: Any, workload: dict[str, Any], nodes: list[dict[str,
         if not isinstance(uid, str) or not uid:
             raise SafetyError("InvalidIdentity", "workload UID is required")
         pods = api.list_pods(uid)
-        _, approved_uids = _validate_spec(workload, nodes)
+        destination_names, approved_uids = _validate_spec(workload, nodes)
 
         pending = workload.get("status", {}).get("pendingPodCreate")
         if pending is not None:
@@ -1384,7 +1645,7 @@ def reconcile_workload(api: Any, workload: dict[str, Any], nodes: list[dict[str,
             if pending_pod is None:
                 return
             _check_pending_pod(pending_pod, workload, pending)
-            _validate_scheduled_pod(pending_pod, approved_uids, nodes)
+            _validate_scheduled_pod(pending_pod, approved_uids, nodes, destination_names)
             if all(pod.get("metadata", {}).get("name") != pending["podName"] for pod in pods):
                 pods.append(pending_pod)
             _authorize_pending_pod_create(api, workload, pending, pending_pod)
@@ -1412,14 +1673,6 @@ def reconcile_workload(api: Any, workload: dict[str, Any], nodes: list[dict[str,
 
         desired = workload["spec"]["replicas"]
         retired_ids = {record["replicaID"] for record in _retired_replica_slots(workload)}
-        if any(
-            f"{workload['spec']['workloadID']}-{ordinal}" in retired_ids
-            for ordinal in range(desired)
-        ):
-            raise SafetyError(
-                "RetiredReplicaRequiresNewOperation",
-                "ordinary reconciliation cannot complete while a desired slot is retired",
-            )
         live_pods = [
             pod for pod in pods if pod.get("status", {}).get("phase") not in {"Succeeded", "Failed"}
         ]
@@ -1451,22 +1704,13 @@ def reconcile_workload(api: Any, workload: dict[str, Any], nodes: list[dict[str,
                 "nonterminal Pod retirement requires staged PDB-aware execution",
             )
 
-        # Phase 1 ordinary reconciliation never consumes surgeBudget. It is
-        # reserved for a future explicit staged-replacement protocol.
         maximum_live = desired
-        for ordinal in range(desired):
-            if ordinal in pods_by_ordinal:
-                continue
+        ordinal = 0
+        while live_count < maximum_live:
             replica_id = f"{workload['spec']['workloadID']}-{ordinal}"
-            if any(
-                record["replicaID"] == replica_id for record in _retired_replica_slots(workload)
-            ):
-                raise SafetyError(
-                    "RetiredReplicaRequiresNewOperation",
-                    "ordinary reconciliation cannot restore a durably retired logical slot",
-                )
-            if live_count >= maximum_live:
-                break
+            if ordinal in pods_by_ordinal or replica_id in retired_ids:
+                ordinal += 1
+                continue
             name = _pod_name(uid, ordinal)
             pod = api.get_pod(name)
             if pod is not None:
@@ -1475,6 +1719,7 @@ def reconcile_workload(api: Any, workload: dict[str, Any], nodes: list[dict[str,
                 pods_by_ordinal[ordinal] = pod
                 pods.append(pod)
                 live_count += 1
+                ordinal += 1
                 continue
             intent = _pod_create_intent(workload, ordinal)
             _write_pending_pod_create(api, workload, intent)
@@ -1489,14 +1734,15 @@ def reconcile_workload(api: Any, workload: dict[str, Any], nodes: list[dict[str,
                             "Pod create conflicted but the deterministic name is not observable",
                         ) from error
                     _check_pending_pod(existing, workload, intent)
-                    _validate_scheduled_pod(existing, approved_uids, nodes)
+                    _validate_scheduled_pod(existing, approved_uids, nodes, destination_names)
                     _authorize_pending_pod_create(api, workload, intent, existing)
                     pods_by_ordinal[ordinal] = existing
                     pods.append(existing)
                     live_count += 1
+                    ordinal += 1
                     continue
                 if error.status in {400, 403, 422, 429}:
-                    if not _clear_pending_pod_create(api, workload):
+                    if not _clear_pending_pod_create(api, workload, error.status):
                         return
                     raise SafetyError(
                         "PodCreateRejectedByAPIServer",
@@ -1504,11 +1750,13 @@ def reconcile_workload(api: Any, workload: dict[str, Any], nodes: list[dict[str,
                     ) from error
                 raise
             _check_pending_pod(created, workload, intent)
+            _validate_scheduled_pod(created, approved_uids, nodes, destination_names)
             _authorize_pending_pod_create(api, workload, intent, created)
             pods_by_ordinal[ordinal] = created
             pods.append(created)
             live_count += 1
-        if all(ordinal in pods_by_ordinal for ordinal in range(desired)):
+            ordinal += 1
+        if len(pods_by_ordinal) >= desired:
             _write_execution_phase(api, workload, "APPLIED")
         _write_status(api, workload, pods, "Reconciled", "workload reconciled from API state")
     except SafetyError as error:
@@ -1524,7 +1772,10 @@ def reconcile_workload(api: Any, workload: dict[str, Any], nodes: list[dict[str,
 
 
 def _validate_scheduled_pod(
-    pod: dict[str, Any], approved_uids: dict[str, str], nodes: list[dict[str, Any]]
+    pod: dict[str, Any],
+    approved_uids: dict[str, str],
+    nodes: list[dict[str, Any]],
+    expected_destinations: list[str] | None = None,
 ) -> None:
     terms = (
         pod.get("spec", {})
@@ -1549,12 +1800,16 @@ def _validate_scheduled_pod(
             ):
                 raise SafetyError("PodOutsideAllowedNodes", "Pod allowed placement is invalid")
             actual_allowed.add(fields[0]["values"][0])
-    if actual_allowed != set(approved_uids):
+    if (
+        not actual_allowed
+        or not actual_allowed.issubset(approved_uids)
+        or (expected_destinations is not None and actual_allowed != set(expected_destinations))
+    ):
         raise SafetyError("PodOutsideAllowedNodes", "Pod allowed placement differs from workload")
     scheduled_name = pod.get("spec", {}).get("nodeName")
     if not scheduled_name:
         return
-    if scheduled_name not in approved_uids:
+    if scheduled_name not in actual_allowed:
         raise SafetyError("PodOutsideAllowedNodes", "Pod is scheduled outside the allowed Node set")
     current_node = next(
         (node for node in nodes if node.get("metadata", {}).get("name") == scheduled_name),

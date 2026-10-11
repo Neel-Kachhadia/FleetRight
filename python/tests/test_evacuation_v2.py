@@ -177,6 +177,19 @@ def test_v2_snapshot_hash_round_trip_and_cpp_planner_verifier() -> None:
     assert admission == []
     assert summary["evacuations"][0]["source_pod_uid"]
     assert summary["evacuations"][0]["source_node_uid"]
+    operation = summary["evacuations"][0]
+    proto_operation = api_module._proto_blocks(plan_text, "operations")[0]
+    assert operation["baseline_replicas"] == api_module._proto_scalar(
+        proto_operation, "baseline_replicas", 0
+    )
+    assert operation["maximum_temporary_surge_replicas"] == api_module._proto_scalar(
+        proto_operation, "maximum_temporary_surge_replicas", 0
+    )
+    assert operation["destination_node_ids"] == api_module._proto_scalars(
+        api_module._proto_blocks(proto_operation, "destinations")[0], "allowed_node_ids"
+    )
+    assert operation["permitted_intermediate_states"]
+    assert operation["actions"]
 
     unsupported = api_module._execution_admission_reasons(
         {**summary, "evacuation_count": 2}, source["workloads"], "kubernetes-workload"

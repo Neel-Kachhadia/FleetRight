@@ -1512,7 +1512,7 @@ def test_unknown_action_blocks_dispatch_until_observed(clean_database: Database)
 
 
 class RetirementGateTarget(FakeScaleTarget):
-    source_retirement_is_read_only = True
+    source_retirement_preparation_enabled = True
 
     def __init__(self, failure: Exception) -> None:
         super().__init__(1)
@@ -1587,7 +1587,55 @@ def test_retirement_action_fails_safe_at_unproven_create_fence(
     assert execution["status"] == plan["state"] == "FAILED_SAFE"
 
 
-def test_read_only_retirement_reconciles_running_action_after_takeover(
+@pytest.mark.parametrize("blocked_stage", ["PDB_BLOCKED", "PDB_STATUS_PENDING"])
+def test_pre_tombstone_pdb_block_retries_replacement_preparation(
+    clean_database: Database, blocked_stage: str
+) -> None:
+    class PDBRetryTarget(FakeScaleTarget):
+        source_retirement_preparation_enabled = True
+
+        def __init__(self) -> None:
+            super().__init__(1)
+            self.prepare_calls = 0
+            self.observe_retirement_calls = 0
+
+        def prepare_source_retirement(self, *_args: object) -> dict[str, object]:
+            self.prepare_calls += 1
+            if self.prepare_calls == 1:
+                return {"stage": blocked_stage}
+            return {
+                "stage": "READY_FOR_SAFE_EVICTION",
+                "source_retirement_intent_recorded": True,
+            }
+
+        def observe_source_retirement(self, *_args: object, **_kwargs: object):
+            self.observe_retirement_calls += 1
+            raise AssertionError("PDB block without a tombstone cannot enter eviction recovery")
+
+    repo = clean_database.repository
+    _prepare_retirement_action(repo, f"retirement-pdb-{blocked_stage.lower()}")
+    target = PDBRetryTarget()
+    controller = ExecutionController(repo, target, FakeHealth(), "controller-a")
+
+    controller.run_once()
+    controller.run_once()
+
+    with repo.transaction() as conn:
+        action = conn.execute(
+            "SELECT execution_state, execution_result FROM action_intents "
+            "WHERE plan_id = %s AND intent_id = 'retire'",
+            (f"retirement-pdb-{blocked_stage.lower()}",),
+        ).fetchone()
+
+    results = [item["result"] for item in action["execution_result"]["progress"]]
+    assert target.prepare_calls == 2
+    assert target.observe_retirement_calls == 0
+    assert action["execution_state"] == "RUNNING"
+    assert results[-1]["stage"] == "READY_FOR_SAFE_EVICTION"
+    assert results[-1]["source_retirement_intent_recorded"] is True
+
+
+def test_retirement_takeover_stays_unresolved_without_target_fence(
     clean_database: Database,
 ) -> None:
     repo = clean_database.repository
@@ -1630,14 +1678,13 @@ def test_read_only_retirement_reconciles_running_action_after_takeover(
             "retire",
             execution["controller_fencing_token"],
         )
-    assert target.retirement_calls == 1
-    assert action["execution_state"] == "FAILED"
-    assert action["execution_result"]["progress"][-1]["result"] == {"stage": "RETIREMENT_RECHECKED"}
-    assert execution["status"] == "FAILED_SAFE"
-    assert fence["no_target_mutation"] is True
+    assert target.retirement_calls == 0
+    assert action["execution_state"] == "RUNNING"
+    assert execution["status"] == "EXECUTING"
+    assert fence is None
 
 
-def test_read_only_retirement_resolves_control_request_without_dispatch(
+def test_retirement_control_request_waits_for_target_fence_before_settling(
     clean_database: Database,
 ) -> None:
     repo = clean_database.repository
@@ -1673,9 +1720,9 @@ def test_read_only_retirement_resolves_control_request_without_dispatch(
             "SELECT status FROM plan_executions WHERE plan_id = 'retirement-pause'"
         ).fetchone()
     assert target.retirement_calls == 0
-    assert action["execution_state"] == "FAILED"
-    assert action["execution_error"] == "source-retirement-stopped-for-control-request"
-    assert execution["status"] == "PAUSED"
+    assert action["execution_state"] == "RUNNING"
+    assert action["execution_error"] is None
+    assert execution["status"] == "EXECUTING"
 
 
 def test_retirement_unknown_outcome_stays_blocked_after_controller_takeover(
@@ -1702,7 +1749,7 @@ def test_retirement_unknown_outcome_stays_blocked_after_controller_takeover(
         execution = conn.execute(
             "SELECT status FROM plan_executions WHERE plan_id = 'retirement-unknown'"
         ).fetchone()
-    assert target.retirement_calls == 2
+    assert target.retirement_calls == 1
     assert action["execution_state"] == "OUTCOME_UNKNOWN"
     assert execution["status"] == "EXECUTING"
 

@@ -1,5 +1,66 @@
 # V2 Execution Progress
 
+## 2026-10-11 Prompt 2B — replacement and eviction safety checkpoint (incomplete)
+
+**Execution window:** began approximately 11:21 UTC; six-hour hard stop is
+approximately 17:21 UTC. Checkpoint recorded around 14:39 UTC; engineering is
+continuing. **Branch:** `phase4/safe-execution-reconciliation`. **Starting
+SHA:** `b2345a05bbffa6979ebaacc0594ea17c8c9c88a0`. Prompt 3 has not started.
+Milestone 4 is not qualified; no tag or push was made.
+
+### Implemented and connected
+
+- The V2 `PREPARE_SOURCE_RETIREMENT` action stays on the authenticated API,
+  PostgreSQL journal, `ExecutionController`, and `FleetRightWorkloadTarget`
+  path. The target publishes durable staged replacement intent, waits for a
+  controller-authorized Pod, checks its observed Pod UID, Node UID, Ready
+  state, warm-up, workload readiness, topology and PDB, then writes the
+  source-UID tombstone before reporting readiness for eviction.
+- Pod CREATE admission now claims the immutable pending-create request UID in
+  FleetRightWorkload status before allowing that CREATE. The validating
+  webhook is installed fail closed in the dedicated lab. Unresolved creates
+  and legacy owner history remain retirement blockers.
+- Policy/v1 Eviction admission validates executor identity, current workload
+  request/fence, durable source/replacement identity, exact source Pod UID and
+  resourceVersion, Node UIDs, replacement readiness, approved placement and
+  the controller-owned PDB. The target does not retry an uncertain eviction
+  until observation determines the prior request is safe to retry.
+- A journal retry bug is fixed: `PDB_BLOCKED` and `PDB_STATUS_PENDING` results
+  without a persisted retirement tombstone re-enter replacement preparation;
+  the same stages with a tombstone reconcile as possible eviction outcomes.
+
+### Verification
+
+| Check | Result | Evidence / limit |
+|---|---|---|
+| Python and PostgreSQL suite | PASS, 364 passed / 6 skipped | Full `python/tests`; isolated `fleetright_test` DB, one existing Starlette TestClient deprecation warning. The six skips are optional environment-gated Docker/Kind cases; the dedicated live test below was run separately. |
+| C++ / CTest | PASS, 38/38 | `ctest --test-dir build --output-on-failure -j2`. |
+| Ruff, formatting, compilation, shell syntax, diff | PASS | `ruff check python`, changed-file format check, `compileall`, installer `bash -n`, and `git diff --check`. |
+| Live replacement and permitted PDB Eviction | PASS, target-level | Two-run live test against Kubernetes 1.37.0 created a real controller-owned replacement, recorded its observed Pod/Node UIDs, and completed policy/v1 Eviction. A response lost after Kubernetes accepted Eviction was reconciled by observing source removal and two Ready replicas. This does not include the API/journal in that live invocation. |
+| Live PDB-blocked replacement | PASS, target-level | Managed PDB with `maxUnavailable: 0` returned `PDB_BLOCKED`; no source tombstone or deletion was observed. |
+| Delayed stale Eviction dispatch after fence takeover | PASS, target-level | Controller A paused after target prechecks and before sending its Eviction. A target using fence 14 took over; the live validating webhook rejected A's request carrying fence 13. The current target then evicted that same source. This is not a real two-process `ExecutionController` takeover test. |
+| Admission webhook installation | PASS | Installer completed against only `kind-fleetright-safety-lab`; fail-closed webhook rejected a dry-run Pod probe. |
+| Secret scan | PASS with one reviewed false positive | `detect-secrets` found only the Kubernetes `secretName: fleetright-pod-admission-tls` reference; the manifest contains no credential value. |
+
+### Remaining qualification gates
+
+| Requirement | Result | Evidence / next work |
+|---|---|---|
+| Live API -> PostgreSQL -> controller -> Kubernetes evacuation | BLOCKED / NOT RUN | API/journal path passes deterministic integration tests, and live target path passes separately. The only pre-existing `cpu-api` in the lab is a legacy FWW; it was left untouched. No end-to-end live plan was fabricated. |
+| Delayed CREATE after takeover on live API server | NOT RUN | Unit adversarial tests still prove pending CREATE blocks retirement and late legacy Pods remain unverified. Need a live held CREATE/admission response test. |
+| Already-admitted Eviction response delayed across takeover | NOT RUN | Live coverage proves a stale request not yet admitted is fenced and separately reconciles a lost response after accepted Eviction. It does not prove an already-admitted request held across a real process takeover. |
+| Real process crash and controller takeover | NOT RUN | PostgreSQL journal unit/integration recovery tests pass; no live Kubernetes process interruption/takeover run was completed. |
+| Multi-replica or node drain, partial-drain recovery | DISABLED / NOT IMPLEMENTED | V2 deactivation and multi-action drain remain rejected. No Pod deletion or Node termination path was added. |
+| Kubernetes health-regression compensation | BLOCKED / NOT QUALIFIED | Docker compensation regressions were previously exercised; no Kubernetes compensation recovery was claimed. |
+| Kubernetes legacy owner policy | PASS, fail closed | Legacy CREATE history remains uncertain and target rejects it before mutation; new workload UIDs require the reserved-create and admission protocols. |
+| Milestone 4 | INCOMPLETE | Live API/journal E2E, delayed CREATE, admitted-request takeover/crash recovery, bounded drain and Kubernetes compensation remain unqualified. No milestone tag is created. |
+
+The live safety test created and deleted only uniquely named temporary objects
+in `fleetright-v2`. The existing legacy `cpu-api`, other namespaces, clusters,
+and database objects were not modified. Continue work before the hard deadline;
+keep DRAIN_NODE, DEACTIVATE_NODE, scale-down and Kubernetes compensation
+disabled unless their required evidence passes.
+
 ## 2026-10-11 Prompt 2B — journaled source-retirement preparation gate
 
 **Session start:** 10:35:07 UTC. **Starting SHA:**

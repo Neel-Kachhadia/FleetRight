@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,6 +11,7 @@ from types import SimpleNamespace
 import fleetright.execution as execution_module
 import pytest
 from fleetright.api import create_app
+from fleetright.control import Repository
 from fleetright.execution import (
     _WORKLOAD_AUTHORIZED_POD_CREATES_RULE,
     _WORKLOAD_CREATE_HISTORY_UNCERTAIN_RULE,
@@ -30,6 +32,14 @@ from fleetright.execution import (
     valid_execution_health_policy,
 )
 from fleetright.reconciler import ExecutionController
+from fleetright.workload_controller import (
+    POD_CREATE_ATTEMPT_ANNOTATION,
+    POD_CREATE_OPERATION_ANNOTATION,
+    POD_CREATE_PLAN_ANNOTATION,
+    WORKLOAD_GENERATION_ANNOTATION,
+    _pod_name,
+    _pod_object,
+)
 
 
 def _skip_fencing_crd_preflight(
@@ -382,13 +392,14 @@ def test_kubernetes_roles_publish_requests_and_leave_pod_creation_to_controller(
     workload_rbac = (root / "deploy/kubernetes/fleetright-workload-controller.yaml").read_text()
 
     assert 'resources: ["fleetrightworkloads"]' in api_rbac
+    assert 'resources: ["fleetrightworkloads/status"]' in api_rbac
     assert 'verbs: ["get", "patch"]' in api_rbac
     assert 'resourceNames: ["fleetrightworkloads.fleetright.io"]' in api_rbac
     assert 'resources: ["customresourcedefinitions"]' in api_rbac
-    assert 'resources: ["pods"]\n    verbs: ["get"]' in api_rbac
+    assert 'resources: ["pods"]\n    verbs: ["get", "list"]' in api_rbac
     assert 'resources: ["nodes"]\n    verbs: ["get"]' in api_rbac
     assert 'resources: ["deployments"]' not in api_rbac
-    assert 'resources: ["pods/eviction"]' not in api_rbac
+    assert 'resources: ["pods/eviction"]\n    verbs: ["create"]' in api_rbac
     assert 'resources: ["pods"]\n    verbs: ["get", "list", "create"]' in workload_rbac
     assert 'verbs: ["get", "list", "create", "delete"]' not in workload_rbac
     assert 'resources: ["pods/eviction"]' not in workload_rbac
@@ -407,8 +418,28 @@ def _workload_object() -> dict[str, object]:
             "workloadID": "cpu-api",
             "executionProtocol": "monotonic-scale-up-v1",
             "podCreateProtocol": "reserved-create-v1",
+            "podCreateAdmissionProtocol": "claimed-create-v1",
+            "surgeBudget": 2,
+            "networkMbps": 0,
+            "disruption": {"maxConcurrentDisruptions": 1},
+            "placement": {
+                "allowedNodes": [
+                    {"name": "worker-a", "uid": "node-uid"},
+                    {"name": "worker-b", "uid": "worker-b-uid"},
+                ]
+            },
             "replicas": 2,
             "availabilityFloor": 1,
+            "podTemplate": {
+                "containers": [
+                    {
+                        "name": "api",
+                        "image": "fleetright-workload:local",
+                        "resources": {"requests": {"cpu": "100m", "memory": "64Mi"}},
+                        "readinessProbe": {"httpGet": {"path": "/ready", "port": 8080}},
+                    }
+                ]
+            },
         },
         "status": {
             "observedGeneration": 4,
@@ -416,6 +447,7 @@ def _workload_object() -> dict[str, object]:
             "readyReplicas": 2,
             "availableReplicas": 2,
             "conditions": [{"type": "Reconciled", "status": "True"}],
+            "authorizedPodCreates": [],
         },
     }
 
@@ -424,7 +456,7 @@ def _retirement_payload(**changes: object) -> dict[str, object]:
     return {
         "operation_id": "verified-operation",
         "replica_id": "cpu-api-0",
-        "source_pod_name": "cpu-api-0",
+        "source_pod_name": _pod_name("workload-uid", 0),
         "source_pod_uid": "source-pod-uid",
         "source_controller_uid": "workload-uid",
         "source_node_id": "worker-a",
@@ -434,7 +466,15 @@ def _retirement_payload(**changes: object) -> dict[str, object]:
         "source_owner_uid": "workload-uid",
         "source_logical_slot_id": "cpu-api-0",
         "destination_node_ids": ["worker-b"],
+        "destination_nodes": [{"name": "worker-b", "uid": "worker-b-uid"}],
         "workload_generation": 4,
+        "baseline_replicas": 2,
+        "surge_desired_replicas": 3,
+        "final_desired_replicas": 3,
+        "maximum_live_replicas": 4,
+        "maximum_temporary_surge_replicas": 2,
+        "profile_required_replicas": 2,
+        "readiness_stabilization_ms": 0,
         **changes,
     }
 
@@ -445,18 +485,39 @@ def _install_source_observation(
     *,
     pod_uid: str = "source-pod-uid",
     node_uid: str = "node-uid",
+    workload: dict[str, object] | None = None,
+    replacement_pod: dict[str, object] | None = None,
 ) -> None:
+    source_name = _pod_name("workload-uid", 0)
+    source_intent = {
+        "workloadUID": "workload-uid",
+        "workloadGeneration": 4,
+        "podName": source_name,
+        "replicaID": "cpu-api-0",
+        "planID": "initial-plan",
+        "operationID": "initial-operation",
+        "createID": "source-create",
+    }
+    source_workload = deepcopy(workload or _workload_object())
+    source_workload["metadata"]["generation"] = 4  # type: ignore[index]
+    source_workload["spec"].pop("executionRequest", None)  # type: ignore[union-attr]
+    source = _pod_object(source_workload, 0, source_intent)
+    source["metadata"].update(name=source_name, uid=pod_uid, resourceVersion="3")
+    source["spec"]["nodeName"] = "worker-a"
+    source["status"] = {
+        "phase": "Running",
+        "conditions": [{"type": "Ready", "status": "True"}],
+    }
     objects = {
-        "pod": {
+        "node": {"metadata": {"name": "worker-a", "uid": node_uid}},
+        "pdb": {
             "metadata": {
-                "name": "cpu-api-0",
-                "uid": pod_uid,
-                "labels": {
-                    "fleetright.io/workload-uid": "workload-uid",
-                    "fleetright.io/replica-id": "cpu-api-0",
-                },
+                "name": "cpu-api",
+                "generation": 2,
+                "annotations": {WORKLOAD_GENERATION_ANNOTATION: "5"},
                 "ownerReferences": [
                     {
+                        "apiVersion": "fleetright.io/v1alpha1",
                         "kind": "FleetRightWorkload",
                         "name": "cpu-api",
                         "uid": "workload-uid",
@@ -464,47 +525,473 @@ def _install_source_observation(
                     }
                 ],
             },
-            "spec": {"nodeName": "worker-a"},
+            "spec": {
+                "selector": {"matchLabels": {"fleetright.io/workload-uid": "workload-uid"}},
+                "unhealthyPodEvictionPolicy": "IfHealthyBudget",
+            },
+            "status": {
+                "observedGeneration": 2,
+                "desiredHealthy": 2,
+                "currentHealthy": 3,
+                "disruptionsAllowed": 1,
+                "expectedPods": 3,
+                "disruptedPods": {},
+            },
         },
-        "node": {"metadata": {"name": "worker-a", "uid": node_uid}},
     }
+    if workload is not None:
+        status = workload["status"]
+        assert isinstance(status, dict)
+        records = status.setdefault("authorizedPodCreates", [])
+        assert isinstance(records, list)
+        if not any(record.get("podUID") == pod_uid for record in records):
+            records.append({**source_intent, "podUID": pod_uid})
 
     def read_object(*args: str) -> dict[str, object]:
-        return deepcopy(objects[args[1]])
+        if args[:2] == ("get", "fleetrightworkload") and workload is not None:
+            return deepcopy(workload)
+        if args[:2] == ("patch", "fleetrightworkload") and workload is not None:
+            patch = json.loads(args[args.index("-p") + 1])
+            metadata = workload["metadata"]
+            spec = workload["spec"]
+            assert isinstance(metadata, dict) and isinstance(spec, dict)
+            if patch["metadata"]["resourceVersion"] != metadata["resourceVersion"]:
+                raise TargetPreconditionFailed("workload resourceVersion changed")
+            if "--subresource=status" in args:
+                status = workload["status"]
+                assert isinstance(status, dict)
+                status.update(patch["status"])
+            else:
+                spec.update(patch["spec"])
+                metadata["generation"] += 1
+            metadata["resourceVersion"] = str(int(metadata["resourceVersion"]) + 1)
+            return deepcopy(workload)
+        if args[:2] == ("get", "nodes"):
+            return {
+                "items": [
+                    {"metadata": {"name": "worker-a", "uid": node_uid}},
+                    {"metadata": {"name": "worker-b", "uid": "worker-b-uid"}},
+                ]
+            }
+        if args[:2] == ("get", "pdb"):
+            pdb = deepcopy(objects["pdb"])
+            if workload is not None:
+                pdb["metadata"]["annotations"][WORKLOAD_GENERATION_ANNOTATION] = str(
+                    workload["metadata"]["generation"]
+                )
+            return pdb
+        if args[:2] == ("get", "pod"):
+            if replacement_pod is not None and args[2] == replacement_pod["metadata"]["name"]:  # type: ignore[index]
+                return deepcopy(replacement_pod)
+            if args[2] == source_name:
+                return deepcopy(source)
+        if args[:2] == ("get", "node") and args[2] in {"worker-a", "worker-b"}:
+            uid = objects["node"]["metadata"]["uid"] if args[2] == "worker-a" else "worker-b-uid"  # type: ignore[index]
+            return {"metadata": {"name": args[2], "uid": uid}}
+        return deepcopy(objects.get(args[1], {}))
 
     monkeypatch.setattr(target, "_json", read_object)
 
 
-def test_source_retirement_target_blocks_before_writing_a_tombstone(
+@pytest.mark.parametrize("replacement_already_authorized", [False, True])
+def test_source_retirement_takeover_publishes_a_target_fence_before_claim(
+    monkeypatch: pytest.MonkeyPatch, replacement_already_authorized: bool
+) -> None:
+    target = FleetRightWorkloadTarget(namespace="fleetright-v2")
+    _skip_fencing_crd_preflight(monkeypatch, target)
+    state = _workload_object()
+    pre_observation = target._observe(state, "cpu-api")
+    if replacement_already_authorized:
+        state["metadata"].update(generation=5, resourceVersion="9")  # type: ignore[index]
+        state["spec"]["replicas"] = 3  # type: ignore[index]
+        state["spec"]["executionRequest"] = {
+            "planID": "verified-plan",
+            "operationID": "verified-operation",
+            "generation": 13,
+            "expectedReplicas": 2,
+            "targetReplicas": 3,
+            "minimumReadyReplicas": 2,
+            "destinationNodes": [{"name": "worker-b", "uid": "worker-b-uid"}],
+            "purpose": "staged-replacement-v1",
+        }  # type: ignore[index]
+        state["spec"]["executionFence"] = {
+            "planID": "verified-plan",
+            "operationID": "verified-operation",
+            "generation": 13,
+            "expectedGeneration": 4,
+            "expectedReplicas": 2,
+            "fencedGeneration": 5,
+        }  # type: ignore[index]
+        state["status"].update(  # type: ignore[index]
+            observedGeneration=5,
+            replicas=3,
+            readyReplicas=3,
+            availableReplicas=3,
+            execution={
+                "planID": "verified-plan",
+                "operationID": "verified-operation",
+                "generation": 13,
+                "targetReplicas": 3,
+                "purpose": "staged-replacement-v1",
+                "phase": "APPLIED",
+            },
+        )
+    _install_source_observation(monkeypatch, target, workload=state)
+    action = {
+        "intent_id": "verified-operation",
+        "action_type": "PREPARE_SOURCE_RETIREMENT",
+        "workload_id": "cpu-api",
+        "execution_state": "RUNNING",
+        "execution_result": {"pre_observation": pre_observation},
+        "payload": _retirement_payload(),
+    }
+    records: list[tuple[object, ...]] = []
+    monkeypatch.setattr(Repository, "prepare_execution_takeover", lambda *_: 14)
+    monkeypatch.setattr(Repository, "incomplete_actions", lambda *_: [action])
+    monkeypatch.setattr(Repository, "execution_fence_receipt", lambda *_: None)
+    monkeypatch.setattr(Repository, "record_execution_fence", lambda *args: records.append(args))
+    monkeypatch.setattr(Repository, "claim_execution_controller", lambda *_: 14)
+    controller = ExecutionController(
+        SimpleNamespace(transaction=lambda: nullcontext(object())),
+        target,
+        SimpleNamespace(),
+        "controller-b",
+    )
+
+    token = controller._claim(
+        {
+            "plan_id": "verified-plan",
+            "controller_id": "controller-a",
+            "controller_lease_expired": True,
+            "controller_fencing_token": 13,
+        }
+    )
+
+    assert token == 14
+    assert state["spec"]["executionFence"]["generation"] == 14  # type: ignore[index]
+    assert state["metadata"]["generation"] == 5 + int(replacement_already_authorized)  # type: ignore[index]
+    receipt = records[-1][-1]
+    assert receipt["state"] == "COMPLETE"  # type: ignore[index]
+    assert receipt["token"] == 14  # type: ignore[index]
+    assert receipt["observation"]["fencing_token"] == 14  # type: ignore[index]
+
+
+def test_source_retirement_publishes_plan_bounded_replacement_intent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     target = FleetRightWorkloadTarget(namespace="fleetright-v2")
-    observed = target._observe(_workload_object(), "cpu-api")
-    monkeypatch.setattr(target, "observe_scale", lambda _workload: observed)
-    _install_source_observation(monkeypatch, target)
+    _skip_fencing_crd_preflight(monkeypatch, target)
+    state = _workload_object()
+    _install_source_observation(monkeypatch, target, workload=state)
 
-    with pytest.raises(ActionBlocked, match="REPLACEMENT_POD_IDENTITY_UNAVAILABLE"):
-        target.prepare_source_retirement(
-            "cpu-api",
-            "verified-plan",
-            _retirement_payload(),
-        )
+    result = target.prepare_source_retirement(
+        "cpu-api", "verified-plan", _retirement_payload(), fencing_token=13
+    )
+
+    assert result["stage"] == "REPLACEMENT_REQUESTED"
+    assert state["spec"]["replicas"] == 3  # type: ignore[index]
+    assert state["spec"]["executionRequest"] == {  # type: ignore[index]
+        "planID": "verified-plan",
+        "operationID": "verified-operation",
+        "generation": 13,
+        "expectedReplicas": 2,
+        "targetReplicas": 3,
+        "minimumReadyReplicas": 2,
+        "destinationNodes": [{"name": "worker-b", "uid": "worker-b-uid"}],
+        "purpose": "staged-replacement-v1",
+    }
 
 
-def test_source_retirement_target_blocks_without_create_persistence_fence(
+def test_takeover_target_fence_rejects_a_delayed_replacement_patch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     target = FleetRightWorkloadTarget(namespace="fleetright-v2")
-    observed = target._observe(_workload_object(), "cpu-api")
-    monkeypatch.setattr(target, "observe_scale", lambda _workload: observed)
-    _install_source_observation(monkeypatch, target)
+    _skip_fencing_crd_preflight(monkeypatch, target)
+    state = _workload_object()
+    _install_source_observation(monkeypatch, target, workload=state)
+    apply_patch = target._json
+    old_patch_waiting = threading.Event()
+    release_old_patch = threading.Event()
+    old_errors: list[Exception] = []
 
-    with pytest.raises(ActionBlocked, match="POD_CREATE_PERSISTENCE_FENCE_UNPROVEN"):
+    def pause_old_patch(*args: str) -> dict[str, object]:
+        if (
+            args[:2] == ("patch", "fleetrightworkload")
+            and threading.current_thread().name == "controller-a"
+        ):
+            old_patch_waiting.set()
+            assert release_old_patch.wait(timeout=5)
+        return apply_patch(*args)
+
+    monkeypatch.setattr(target, "_json", pause_old_patch)
+
+    def old_authorization() -> None:
+        try:
+            target.prepare_source_retirement(
+                "cpu-api", "verified-plan", _retirement_payload(), fencing_token=13
+            )
+        except Exception as error:
+            old_errors.append(error)
+
+    old_controller = threading.Thread(name="controller-a", target=old_authorization)
+    old_controller.start()
+    assert old_patch_waiting.wait(timeout=5)
+    before_fence = target.observe_scale("cpu-api")
+    target.fence_scale(
+        "cpu-api",
+        14,
+        expected=before_fence,
+        plan_id="verified-plan",
+        operation_id="verified-operation",
+        target_replicas=3,
+        destination_nodes=[{"name": "worker-b", "uid": "worker-b-uid"}],
+        purpose="staged-replacement-v1",
+        minimum_ready_replicas=2,
+    )
+    release_old_patch.set()
+    old_controller.join(timeout=5)
+
+    assert not old_controller.is_alive()
+    assert len(old_errors) == 1 and isinstance(old_errors[0], TargetPreconditionFailed)
+    assert state["spec"]["replicas"] == 2  # type: ignore[index]
+    assert "executionRequest" not in state["spec"]  # type: ignore[operator]
+    assert state["spec"]["executionFence"]["generation"] == 14  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    ("fencing_token", "deleting", "pdb_state", "source_uid_changed"),
+    [
+        (13, False, "ready", False),
+        (13, True, "ready", False),
+        (14, False, "ready", False),
+        (13, False, "stale", False),
+        (13, False, "blocked", False),
+        (13, False, "ready", True),
+    ],
+)
+def test_source_retirement_binds_observed_ready_replacement_uid_and_node(
+    monkeypatch: pytest.MonkeyPatch,
+    fencing_token: int,
+    deleting: bool,
+    pdb_state: str,
+    source_uid_changed: bool,
+) -> None:
+    target = FleetRightWorkloadTarget(namespace="fleetright-v2")
+    _skip_fencing_crd_preflight(monkeypatch, target)
+    state = _workload_object()
+    state["metadata"].update(generation=5, resourceVersion="9")  # type: ignore[index]
+    state["spec"]["replicas"] = 3  # type: ignore[index]
+    state["spec"]["executionRequest"] = {  # type: ignore[index]
+        "planID": "verified-plan",
+        "operationID": "verified-operation",
+        "generation": 13,
+        "expectedReplicas": 2,
+        "targetReplicas": 3,
+        "minimumReadyReplicas": 2,
+        "destinationNodes": [{"name": "worker-b", "uid": "worker-b-uid"}],
+        "purpose": "staged-replacement-v1",
+    }
+    state["spec"]["executionFence"] = {  # type: ignore[index]
+        "planID": "verified-plan",
+        "operationID": "verified-operation",
+        "generation": 13,
+        "expectedGeneration": 4,
+        "expectedReplicas": 2,
+        "fencedGeneration": 5,
+    }
+    create = {
+        "workloadUID": "workload-uid",
+        "podUID": "replacement-pod-uid",
+        "podName": _pod_name("workload-uid", 2),
+        "replicaID": "cpu-api-2",
+        "workloadGeneration": 5,
+        "planID": "verified-plan",
+        "operationID": "verified-operation",
+        "createID": "create-attempt-2",
+    }
+    state["status"].update(  # type: ignore[index]
+        observedGeneration=5,
+        replicas=3,
+        readyReplicas=3,
+        availableReplicas=3,
+        authorizedPodCreates=[create],
+        execution={
+            "planID": "verified-plan",
+            "operationID": "verified-operation",
+            "generation": 13,
+            "targetReplicas": 3,
+            "purpose": "staged-replacement-v1",
+            "phase": "APPLIED",
+        },
+    )
+    replacement = {
+        "metadata": {
+            "name": create["podName"],
+            "uid": create["podUID"],
+            "labels": {
+                "fleetright.io/workload-uid": "workload-uid",
+                "fleetright.io/replica-id": "cpu-api-2",
+            },
+            "annotations": {
+                POD_CREATE_PLAN_ANNOTATION: "verified-plan",
+                POD_CREATE_OPERATION_ANNOTATION: "verified-operation",
+                POD_CREATE_ATTEMPT_ANNOTATION: "create-attempt-2",
+                WORKLOAD_GENERATION_ANNOTATION: "5",
+            },
+            "ownerReferences": [
+                {
+                    "kind": "FleetRightWorkload",
+                    "name": "cpu-api",
+                    "uid": "workload-uid",
+                    "controller": True,
+                }
+            ],
+        },
+        "spec": {"nodeName": "worker-b"},
+        "status": {
+            "phase": "Running",
+            "conditions": [
+                {
+                    "type": "Ready",
+                    "status": "True",
+                    "lastTransitionTime": "2000-01-01T00:00:00Z",
+                }
+            ],
+        },
+    }
+    if deleting:
+        replacement["metadata"]["deletionTimestamp"] = "2026-10-11T00:00:00Z"
+    _install_source_observation(monkeypatch, target, workload=state, replacement_pod=replacement)
+
+    original_json = target._json
+    source_reads = 0
+
+    def retirement_observation(*args: str) -> dict[str, object]:
+        nonlocal source_reads
+        value = original_json(*args)
+        if args[:2] == ("get", "pod") and args[2] == _pod_name("workload-uid", 0):
+            source_reads += 1
+            if source_uid_changed and source_reads == 2:
+                value["metadata"]["uid"] = "new-source-pod-uid"  # type: ignore[index]
+        if args[:2] == ("get", "pdb") and pdb_state != "ready":
+            status = value["status"]
+            assert isinstance(status, dict)
+            status.update(
+                observedGeneration=1 if pdb_state == "stale" else 2,
+                desiredHealthy=1 if pdb_state == "stale" else 2,
+                currentHealthy=1 if pdb_state == "stale" else 2,
+                disruptionsAllowed=0,
+            )
+        return value
+
+    monkeypatch.setattr(target, "_json", retirement_observation)
+
+    if source_uid_changed:
+        with pytest.raises(ActionBlocked, match="SOURCE_POD_UID_CHANGED"):
+            target.prepare_source_retirement(
+                "cpu-api", "verified-plan", _retirement_payload(), fencing_token=fencing_token
+            )
+        assert state["status"].get("retiredReplicaSlots", []) == []  # type: ignore[index]
+        return
+
+    result = target.prepare_source_retirement(
+        "cpu-api", "verified-plan", _retirement_payload(), fencing_token=fencing_token
+    )
+
+    if fencing_token == 14:
+        assert result == {"stage": "REPLACEMENT_REQUESTED", "surge_replicas": 3}
+        request = state["spec"]["executionRequest"]  # type: ignore[index]
+        assert request["expectedReplicas"] == 2
+        assert request["targetReplicas"] == 3
+        assert request["generation"] == 14
+        assert state["spec"]["replicas"] == 3  # type: ignore[index]
+        assert create in state["status"]["authorizedPodCreates"]  # type: ignore[index]
+        return
+    if deleting:
+        assert result == {"stage": "REPLACEMENT_WAITING_READY", "replica_id": "cpu-api-2"}
+        return
+    if pdb_state == "stale":
+        assert result["stage"] == "PDB_STATUS_PENDING"
+        assert state["status"].get("retiredReplicaSlots", []) == []  # type: ignore[index]
+        return
+    if pdb_state == "blocked":
+        assert result["stage"] == "PDB_BLOCKED"
+        assert state["status"].get("retiredReplicaSlots", []) == []  # type: ignore[index]
+        return
+    assert result == {
+        "stage": "READY_FOR_SAFE_EVICTION",
+        "workload_uid": "workload-uid",
+        "workload_generation": 5,
+        "source_pod_name": _pod_name("workload-uid", 0),
+        "source_pod_uid": "source-pod-uid",
+        "source_pod_resource_version": "3",
+        "source_node_id": "worker-a",
+        "source_node_uid": "node-uid",
+        "replacement_pod_name": create["podName"],
+        "replacement_pod_uid": "replacement-pod-uid",
+        "replacement_replica_id": "cpu-api-2",
+        "replacement_node_id": "worker-b",
+        "replacement_node_uid": "worker-b-uid",
+        "replacement_workload_generation": 5,
+        "replacement_create_id": "create-attempt-2",
+        "ready_since": "2000-01-01T00:00:00Z",
+        "source_retirement_intent_recorded": True,
+    }
+    tombstone = state["status"]["retiredReplicaSlots"][0]  # type: ignore[index]
+    assert tombstone["replicaID"] == "cpu-api-0"
+    assert tombstone["podUID"] == "source-pod-uid"
+    assert tombstone["planID"] == "verified-plan"
+    assert tombstone["operationID"] == "verified-operation"
+    assert tombstone["sourceNodeName"] == "worker-a"
+    assert tombstone["sourceNodeUID"] == "node-uid"
+    assert tombstone["replacementPodUID"] == "replacement-pod-uid"
+    assert tombstone["replacementNodeName"] == "worker-b"
+    assert tombstone["replacementNodeUID"] == "worker-b-uid"
+    captured: dict[str, object] = {}
+
+    def send_eviction(*args: str, stdin: str | None = None) -> SimpleNamespace:
+        captured["args"] = args
+        captured["body"] = json.loads(stdin or "{}")
+        return SimpleNamespace(stdout='{"kind":"Status","status":"Success"}')
+
+    monkeypatch.setattr(target, "_kubectl", send_eviction)
+    eviction_result = target.evict_source(
+        "cpu-api",
+        "verified-plan",
+        _retirement_payload(),
+        result,
+        fencing_token=13,
+    )
+    assert eviction_result["stage"] == "EVICTION_ACCEPTED"
+    assert any(
+        "/pods/" + _pod_name("workload-uid", 0) + "/eviction" in arg for arg in captured["args"]
+    )
+    eviction = captured["body"]
+    assert eviction["apiVersion"] == "policy/v1"
+    assert eviction["kind"] == "Eviction"
+    assert eviction["deleteOptions"]["preconditions"] == {
+        "uid": "source-pod-uid",
+        "resourceVersion": "3",
+    }
+    assert eviction["metadata"]["annotations"]["fleetright.io/fencing-token"] == "13"
+
+
+def test_source_retirement_rejects_unapproved_replacement_destination(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = FleetRightWorkloadTarget(namespace="fleetright-v2")
+    _skip_fencing_crd_preflight(monkeypatch, target)
+    state = _workload_object()
+    _install_source_observation(monkeypatch, target, workload=state)
+
+    with pytest.raises(ActionBlocked, match="DESTINATION_NODE_OUTSIDE_WORKLOAD_PLACEMENT"):
         target.prepare_source_retirement(
             "cpu-api",
             "verified-plan",
-            _retirement_payload(replacement_pod_uid="replacement-pod-uid"),
+            _retirement_payload(destination_nodes=[{"name": "worker-c", "uid": "worker-c-uid"}]),
+            fencing_token=13,
         )
+    assert "executionRequest" not in state["spec"]  # type: ignore[operator]
 
 
 def test_source_retirement_target_rejects_changed_source_authority(
@@ -536,6 +1023,7 @@ def test_source_retirement_target_revalidates_live_source_pod_and_node_uid(
     observed = target._observe(_workload_object(), "cpu-api")
     monkeypatch.setattr(target, "observe_scale", lambda _workload: observed)
     _install_source_observation(monkeypatch, target, pod_uid=pod_uid, node_uid=node_uid)
+    assert target._json("get", "node", "worker-a", "-o", "json")["metadata"]["uid"] == node_uid
 
     with pytest.raises(ActionBlocked, match=reason):
         target.prepare_source_retirement("cpu-api", "verified-plan", _retirement_payload())
@@ -584,11 +1072,7 @@ def test_source_retirement_target_fails_closed_on_unresolved_or_legacy_create(
         target.prepare_source_retirement(
             "cpu-api",
             "verified-plan",
-            {
-                "operation_id": "verified-operation",
-                "source_owner_uid": "workload-uid",
-                "workload_generation": 4,
-            },
+            _retirement_payload(),
         )
 
 
@@ -914,21 +1398,6 @@ def test_workload_authority_blocks_while_pod_create_outcome_is_unknown(
     [
         ({"podCreateHistoryUncertain": True}, "POD_CREATE_HISTORY_UNCERTAIN"),
         ({"unverifiedPodCreates": 1}, "POD_CREATE_HISTORY_UNCERTAIN"),
-        (
-            {
-                "retiredReplicaSlots": [
-                    {
-                        "workloadUID": "workload-uid",
-                        "replicaID": "cpu-api-1",
-                        "podUID": "source-pod-uid",
-                        "workloadGeneration": 4,
-                        "planID": "plan-retire",
-                        "operationID": "retire-1",
-                    }
-                ]
-            },
-            "RETIRED_SLOT_HISTORY_PRESENT",
-        ),
     ],
 )
 def test_workload_authority_stays_blocked_after_stale_pod_disappears(
@@ -952,6 +1421,40 @@ def test_workload_authority_stays_blocked_after_stale_pod_disappears(
             plan_id="plan-1",
             operation_id="action-1",
             target_replicas=3,
+        )
+
+
+def test_retirement_history_fences_only_the_exact_logical_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = FleetRightWorkloadTarget(namespace="fleetright-v2")
+    state = _workload_object()
+    state["status"]["retiredReplicaSlots"] = [
+        {
+            "workloadUID": "workload-uid",
+            "replicaID": "cpu-api-1",
+            "podUID": "source-pod-uid",
+            "workloadGeneration": 4,
+            "planID": "old-plan",
+            "operationID": "old-operation",
+        }
+    ]
+    observed = target._observe(state, "cpu-api")
+    monkeypatch.setattr(target, "observe_scale", lambda _: observed)
+    monkeypatch.setattr(target, "_require_fencing_schema", lambda: None)
+
+    with pytest.raises(ActionBlocked, match="SOURCE_REPLICA_ALREADY_RETIRED"):
+        target.authorize_scale(
+            "cpu-api",
+            12,
+            expected=observed,
+            plan_id="new-plan",
+            operation_id="new-operation",
+            target_replicas=3,
+            purpose="staged-replacement-v1",
+            minimum_ready_replicas=1,
+            source_replica_id="cpu-api-1",
+            source_pod_uid="source-pod-uid",
         )
 
 

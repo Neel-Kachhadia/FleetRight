@@ -33,6 +33,7 @@ from fleetright.control import (
 from fleetright.execution import (
     DockerComposeTarget,
     FleetRightWorkloadTarget,
+    TargetPreconditionFailed,
     WorkloadHealthObserver,
 )
 from fleetright.reconciler import ExecutionController
@@ -757,7 +758,7 @@ def test_execution_admission_allows_only_supported_plan_actions() -> None:
     ) == ["UNSUPPORTED_EXECUTION_WORKLOAD:memory-api"]
 
 
-def test_v2_plan_runs_journaled_retirement_preparation_and_fails_closed(
+def test_v2_plan_publishes_journaled_replacement_intent(
     clean_database: Database,
 ) -> None:
     from test_evacuation_v2 import _v2_snapshot
@@ -782,14 +783,25 @@ def test_v2_plan_runs_journaled_retirement_preparation_and_fails_closed(
                     "workloadID": "cpu-api",
                     "executionProtocol": "monotonic-scale-up-v1",
                     "podCreateProtocol": "reserved-create-v1",
-                    "replicas": 2,
+                    "podCreateAdmissionProtocol": "claimed-create-v1",
+                    "replicas": 3,
                     "availabilityFloor": 1,
+                    "surgeBudget": 2,
+                    "placement": {
+                        "allowedNodes": [
+                            {
+                                "name": item["node_id"],
+                                "uid": item["node_uid"],
+                            }
+                            for item in snapshot["evacuation_v2"]["nodes"]
+                        ]
+                    },
                 },
                 "status": {
                     "observedGeneration": 1,
-                    "replicas": 2,
-                    "readyReplicas": 2,
-                    "availableReplicas": 2,
+                    "replicas": 3,
+                    "readyReplicas": 3,
+                    "availableReplicas": 3,
                     "conditions": [{"type": "Reconciled", "status": "True"}],
                 },
             }
@@ -797,8 +809,22 @@ def test_v2_plan_runs_journaled_retirement_preparation_and_fails_closed(
         def observe_scale(self, _workload_id: str) -> dict[str, object]:
             return self._observe(self.workload, "cpu-api")
 
+        def _require_fencing_schema(self) -> None:
+            return None
+
         def _json(self, *args: str) -> dict[str, object]:
-            if args[0] != "get" or self.source is None:
+            if self.source is None:
+                raise AssertionError("retirement target attempted an unsupported Kubernetes call")
+            if args[0] == "patch" and args[1] == "fleetrightworkload":
+                patch = json.loads(args[args.index("-p") + 1])
+                metadata = self.workload["metadata"]
+                if patch["metadata"]["resourceVersion"] != metadata["resourceVersion"]:
+                    raise TargetPreconditionFailed("workload resourceVersion changed")
+                self.workload["spec"].update(patch["spec"])
+                metadata["generation"] += 1
+                metadata["resourceVersion"] = str(int(metadata["resourceVersion"]) + 1)
+                return deepcopy(self.workload)
+            if args[0] != "get":
                 raise AssertionError("retirement target attempted an unsupported Kubernetes call")
             if args[1] == "pod":
                 return {
@@ -830,11 +856,21 @@ def test_v2_plan_runs_journaled_retirement_preparation_and_fails_closed(
             raise AssertionError("retirement target read an unexpected Kubernetes resource")
 
         def prepare_source_retirement(
-            self, _workload_id: str, _plan_id: str, _payload: dict[str, object]
+            self,
+            _workload_id: str,
+            _plan_id: str,
+            _payload: dict[str, object],
+            *,
+            fencing_token: int | None = None,
         ) -> dict[str, object]:
             self.calls += 1
             self.source = _payload
-            return super().prepare_source_retirement(_workload_id, _plan_id, _payload)
+            return super().prepare_source_retirement(
+                _workload_id,
+                _plan_id,
+                _payload,
+                fencing_token=fencing_token,
+            )
 
     target = RetirementTarget()
 
@@ -864,6 +900,13 @@ def test_v2_plan_runs_journaled_retirement_preparation_and_fails_closed(
         assert action["action_type"] == "PREPARE_SOURCE_RETIREMENT"
         assert action["payload"]["source_pod_uid"]
         assert action["payload"]["source_node_uid"]
+        expected_nodes = {
+            node["node_id"]: node["node_uid"] for node in snapshot["evacuation_v2"]["nodes"]
+        }
+        assert action["payload"]["destination_nodes"] == [
+            {"name": name, "uid": expected_nodes[name]}
+            for name in action["payload"]["destination_node_ids"]
+        ]
         target.source = action["payload"]
         with clean_database.repository.transaction() as conn:
             artifacts = Repository.load_artifacts(conn, plan["plan_id"])
@@ -875,6 +918,12 @@ def test_v2_plan_runs_journaled_retirement_preparation_and_fails_closed(
         api_module._verify_source_retirement_actions(artifacts, plan["plan_id"], 2, journal_actions)
         forged_actions = deepcopy(journal_actions)
         forged_actions[0]["payload"]["source_pod_uid"] = "different-source"
+        with pytest.raises(ControlError, match="does not match verified V2 operation"):
+            api_module._verify_source_retirement_actions(
+                artifacts, plan["plan_id"], 2, forged_actions
+            )
+        forged_actions = deepcopy(journal_actions)
+        forged_actions[0]["payload"]["destination_nodes"][0]["uid"] = "different-node-uid"
         with pytest.raises(ControlError, match="does not match verified V2 operation"):
             api_module._verify_source_retirement_actions(
                 artifacts, plan["plan_id"], 2, forged_actions
@@ -926,10 +975,13 @@ def test_v2_plan_runs_journaled_retirement_preparation_and_fails_closed(
                 (plan["plan_id"],),
             ).fetchone()["status"]
         assert stored_action["action_type"] == "PREPARE_SOURCE_RETIREMENT"
-        assert stored_action["execution_state"] == "FAILED"
-        assert stored_action["execution_error"] == "REPLACEMENT_POD_IDENTITY_UNAVAILABLE"
-        assert stored_action["execution_result"]["result"]["blocked_at"] == "VALIDATE_REPLACEMENT"
-        assert execution_state == "FAILED_SAFE"
+        assert stored_action["execution_state"] == "RUNNING", stored_action
+        assert stored_action["execution_error"] is None
+        assert stored_action["execution_result"]["progress"][-1]["result"]["stage"] == (
+            "REPLACEMENT_REQUESTED"
+        )
+        assert target.workload["spec"]["executionRequest"]["purpose"] == ("staged-replacement-v1")
+        assert execution_state == "EXECUTING"
         assert target.calls == 1
 
 
