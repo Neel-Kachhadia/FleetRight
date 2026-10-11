@@ -757,25 +757,93 @@ def test_execution_admission_allows_only_supported_plan_actions() -> None:
     ) == ["UNSUPPORTED_EXECUTION_WORKLOAD:memory-api"]
 
 
-def test_verified_v2_plan_stays_out_of_the_execution_journal(clean_database: Database) -> None:
+def test_v2_plan_runs_journaled_retirement_preparation_and_fails_closed(
+    clean_database: Database,
+) -> None:
     from test_evacuation_v2 import _v2_snapshot
 
     now_ms = time.time_ns() // 1_000_000
     snapshot, _, _ = _v2_snapshot(now_ms)
     tokens, raw_tokens = _tokens()
-    target_calls: list[str] = []
 
-    class UnusedTarget:
-        def __getattr__(self, name: str) -> object:
-            target_calls.append(name)
-            raise AssertionError(f"rejected V2 plan reached target method {name}")
+    class RetirementTarget(FleetRightWorkloadTarget):
+        def __init__(self) -> None:
+            super().__init__(namespace="default")
+            self.calls = 0
+            self.source: dict[str, object] | None = None
+            self.workload = {
+                "metadata": {
+                    "name": "cpu-api",
+                    "uid": "workload-uid",
+                    "generation": 1,
+                    "resourceVersion": "1",
+                },
+                "spec": {
+                    "workloadID": "cpu-api",
+                    "executionProtocol": "monotonic-scale-up-v1",
+                    "podCreateProtocol": "reserved-create-v1",
+                    "replicas": 2,
+                    "availabilityFloor": 1,
+                },
+                "status": {
+                    "observedGeneration": 1,
+                    "replicas": 2,
+                    "readyReplicas": 2,
+                    "availableReplicas": 2,
+                    "conditions": [{"type": "Reconciled", "status": "True"}],
+                },
+            }
+
+        def observe_scale(self, _workload_id: str) -> dict[str, object]:
+            return self._observe(self.workload, "cpu-api")
+
+        def _json(self, *args: str) -> dict[str, object]:
+            if args[0] != "get" or self.source is None:
+                raise AssertionError("retirement target attempted an unsupported Kubernetes call")
+            if args[1] == "pod":
+                return {
+                    "metadata": {
+                        "name": self.source["source_pod_name"],
+                        "uid": self.source["source_pod_uid"],
+                        "labels": {
+                            "fleetright.io/workload-uid": "workload-uid",
+                            "fleetright.io/replica-id": self.source["source_logical_slot_id"],
+                        },
+                        "ownerReferences": [
+                            {
+                                "kind": "FleetRightWorkload",
+                                "name": "cpu-api",
+                                "uid": "workload-uid",
+                                "controller": True,
+                            }
+                        ],
+                    },
+                    "spec": {"nodeName": self.source["source_node_id"]},
+                }
+            if args[1] == "node":
+                return {
+                    "metadata": {
+                        "name": self.source["source_node_id"],
+                        "uid": self.source["source_node_uid"],
+                    }
+                }
+            raise AssertionError("retirement target read an unexpected Kubernetes resource")
+
+        def prepare_source_retirement(
+            self, _workload_id: str, _plan_id: str, _payload: dict[str, object]
+        ) -> dict[str, object]:
+            self.calls += 1
+            self.source = _payload
+            return super().prepare_source_retirement(_workload_id, _plan_id, _payload)
+
+    target = RetirementTarget()
 
     app = create_app(
         clean_database.repository,
         tokens=tokens,
         mode="EXECUTE",
         execution_target="kubernetes-workload",
-        target_adapter=UnusedTarget(),
+        target_adapter=target,
         health_observer=object(),
         start_execution_worker=False,
     )
@@ -784,44 +852,85 @@ def test_verified_v2_plan_stays_out_of_the_execution_journal(clean_database: Dat
             "/v1/optimize",
             headers={
                 "Authorization": f"Bearer {raw_tokens['recommender']}",
-                "Idempotency-Key": "verified-v2-remains-disabled",
+                "Idempotency-Key": "verified-v2-retirement-preparation",
             },
             json={"snapshot": snapshot},
         )
-        assert created.status_code == 200
+        assert created.status_code == 201
         plan = created.json()
-        assert plan["state"] == "REJECTED"
-        assert plan["verification_accepted"] is True
-        assert plan["admission_accepted"] is False
-        assert "UNSUPPORTED_EXECUTION_PROTOCOL_V2" in plan["reason_codes"]
-        assert plan["candidate_actions"] == []
+        assert plan["state"] == "VERIFIED"
+        assert plan["verification_accepted"] is True and plan["admission_accepted"] is True
+        action = plan["candidate_actions"][0]
+        assert action["action_type"] == "PREPARE_SOURCE_RETIREMENT"
+        assert action["payload"]["source_pod_uid"]
+        assert action["payload"]["source_node_uid"]
+        target.source = action["payload"]
+        with clean_database.repository.transaction() as conn:
+            artifacts = Repository.load_artifacts(conn, plan["plan_id"])
+            journal_actions = conn.execute(
+                "SELECT intent_id, action_type, workload_id, payload FROM action_intents "
+                "WHERE plan_id = %s ORDER BY action_sequence",
+                (plan["plan_id"],),
+            ).fetchall()
+        api_module._verify_source_retirement_actions(artifacts, plan["plan_id"], 2, journal_actions)
+        forged_actions = deepcopy(journal_actions)
+        forged_actions[0]["payload"]["source_pod_uid"] = "different-source"
+        with pytest.raises(ControlError, match="does not match verified V2 operation"):
+            api_module._verify_source_retirement_actions(
+                artifacts, plan["plan_id"], 2, forged_actions
+            )
+        forged_actions = deepcopy(journal_actions)
+        forged_actions.append(
+            {
+                **journal_actions[0],
+                "intent_id": "unverified-scale-action",
+                "action_type": "SET_REPLICA_COUNT",
+            }
+        )
+        with pytest.raises(ControlError, match="does not match verified V2 operations"):
+            api_module._verify_source_retirement_actions(
+                artifacts, plan["plan_id"], 2, forged_actions
+            )
 
-        app.state.execution_controller.run_once()
-        execute = client.post(
-            f"/v1/plans/{plan['plan_id']}/execute",
-            headers={
-                "Authorization": f"Bearer {raw_tokens['operator']}",
-                "Idempotency-Key": "verified-v2-execute-remains-disabled",
-            },
+        operator = f"Bearer {raw_tokens['operator']}"
+        approved = client.post(
+            f"/v1/plans/{plan['plan_id']}/approve",
+            headers={"Authorization": operator, "Idempotency-Key": "approve-v2-retirement"},
             json={},
         )
-        assert execute.status_code == 409
-        assert target_calls == []
+        assert approved.status_code == 200 and approved.json()["state"] == "APPROVED", approved.text
+        assert clean_database.repository.get_plan(plan["plan_id"])["state"] == "APPROVED"
+        execute = client.post(
+            f"/v1/plans/{plan['plan_id']}/execute",
+            headers={"Authorization": operator, "Idempotency-Key": "execute-v2-retirement"},
+            json={},
+        )
+        assert execute.status_code == 202, execute.text
+        execute_replay = client.post(
+            f"/v1/plans/{plan['plan_id']}/execute",
+            headers={"Authorization": operator, "Idempotency-Key": "execute-v2-retirement"},
+            json={},
+        )
+        assert execute_replay.status_code == 202
+        app.state.execution_controller.run_once()
+
         with clean_database.repository.transaction() as conn:
-            assert (
-                conn.execute(
-                    "SELECT count(*) AS n FROM action_intents WHERE plan_id=%s",
-                    (plan["plan_id"],),
-                ).fetchone()["n"]
-                == 0
-            )
-            assert (
-                conn.execute(
-                    "SELECT count(*) AS n FROM plan_executions WHERE plan_id=%s",
-                    (plan["plan_id"],),
-                ).fetchone()["n"]
-                == 0
-            )
+            stored_action = conn.execute(
+                "SELECT action_type, execution_state, execution_error, execution_result "
+                "FROM action_intents "
+                "WHERE plan_id = %s",
+                (plan["plan_id"],),
+            ).fetchone()
+            execution_state = conn.execute(
+                "SELECT status FROM plan_executions WHERE plan_id = %s",
+                (plan["plan_id"],),
+            ).fetchone()["status"]
+        assert stored_action["action_type"] == "PREPARE_SOURCE_RETIREMENT"
+        assert stored_action["execution_state"] == "FAILED"
+        assert stored_action["execution_error"] == "REPLACEMENT_POD_IDENTITY_UNAVAILABLE"
+        assert stored_action["execution_result"]["result"]["blocked_at"] == "VALIDATE_REPLACEMENT"
+        assert execution_state == "FAILED_SAFE"
+        assert target.calls == 1
 
 
 @pytest.mark.parametrize("unsupported_action", ["MOVE_REPLICA", "DEACTIVATE_NODE"])

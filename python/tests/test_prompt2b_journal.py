@@ -23,6 +23,7 @@ from fleetright.execution import (
     OutcomeUnknown,
     TargetNotFound,
     TargetPreconditionFailed,
+    TargetUnavailable,
 )
 from fleetright.reconciler import ExecutionController
 from psycopg import sql
@@ -283,11 +284,7 @@ class FakeFleetRightWorkloadTarget:
             raise TargetPreconditionFailed("workload changed after the authority fence")
         if same_request and not same_fence and not expected_unchanged:
             raise TargetPreconditionFailed("workload changed before fencing")
-        if (
-            not same_fence
-            and not same_request
-            and not expected_unchanged
-        ):
+        if not same_fence and not same_request and not expected_unchanged:
             raise TargetPreconditionFailed("workload precondition changed")
         prior_fence = self.execution_fence
         before = (
@@ -888,9 +885,7 @@ def test_workload_second_controller_recovers_fence_written_before_first_claim(
     clean_database: Database,
 ) -> None:
     repo = clean_database.repository
-    controller_a, _legacy_target, _health = _prepare_controller(
-        repo, "workload-second-fence", 2, 3
-    )
+    controller_a, _legacy_target, _health = _prepare_controller(repo, "workload-second-fence", 2, 3)
     target = FakeFleetRightWorkloadTarget(2)
     target.lose_before_authorize = True
     controller_a.target = target
@@ -997,8 +992,7 @@ def test_workload_takeover_replays_published_request_after_fence_response_loss(
             "WHERE plan_id = 'workload-published-fence-replay'"
         ).fetchone()
         execution = conn.execute(
-            "SELECT status FROM plan_executions "
-            "WHERE plan_id = 'workload-published-fence-replay'"
+            "SELECT status FROM plan_executions WHERE plan_id = 'workload-published-fence-replay'"
         ).fetchone()
         receipt = Repository.execution_fence_receipt(
             conn, "workload-published-fence-replay", "scale", pending_token
@@ -1050,8 +1044,7 @@ def test_old_takeover_receipt_cannot_close_or_unfence_a_new_dispatch(
     stale_observation = next(
         item["observation"]
         for item in reversed(action["execution_result"]["progress"])
-        if isinstance(item.get("result"), dict)
-        and "dispatch_target_replicas" in item["result"]
+        if isinstance(item.get("result"), dict) and "dispatch_target_replicas" in item["result"]
     )
     assert target_token > token_b
     assert target.replicas == 8 and target.execution_request is None
@@ -1068,9 +1061,7 @@ def test_old_takeover_receipt_cannot_close_or_unfence_a_new_dispatch(
     assert execution["status"] == "EXECUTING"
     assert execution["controller_lease_expired"]
 
-    controller_c = ExecutionController(
-        repo, target, FakeHealth(), "controller-c", max_attempts=3
-    )
+    controller_c = ExecutionController(repo, target, FakeHealth(), "controller-c", max_attempts=3)
     token_c = controller_c._claim(execution)
     assert token_c is not None and token_c > target_token
     with pytest.raises(TargetPreconditionFailed):
@@ -1243,8 +1234,7 @@ def test_workload_takeover_refreshes_precondition_after_delayed_request_wins_rac
         controller_b.run_once()
     with repo.transaction() as conn:
         action_state = conn.execute(
-            "SELECT execution_state FROM action_intents "
-            "WHERE plan_id = 'workload-delayed-request'"
+            "SELECT execution_state FROM action_intents WHERE plan_id = 'workload-delayed-request'"
         ).fetchone()["execution_state"]
         execution_state = conn.execute(
             "SELECT status FROM plan_executions WHERE plan_id = 'workload-delayed-request'"
@@ -1398,6 +1388,7 @@ def test_unknown_action_blocks_dispatch_until_observed(clean_database: Database)
                 "controller-a",
                 token,
             )
+
         with pytest.raises(ValueError, match="positive attempt limit"):
             Repository.transition_action(
                 conn,
@@ -1518,6 +1509,202 @@ def test_unknown_action_blocks_dispatch_until_observed(clean_database: Database)
             target_observation={"replicas": 4, "ready": 4},
         )
         assert completed_b["attempt_number"] == 1
+
+
+class RetirementGateTarget(FakeScaleTarget):
+    source_retirement_is_read_only = True
+
+    def __init__(self, failure: Exception) -> None:
+        super().__init__(1)
+        self.failure = failure
+        self.retirement_calls = 0
+
+    def prepare_source_retirement(
+        self, _workload_id: str, _plan_id: str, _payload: dict[str, object]
+    ) -> dict[str, object]:
+        self.retirement_calls += 1
+        raise self.failure
+
+
+def _prepare_retirement_action(repo: Repository, plan_id: str) -> None:
+    with repo.transaction() as conn:
+        _insert_plan(conn, plan_id)
+        conn.execute(
+            "INSERT INTO control_state "
+            "(singleton, snapshot_id, snapshot_generation, binding) VALUES "
+            "(TRUE, 'snapshot', 1, %s)",
+            (Jsonb({}),),
+        )
+        conn.execute(
+            "INSERT INTO action_intents (plan_id, intent_id, action_sequence, action_type, "
+            "workload_id, payload, status) VALUES (%s, 'retire', 0, "
+            "'PREPARE_SOURCE_RETIREMENT', 'cpu-api', %s, 'APPROVED')",
+            (
+                plan_id,
+                Jsonb(
+                    {
+                        "operation_id": "retire",
+                        "source_owner_uid": "deployment-uid",
+                        "workload_generation": 1,
+                    }
+                ),
+            ),
+        )
+    _claim(repo, plan_id)
+
+
+def test_retirement_action_fails_safe_at_unproven_create_fence(
+    clean_database: Database,
+) -> None:
+    repo = clean_database.repository
+    _prepare_retirement_action(repo, "retirement-blocked")
+    target = RetirementGateTarget(ActionBlocked("POD_CREATE_PERSISTENCE_FENCE_UNPROVEN"))
+    controller = ExecutionController(repo, target, FakeHealth(), "controller-a")
+
+    controller.run_once()
+
+    with repo.transaction() as conn:
+        action = conn.execute(
+            "SELECT execution_state, execution_error, execution_result FROM action_intents "
+            "WHERE plan_id = 'retirement-blocked' AND intent_id = 'retire'"
+        ).fetchone()
+        execution = conn.execute(
+            "SELECT status, outcome FROM plan_executions WHERE plan_id = 'retirement-blocked'"
+        ).fetchone()
+        plan = conn.execute(
+            "SELECT state FROM plans WHERE plan_id = 'retirement-blocked'"
+        ).fetchone()
+
+    assert target.retirement_calls == 1
+    assert action["execution_state"] == "FAILED"
+    assert action["execution_error"] == "POD_CREATE_PERSISTENCE_FENCE_UNPROVEN"
+    assert action["execution_result"]["progress"][0]["result"] == {"stage": "RETIREMENT_REQUESTED"}
+    assert action["execution_result"]["result"] == {
+        "stage": "BLOCKED",
+        "blocked_at": "VALIDATE_CREATE_PERSISTENCE_FENCE",
+        "reason": "POD_CREATE_PERSISTENCE_FENCE_UNPROVEN",
+    }
+    assert execution["status"] == plan["state"] == "FAILED_SAFE"
+
+
+def test_read_only_retirement_reconciles_running_action_after_takeover(
+    clean_database: Database,
+) -> None:
+    repo = clean_database.repository
+    _prepare_retirement_action(repo, "retirement-crash-before-read")
+    target = RetirementGateTarget(ActionBlocked("POD_CREATE_PERSISTENCE_FENCE_UNPROVEN"))
+    with repo.transaction() as conn:
+        execution = conn.execute(
+            "SELECT controller_fencing_token FROM plan_executions "
+            "WHERE plan_id = 'retirement-crash-before-read'"
+        ).fetchone()
+        Repository.transition_action(
+            conn,
+            "retirement-crash-before-read",
+            "retire",
+            "NOT_STARTED",
+            "RUNNING",
+            "controller-a",
+            execution["controller_fencing_token"],
+            pre_observation=target.observe_scale("cpu-api"),
+        )
+        conn.execute(
+            "UPDATE plan_executions SET controller_lease_expires_at = clock_timestamp() "
+            "WHERE plan_id = 'retirement-crash-before-read'"
+        )
+
+    ExecutionController(repo, target, FakeHealth(), "controller-b").run_once()
+
+    with repo.transaction() as conn:
+        execution = conn.execute(
+            "SELECT status, controller_fencing_token FROM plan_executions "
+            "WHERE plan_id = 'retirement-crash-before-read'"
+        ).fetchone()
+        action = conn.execute(
+            "SELECT execution_state, execution_result FROM action_intents "
+            "WHERE plan_id = 'retirement-crash-before-read'"
+        ).fetchone()
+        fence = Repository.execution_fence_receipt(
+            conn,
+            "retirement-crash-before-read",
+            "retire",
+            execution["controller_fencing_token"],
+        )
+    assert target.retirement_calls == 1
+    assert action["execution_state"] == "FAILED"
+    assert action["execution_result"]["progress"][-1]["result"] == {"stage": "RETIREMENT_RECHECKED"}
+    assert execution["status"] == "FAILED_SAFE"
+    assert fence["no_target_mutation"] is True
+
+
+def test_read_only_retirement_resolves_control_request_without_dispatch(
+    clean_database: Database,
+) -> None:
+    repo = clean_database.repository
+    _prepare_retirement_action(repo, "retirement-pause")
+    target = RetirementGateTarget(ActionBlocked("POD_CREATE_PERSISTENCE_FENCE_UNPROVEN"))
+    with repo.transaction() as conn:
+        execution = conn.execute(
+            "SELECT controller_fencing_token FROM plan_executions "
+            "WHERE plan_id = 'retirement-pause'"
+        ).fetchone()
+        Repository.transition_action(
+            conn,
+            "retirement-pause",
+            "retire",
+            "NOT_STARTED",
+            "RUNNING",
+            "controller-a",
+            execution["controller_fencing_token"],
+            pre_observation=target.observe_scale("cpu-api"),
+        )
+        Repository.request_execution_control(conn, "retirement-pause", "PAUSE", "operator pause")
+
+    controller = ExecutionController(repo, target, FakeHealth(), "controller-a")
+    controller.run_once()
+    controller.run_once()
+
+    with repo.transaction() as conn:
+        action = conn.execute(
+            "SELECT execution_state, execution_error FROM action_intents "
+            "WHERE plan_id = 'retirement-pause'"
+        ).fetchone()
+        execution = conn.execute(
+            "SELECT status FROM plan_executions WHERE plan_id = 'retirement-pause'"
+        ).fetchone()
+    assert target.retirement_calls == 0
+    assert action["execution_state"] == "FAILED"
+    assert action["execution_error"] == "source-retirement-stopped-for-control-request"
+    assert execution["status"] == "PAUSED"
+
+
+def test_retirement_unknown_outcome_stays_blocked_after_controller_takeover(
+    clean_database: Database,
+) -> None:
+    repo = clean_database.repository
+    _prepare_retirement_action(repo, "retirement-unknown")
+    target = RetirementGateTarget(TargetUnavailable("retirement observation unavailable"))
+    controller_a = ExecutionController(repo, target, FakeHealth(), "controller-a")
+    controller_a.run_once()
+    with repo.transaction() as conn:
+        conn.execute(
+            "UPDATE plan_executions SET controller_lease_expires_at = clock_timestamp() "
+            "WHERE plan_id = 'retirement-unknown'"
+        )
+
+    controller_b = ExecutionController(repo, target, FakeHealth(), "controller-b")
+    controller_b.run_once()
+
+    with repo.transaction() as conn:
+        action = conn.execute(
+            "SELECT execution_state FROM action_intents WHERE plan_id = 'retirement-unknown'"
+        ).fetchone()
+        execution = conn.execute(
+            "SELECT status FROM plan_executions WHERE plan_id = 'retirement-unknown'"
+        ).fetchone()
+    assert target.retirement_calls == 2
+    assert action["execution_state"] == "OUTCOME_UNKNOWN"
+    assert execution["status"] == "EXECUTING"
 
 
 def test_compensation_is_persisted_once_before_dispatch(clean_database: Database) -> None:

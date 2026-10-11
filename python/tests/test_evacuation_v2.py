@@ -174,9 +174,14 @@ def test_v2_snapshot_hash_round_trip_and_cpp_planner_verifier() -> None:
     admission = api_module._execution_admission_reasons(
         summary, source["workloads"], "kubernetes-workload"
     )
-    assert "UNSUPPORTED_EXECUTION_PROTOCOL_V2" in admission
-    assert "UNSUPPORTED_EXECUTION_ACTION_MOVE_REPLICA" in admission
-    assert "UNSUPPORTED_EXECUTION_ACTION_DEACTIVATE_NODE" in admission
+    assert admission == []
+    assert summary["evacuations"][0]["source_pod_uid"]
+    assert summary["evacuations"][0]["source_node_uid"]
+
+    unsupported = api_module._execution_admission_reasons(
+        {**summary, "evacuation_count": 2}, source["workloads"], "kubernetes-workload"
+    )
+    assert unsupported == ["UNSUPPORTED_SOURCE_RETIREMENT_PREPARATION"]
 
     tampered_text = plan_text.replace("maximum_live_replicas: 5", "maximum_live_replicas: 99", 1)
     assert tampered_text != plan_text

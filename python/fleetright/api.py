@@ -406,7 +406,16 @@ def _evacuation_plan_summary(plan_text: str) -> dict[str, object]:
             "sequence": _proto_scalar(block, "sequence", 0),
             "workload_id": _proto_scalar(block, "workload_id", ""),
             "replica_id": _proto_scalar(block, "replica_id", ""),
+            "source_pod_name": _proto_scalar(block, "source_pod_name", ""),
+            "source_pod_uid": _proto_scalar(block, "source_pod_uid", ""),
+            "source_controller_uid": _proto_scalar(block, "source_controller_uid", "")
+            or _proto_scalar(block, "source_owner_uid", ""),
             "source_node_id": _proto_scalar(block, "source_node_id", ""),
+            "source_node_uid": _proto_scalar(block, "source_node_uid", ""),
+            "source_owner_kind": _proto_scalar(block, "source_owner_kind", ""),
+            "source_owner_name": _proto_scalar(block, "source_owner_name", ""),
+            "source_owner_uid": _proto_scalar(block, "source_owner_uid", ""),
+            "source_logical_slot_id": _proto_scalar(block, "source_logical_slot_id", ""),
             "destination_node_ids": destination_ids,
         }
         evacuations.append(evacuation)
@@ -1214,12 +1223,50 @@ def _execution_admission_reasons(
     if isinstance(schema_version, bool) or not isinstance(schema_version, int):
         reasons.append("UNSUPPORTED_EXECUTION_PROTOCOL_VERSION")
     elif schema_version == 2:
-        reasons.append("UNSUPPORTED_EXECUTION_PROTOCOL_V2")
+        evacuations = summary.get("evacuations")
+        if (
+            target != "kubernetes-workload"
+            or not isinstance(evacuations, list)
+            or len(evacuations) != 1
+            or summary.get("evacuation_count") != 1
+        ):
+            reasons.append("UNSUPPORTED_SOURCE_RETIREMENT_PREPARATION")
+        else:
+            operation = evacuations[0]
+            if not isinstance(operation, dict):
+                reasons.append("UNSUPPORTED_SOURCE_RETIREMENT_PREPARATION")
+            else:
+                required = (
+                    "workload_id",
+                    "replica_id",
+                    "source_pod_name",
+                    "source_pod_uid",
+                    "source_controller_uid",
+                    "source_node_id",
+                    "source_node_uid",
+                    "source_owner_kind",
+                    "source_owner_name",
+                    "source_owner_uid",
+                    "source_logical_slot_id",
+                )
+                if any(
+                    not isinstance(operation.get(key), str) or not operation[key]
+                    for key in required
+                ):
+                    reasons.append("UNSUPPORTED_SOURCE_RETIREMENT_PREPARATION")
+                elif (
+                    operation["workload_id"] not in _supported_execution_workloads(target)
+                    or operation["source_owner_kind"] != "FleetRightWorkload"
+                    or operation["source_owner_name"] != operation["workload_id"]
+                    or operation["source_owner_uid"] != operation["source_controller_uid"]
+                    or operation["source_logical_slot_id"] != operation["replica_id"]
+                ):
+                    reasons.append("UNSUPPORTED_SOURCE_RETIREMENT_IDENTITY")
     elif schema_version != 1:
         reasons.append("UNSUPPORTED_EXECUTION_PROTOCOL_VERSION")
-    if summary["deactivated_node_ids"]:
+    if schema_version != 2 and summary["deactivated_node_ids"]:
         reasons.append("UNSUPPORTED_EXECUTION_ACTION_DEACTIVATE_NODE")
-    if summary["evacuation_count"]:
+    if schema_version != 2 and summary["evacuation_count"]:
         reasons.append("UNSUPPORTED_EXECUTION_ACTION_MOVE_REPLICA")
 
     current = {workload["workload_id"]: workload for workload in source_workloads}
@@ -1243,6 +1290,97 @@ def _execution_admission_reasons(
         ):
             reasons.append(f"UNSUPPORTED_EXECUTION_WORKLOAD:{workload_id}")
     return list(dict.fromkeys(reasons))
+
+
+def _valid_source_retirement_action(workload_id: object, payload: object) -> bool:
+    if not isinstance(workload_id, str) or not isinstance(payload, dict):
+        return False
+    text_fields = (
+        "operation_id",
+        "replica_id",
+        "source_pod_name",
+        "source_pod_uid",
+        "source_controller_uid",
+        "source_node_id",
+        "source_node_uid",
+        "source_owner_kind",
+        "source_owner_name",
+        "source_owner_uid",
+        "source_logical_slot_id",
+    )
+    destinations = payload.get("destination_node_ids")
+    return (
+        all(isinstance(payload.get(key), str) and payload[key] for key in text_fields)
+        and type(payload.get("sequence")) is int
+        and payload["sequence"] >= 0
+        and type(payload.get("workload_generation")) is int
+        and payload["workload_generation"] >= 1
+        and payload["source_owner_kind"] == "FleetRightWorkload"
+        and payload["source_owner_name"] == workload_id
+        and payload["source_owner_uid"] == payload["source_controller_uid"]
+        and payload["source_logical_slot_id"] == payload["replica_id"]
+        and isinstance(destinations, list)
+        and bool(destinations)
+        and all(isinstance(node_id, str) and node_id for node_id in destinations)
+    )
+
+
+def _verify_source_retirement_actions(
+    artifacts: dict[str, bytes],
+    plan_id: str,
+    schema_version: int,
+    actions: list[dict[str, Any]],
+) -> None:
+    retirements = [
+        action for action in actions if action["action_type"] == "PREPARE_SOURCE_RETIREMENT"
+    ]
+    if schema_version != 2:
+        if retirements:
+            raise ControlError("source-retirement action is not backed by a V2 plan")
+        return
+    try:
+        plan = _evacuation_plan_summary(
+            decode_text(
+                "fleetright.v2.EvacuationPlan",
+                "fleetright/v2/evacuation.proto",
+                artifacts["plan.pb"],
+            )
+        )
+        snapshot_text = decode_text(
+            "fleetright.v2.EvacuationSnapshot",
+            "fleetright/v2/evacuation.proto",
+            artifacts["effective_snapshot.pb"],
+        )
+    except (KeyError, ValueError) as error:
+        raise ControlError("source-retirement artifacts cannot be decoded") from error
+    if plan["schema_version"] != 2 or plan["plan_id"] != plan_id:
+        # The journal plan ID is the optimizer's immutable operation namespace.
+        raise ControlError("source-retirement plan identity changed")
+    generations = {
+        _proto_scalar(block, "workload_id", ""): _proto_scalar(block, "owner_generation", 0)
+        for block in _proto_blocks(snapshot_text, "controllers")
+    }
+    expected: dict[str, tuple[str, dict[str, object]]] = {}
+    for operation in plan["evacuations"]:
+        sequence = operation["sequence"]
+        operation_id = hashlib.sha256(f"{plan_id}:retirement:{sequence}".encode()).hexdigest()
+        payload = {
+            **operation,
+            "operation_id": operation_id,
+            "workload_generation": generations.get(operation["workload_id"]),
+        }
+        expected[operation_id] = (operation["workload_id"], payload)
+    if len(actions) != len(expected) or len(retirements) != len(actions):
+        raise ControlError("source-retirement journal does not match verified V2 operations")
+    for action in retirements:
+        expected_action = expected.get(action["intent_id"])
+        if (
+            expected_action is None
+            or action["workload_id"] != expected_action[0]
+            or action["payload"] != expected_action[1]
+            or not _valid_source_retirement_action(action["workload_id"], action["payload"])
+        ):
+            raise ControlError("source-retirement journal does not match verified V2 operation")
 
 
 def create_app(
@@ -1596,7 +1734,11 @@ def create_app(
                     summary, source_fields["workloads"], app.state.execution_target
                 )
                 reason_codes.extend(execution_rejections)
-                reductions = _reduction_workloads(summary, source_fields)
+                reductions = (
+                    set()
+                    if plan_schema_version == 2
+                    else _reduction_workloads(summary, source_fields)
+                )
                 disallowed = sorted(
                     workload_id
                     for workload_id in reductions
@@ -1782,6 +1924,30 @@ def create_app(
                                 },
                             }
                         )
+                elif plan_schema_version == 2:
+                    controller_by_workload = {
+                        item["workload_id"]: item
+                        for item in source_fields["evacuation_v2"]["controllers"]
+                    }
+                    for evacuation in summary["evacuations"]:
+                        sequence = int(evacuation["sequence"])
+                        operation_id = hashlib.sha256(
+                            f"{native_id}:retirement:{sequence}".encode()
+                        ).hexdigest()
+                        intents.append(
+                            {
+                                "intent_id": operation_id,
+                                "action_type": "PREPARE_SOURCE_RETIREMENT",
+                                "workload_id": evacuation["workload_id"],
+                                "payload": {
+                                    **evacuation,
+                                    "operation_id": operation_id,
+                                    "workload_generation": controller_by_workload[
+                                        evacuation["workload_id"]
+                                    ]["owner_generation"],
+                                },
+                            }
+                        )
                 if not _verify_lease_tokens(conn, app.state.controller_id, leases):
                     raise LeaseConflict("planning lease expired or lost its fencing token")
                 repo.create_plan(
@@ -1952,14 +2118,33 @@ def create_app(
                 ):
                     raise ArtifactIntegrityError("independent verification no longer passes")
                 actions = conn.execute(
-                    "SELECT action_type, workload_id, payload FROM action_intents "
+                    "SELECT intent_id, action_type, workload_id, payload FROM action_intents "
                     "WHERE plan_id = %s ORDER BY action_sequence",
                     (plan_id,),
                 ).fetchall()
                 if not actions:
                     raise ControlError("plan has no executable action")
+                _verify_source_retirement_actions(
+                    artifacts,
+                    plan_id,
+                    int(row["binding"].get("plan_schema_version", 1)),
+                    actions,
+                )
                 for action in actions:
                     payload = action["payload"]
+                    if action["action_type"] == "PREPARE_SOURCE_RETIREMENT":
+                        if (
+                            not _valid_source_retirement_action(action["workload_id"], payload)
+                            or payload.get("operation_id") != action["intent_id"]
+                            or (
+                                action["workload_id"]
+                                not in _supported_execution_workloads(app.state.execution_target)
+                            )
+                        ):
+                            raise ControlError(
+                                "plan contains an unsupported source-retirement preparation"
+                            )
+                        continue
                     if (
                         action["action_type"] != "SET_REPLICA_COUNT"
                         or not isinstance(action["workload_id"], str)
@@ -2266,8 +2451,24 @@ def _mutate_plan(
                     "WHERE plan_id = %s ORDER BY action_sequence",
                     (plan_id,),
                 ).fetchall()
+                _verify_source_retirement_actions(
+                    artifacts,
+                    plan_id,
+                    int(row["binding"].get("plan_schema_version", 1)),
+                    approval_actions,
+                )
                 for action in approval_actions:
                     payload = action["payload"]
+                    if action["action_type"] == "PREPARE_SOURCE_RETIREMENT":
+                        if (
+                            not _valid_source_retirement_action(action["workload_id"], payload)
+                            or payload.get("operation_id") != action["intent_id"]
+                            or action["workload_id"] not in supported_workloads
+                        ):
+                            raise ControlError(
+                                "plan contains an unsupported source-retirement preparation"
+                            )
+                        continue
                     if (
                         action["action_type"] != "SET_REPLICA_COUNT"
                         or action["workload_id"] not in supported_workloads
@@ -2320,6 +2521,31 @@ def _mutate_plan(
                             raise HTTPException(
                                 status_code=503, detail="execution-target-unavailable"
                             ) from error
+                        if action["action_type"] == "PREPARE_SOURCE_RETIREMENT":
+                            if observed.get("uid") != payload.get(
+                                "source_owner_uid"
+                            ) or observed.get("generation") != payload.get("workload_generation"):
+                                reason = "source-retirement-target-identity-changed"
+                                Repository.transition_plan(
+                                    conn,
+                                    plan_id,
+                                    "STALE",
+                                    principal.name,
+                                    principal.role,
+                                    reason,
+                                    request_id,
+                                    key,
+                                )
+                                response = {
+                                    "plan_id": plan_id,
+                                    "state": "STALE",
+                                    "detail": reason,
+                                }
+                                Repository.finish_idempotent(
+                                    conn, principal.name, op_key, key, 409, response
+                                )
+                                return JSONResponse(status_code=409, content=response)
+                            continue
                         if observed.get("replicas") != payload.get("current_replicas"):
                             reason = "target-replica-precondition-changed"
                             Repository.transition_plan(

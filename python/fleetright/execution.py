@@ -503,6 +503,84 @@ class FleetRightWorkloadTarget(KubernetesTarget):
     """Publish monotonic requests; the workload controller alone creates Pods."""
 
     supports_workload_execution = True
+    # shortcut: retirement preparation is read-only until the API can fence admitted CREATEs.
+    source_retirement_is_read_only = True
+
+    def prepare_source_retirement(
+        self, workload_id: str, plan_id: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Fail closed until Kubernetes can fence already-admitted Pod CREATEs."""
+        current = self.observe_scale(workload_id)
+        if current["uid"] != payload.get("source_owner_uid"):
+            raise ActionBlocked("SOURCE_WORKLOAD_UID_CHANGED")
+        if current["generation"] != payload.get("workload_generation"):
+            raise ActionBlocked("SOURCE_WORKLOAD_GENERATION_CHANGED")
+        if current["pod_create_protocol"] != "reserved-create-v1":
+            raise ActionBlocked("UNSUPPORTED_POD_CREATE_PROTOCOL")
+        if current["pending_pod_create"] is not None:
+            raise ActionBlocked("POD_CREATE_OUTCOME_UNKNOWN")
+        if current["pod_create_history_uncertain"] or current["unverified_pod_creates"]:
+            raise ActionBlocked("POD_CREATE_HISTORY_UNCERTAIN")
+        if current["retired_replica_slots"]:
+            raise ActionBlocked("RETIRED_SLOT_HISTORY_PRESENT")
+        if not plan_id or not payload.get("operation_id"):
+            raise TargetPreconditionFailed("retirement operation identity is invalid")
+        self._verify_retirement_source(current["uid"], workload_id, payload)
+        if (
+            not isinstance(payload.get("replacement_pod_uid"), str)
+            or not payload["replacement_pod_uid"]
+        ):
+            raise ActionBlocked("REPLACEMENT_POD_IDENTITY_UNAVAILABLE")
+        # Status reservation does not fence a CREATE already admitted at Pod storage.
+        raise ActionBlocked("POD_CREATE_PERSISTENCE_FENCE_UNPROVEN")
+
+    def _verify_retirement_source(
+        self, workload_uid: str, workload_id: str, payload: dict[str, Any]
+    ) -> None:
+        pod_name = payload.get("source_pod_name")
+        pod_uid = payload.get("source_pod_uid")
+        node_name = payload.get("source_node_id")
+        node_uid = payload.get("source_node_uid")
+        slot_id = payload.get("source_logical_slot_id")
+        if not all(
+            isinstance(value, str) and value
+            for value in (pod_name, pod_uid, node_name, node_uid, slot_id)
+        ):
+            raise TargetPreconditionFailed("retirement source identity is incomplete")
+        try:
+            pod = self._json("get", "pod", pod_name, "-n", self.namespace, "-o", "json")
+        except TargetNotFound as error:
+            raise ActionBlocked("SOURCE_POD_NOT_FOUND") from error
+        metadata, spec = pod.get("metadata", {}), pod.get("spec", {})
+        labels = metadata.get("labels", {}) if isinstance(metadata, dict) else {}
+        owners = metadata.get("ownerReferences", []) if isinstance(metadata, dict) else []
+        if not isinstance(metadata, dict) or metadata.get("uid") != pod_uid:
+            raise ActionBlocked("SOURCE_POD_UID_CHANGED")
+        if (
+            metadata.get("name") != pod_name
+            or not isinstance(labels, dict)
+            or labels.get("fleetright.io/workload-uid") != workload_uid
+            or labels.get("fleetright.io/replica-id") != slot_id
+            or not isinstance(owners, list)
+            or not any(
+                isinstance(owner, dict)
+                and owner.get("kind") == "FleetRightWorkload"
+                and owner.get("name") == workload_id
+                and owner.get("uid") == workload_uid
+                and owner.get("controller") is True
+                for owner in owners
+            )
+        ):
+            raise ActionBlocked("SOURCE_POD_OWNER_OR_SLOT_CHANGED")
+        if not isinstance(spec, dict) or spec.get("nodeName") != node_name:
+            raise ActionBlocked("SOURCE_NODE_CHANGED")
+        try:
+            node = self._json("get", "node", node_name, "-o", "json")
+        except TargetNotFound as error:
+            raise ActionBlocked("SOURCE_NODE_NOT_FOUND") from error
+        node_metadata = node.get("metadata", {})
+        if not isinstance(node_metadata, dict) or node_metadata.get("uid") != node_uid:
+            raise ActionBlocked("SOURCE_NODE_UID_CHANGED")
 
     def _require_fencing_schema(self) -> None:
         crd = self._json("get", "crd", "fleetrightworkloads.fleetright.io", "-o", "json")
@@ -840,6 +918,7 @@ class FleetRightWorkloadTarget(KubernetesTarget):
             "fencing_token": max(token, fence_token),
             "generation_tracks_spec": True,
             "workload_execution": True,
+            "pod_create_protocol": spec.get("podCreateProtocol"),
             "execution_request": request,
             "execution_fence": fence,
             "execution": execution,

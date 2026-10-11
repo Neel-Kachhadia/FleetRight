@@ -8,6 +8,7 @@ from threading import Event
 from typing import Any
 
 import pytest
+from fleetright.execution import ActionBlocked, FleetRightWorkloadTarget
 from fleetright.workload_controller import (
     POD_CREATE_ATTEMPT_ANNOTATION,
     POD_CREATE_OPERATION_ANNOTATION,
@@ -330,9 +331,28 @@ def test_delayed_create_is_journaled_and_takeover_resolves_exact_pod() -> None:
         takeover["status"] = deepcopy(api.status)
         reconcile_workload(api, takeover, _nodes())
         slot_name = _pod_name("workload-uid", 1)
+        source_pod = next(iter(api.pods.values()))
         assert api.get_pod(slot_name) is None
         assert api.status["pendingPodCreate"]["podName"] == slot_name
         assert api.status["execution"]["phase"] == "RECONCILING"
+        retirement_target = FleetRightWorkloadTarget(namespace="default")
+        retirement_observation = retirement_target._observe(takeover, "api")
+        retirement_target.observe_scale = lambda _workload: retirement_observation
+        with pytest.raises(ActionBlocked, match="POD_CREATE_OUTCOME_UNKNOWN"):
+            retirement_target.prepare_source_retirement(
+                "api",
+                "plan-retirement",
+                {
+                    "operation_id": "retire-1",
+                    "source_owner_uid": "workload-uid",
+                    "workload_generation": 2,
+                },
+            )
+        assert not api.status.get("retiredReplicaSlots")
+        assert (
+            api.pods[source_pod["metadata"]["name"]]["metadata"]["uid"]
+            == source_pod["metadata"]["uid"]
+        )
         release_post.set()
         old.result(timeout=3)
 
@@ -350,11 +370,13 @@ def test_delayed_create_is_journaled_and_takeover_resolves_exact_pod() -> None:
     authorization = next(
         item for item in api.status["authorizedPodCreates"] if item["podUID"] == created_uid
     )
+    assert (authorization["planID"], authorization["operationID"]) == ("plan-1", "action-1")
     assert (
         authorization["createID"]
         == api.pods[slot_name]["metadata"]["annotations"][POD_CREATE_ATTEMPT_ANNOTATION]
     )
     assert api.status["conditions"][2]["reason"] == "Reconciled"
+    assert not api.status.get("retiredReplicaSlots")
 
 
 def test_pre_upgrade_inflight_create_can_recreate_a_retired_slot() -> None:
@@ -599,6 +621,7 @@ def test_retirement_and_create_reservation_race_uses_status_cas(winner: str) -> 
 
     api = CASAPI()
     workload = _workload()
+    workload["spec"]["executionProtocol"] = "monotonic-scale-up-v1"
     reconcile_workload(api, workload, _nodes())
     api.cas_version = workload["metadata"]["resourceVersion"]
     source = next(iter(api.pods.values()))
@@ -647,6 +670,24 @@ def test_retirement_and_create_reservation_race_uses_status_cas(winner: str) -> 
     assert len(api.pods) == 1
     assert bool(api.status.get("retiredReplicaSlots")) == (winner == "retirement")
     assert (api.status.get("pendingPodCreate") is not None) == (winner == "reservation")
+    target = FleetRightWorkloadTarget(namespace="default")
+    current = deepcopy(workload)
+    current["status"] = deepcopy(api.status)
+    observed = target._observe(current, "api")
+    target.observe_scale = lambda _workload: observed
+    reason = (
+        "RETIRED_SLOT_HISTORY_PRESENT" if winner == "retirement" else "POD_CREATE_OUTCOME_UNKNOWN"
+    )
+    with pytest.raises(ActionBlocked, match=reason):
+        target.prepare_source_retirement(
+            "api",
+            "plan-retirement",
+            {
+                "operation_id": "retire-1",
+                "source_owner_uid": "workload-uid",
+                "workload_generation": 1,
+            },
+        )
 
 
 def test_authorized_create_history_capacity_blocks_before_pod_post() -> None:

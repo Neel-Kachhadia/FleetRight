@@ -385,6 +385,8 @@ def test_kubernetes_roles_publish_requests_and_leave_pod_creation_to_controller(
     assert 'verbs: ["get", "patch"]' in api_rbac
     assert 'resourceNames: ["fleetrightworkloads.fleetright.io"]' in api_rbac
     assert 'resources: ["customresourcedefinitions"]' in api_rbac
+    assert 'resources: ["pods"]\n    verbs: ["get"]' in api_rbac
+    assert 'resources: ["nodes"]\n    verbs: ["get"]' in api_rbac
     assert 'resources: ["deployments"]' not in api_rbac
     assert 'resources: ["pods/eviction"]' not in api_rbac
     assert 'resources: ["pods"]\n    verbs: ["get", "list", "create"]' in workload_rbac
@@ -416,6 +418,162 @@ def _workload_object() -> dict[str, object]:
             "conditions": [{"type": "Reconciled", "status": "True"}],
         },
     }
+
+
+def _retirement_payload(**changes: object) -> dict[str, object]:
+    return {
+        "operation_id": "verified-operation",
+        "replica_id": "cpu-api-0",
+        "source_pod_name": "cpu-api-0",
+        "source_pod_uid": "source-pod-uid",
+        "source_controller_uid": "workload-uid",
+        "source_node_id": "worker-a",
+        "source_node_uid": "node-uid",
+        "source_owner_kind": "FleetRightWorkload",
+        "source_owner_name": "cpu-api",
+        "source_owner_uid": "workload-uid",
+        "source_logical_slot_id": "cpu-api-0",
+        "destination_node_ids": ["worker-b"],
+        "workload_generation": 4,
+        **changes,
+    }
+
+
+def _install_source_observation(
+    monkeypatch: pytest.MonkeyPatch,
+    target: FleetRightWorkloadTarget,
+    *,
+    pod_uid: str = "source-pod-uid",
+    node_uid: str = "node-uid",
+) -> None:
+    objects = {
+        "pod": {
+            "metadata": {
+                "name": "cpu-api-0",
+                "uid": pod_uid,
+                "labels": {
+                    "fleetright.io/workload-uid": "workload-uid",
+                    "fleetright.io/replica-id": "cpu-api-0",
+                },
+                "ownerReferences": [
+                    {
+                        "kind": "FleetRightWorkload",
+                        "name": "cpu-api",
+                        "uid": "workload-uid",
+                        "controller": True,
+                    }
+                ],
+            },
+            "spec": {"nodeName": "worker-a"},
+        },
+        "node": {"metadata": {"name": "worker-a", "uid": node_uid}},
+    }
+
+    def read_object(*args: str) -> dict[str, object]:
+        return deepcopy(objects[args[1]])
+
+    monkeypatch.setattr(target, "_json", read_object)
+
+
+def test_source_retirement_target_blocks_before_writing_a_tombstone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = FleetRightWorkloadTarget(namespace="fleetright-v2")
+    observed = target._observe(_workload_object(), "cpu-api")
+    monkeypatch.setattr(target, "observe_scale", lambda _workload: observed)
+    _install_source_observation(monkeypatch, target)
+
+    with pytest.raises(ActionBlocked, match="REPLACEMENT_POD_IDENTITY_UNAVAILABLE"):
+        target.prepare_source_retirement(
+            "cpu-api",
+            "verified-plan",
+            _retirement_payload(),
+        )
+
+
+def test_source_retirement_target_rejects_changed_source_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = FleetRightWorkloadTarget(namespace="fleetright-v2")
+    observed = target._observe(_workload_object(), "cpu-api")
+    monkeypatch.setattr(target, "observe_scale", lambda _workload: observed)
+
+    with pytest.raises(ActionBlocked, match="SOURCE_WORKLOAD_UID_CHANGED"):
+        target.prepare_source_retirement(
+            "cpu-api",
+            "verified-plan",
+            _retirement_payload(source_owner_uid="old-workload-uid"),
+        )
+
+
+@pytest.mark.parametrize(
+    ("pod_uid", "node_uid", "reason"),
+    [
+        ("late-pod-uid", "node-uid", "SOURCE_POD_UID_CHANGED"),
+        ("source-pod-uid", "replacement-node-uid", "SOURCE_NODE_UID_CHANGED"),
+    ],
+)
+def test_source_retirement_target_revalidates_live_source_pod_and_node_uid(
+    monkeypatch: pytest.MonkeyPatch, pod_uid: str, node_uid: str, reason: str
+) -> None:
+    target = FleetRightWorkloadTarget(namespace="fleetright-v2")
+    observed = target._observe(_workload_object(), "cpu-api")
+    monkeypatch.setattr(target, "observe_scale", lambda _workload: observed)
+    _install_source_observation(monkeypatch, target, pod_uid=pod_uid, node_uid=node_uid)
+
+    with pytest.raises(ActionBlocked, match=reason):
+        target.prepare_source_retirement("cpu-api", "verified-plan", _retirement_payload())
+
+
+@pytest.mark.parametrize(
+    ("status_update", "protocol", "reason"),
+    [
+        (
+            {
+                "pendingPodCreate": {
+                    "workloadUID": "workload-uid",
+                    "workloadGeneration": 4,
+                    "podName": "frw-workload-r2",
+                    "replicaID": "cpu-api-2",
+                    "planID": "plan-1",
+                    "operationID": "action-1",
+                    "createID": "attempt-1",
+                }
+            },
+            "reserved-create-v1",
+            "POD_CREATE_OUTCOME_UNKNOWN",
+        ),
+        ({"podCreateHistoryUncertain": True}, "reserved-create-v1", "POD_CREATE_HISTORY_UNCERTAIN"),
+        ({}, None, "UNSUPPORTED_POD_CREATE_PROTOCOL"),
+    ],
+)
+def test_source_retirement_target_fails_closed_on_unresolved_or_legacy_create(
+    monkeypatch: pytest.MonkeyPatch,
+    status_update: dict[str, object],
+    protocol: str | None,
+    reason: str,
+) -> None:
+    target = FleetRightWorkloadTarget(namespace="fleetright-v2")
+    state = _workload_object()
+    state["status"].update(status_update)
+    if protocol is None:
+        del state["spec"]["podCreateProtocol"]
+        with pytest.raises(TargetPreconditionFailed, match="Pod CREATE history is uncertain"):
+            target._observe(state, "cpu-api")
+        return
+    observed = target._observe(state, "cpu-api")
+    monkeypatch.setattr(target, "observe_scale", lambda _workload: observed)
+
+    with pytest.raises(ActionBlocked, match=reason):
+        target.prepare_source_retirement(
+            "cpu-api",
+            "verified-plan",
+            {
+                "operation_id": "verified-operation",
+                "source_owner_uid": "workload-uid",
+                "workload_generation": 4,
+            },
+        )
 
 
 def test_workload_request_cas_binds_identity_generation_and_replica_target(
