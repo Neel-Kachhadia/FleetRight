@@ -1372,7 +1372,7 @@ def test_kubernetes_workload_api_recovers_after_ready_scale_up_crash(
     assert baseline["replicas"] == baseline["ready_replicas"]
     with docker_e2e_database.repository.transaction() as conn:
         conn.execute(
-            "SELECT setval('execution_controller_fence_seq', %s, true)",
+            "SELECT setval('execution_controller_fence_seq', GREATEST(%s, 1), true)",
             (baseline["fencing_token"],),
         )
     expected_replicas = baseline["replicas"] + 1
