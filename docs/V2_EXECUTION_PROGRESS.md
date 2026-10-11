@@ -3,7 +3,7 @@
 ## 2026-10-11 Prompt 2B — replacement and eviction safety checkpoint (incomplete)
 
 **Execution window:** began approximately 11:21 UTC; six-hour hard stop is
-approximately 17:21 UTC. Checkpoint recorded around 14:39 UTC; engineering is
+approximately 17:21 UTC. Checkpoint recorded around 14:55 UTC; engineering is
 continuing. **Branch:** `phase4/safe-execution-reconciliation`. **Starting
 SHA:** `b2345a05bbffa6979ebaacc0594ea17c8c9c88a0`. Prompt 3 has not started.
 Milestone 4 is not qualified; no tag or push was made.
@@ -36,9 +36,10 @@ Milestone 4 is not qualified; no tag or push was made.
 | Python and PostgreSQL suite | PASS, 364 passed / 6 skipped | Full `python/tests`; isolated `fleetright_test` DB, one existing Starlette TestClient deprecation warning. The six skips are optional environment-gated Docker/Kind cases; the dedicated live test below was run separately. |
 | C++ / CTest | PASS, 38/38 | `ctest --test-dir build --output-on-failure -j2`. |
 | Ruff, formatting, compilation, shell syntax, diff | PASS | `ruff check python`, changed-file format check, `compileall`, installer `bash -n`, and `git diff --check`. |
-| Live replacement and permitted PDB Eviction | PASS, target-level | Two-run live test against Kubernetes 1.37.0 created a real controller-owned replacement, recorded its observed Pod/Node UIDs, and completed policy/v1 Eviction. A response lost after Kubernetes accepted Eviction was reconciled by observing source removal and two Ready replicas. This does not include the API/journal in that live invocation. |
+| Live replacement and PDB cases | PASS, 2/2 in 181.65s | Kubernetes 1.37.0 created a real controller-owned replacement with observed Pod/Node UIDs. The permitted case completed policy/v1 Eviction; the blocked case returned `PDB_BLOCKED` with no tombstone or source deletion. A lost Eviction response was reconciled to source removal and two Ready replicas. |
 | Live PDB-blocked replacement | PASS, target-level | Managed PDB with `maxUnavailable: 0` returned `PDB_BLOCKED`; no source tombstone or deletion was observed. |
 | Delayed stale Eviction dispatch after fence takeover | PASS, target-level | Controller A paused after target prechecks and before sending its Eviction. A target using fence 14 took over; the live validating webhook rejected A's request carrying fence 13. The current target then evicted that same source. This is not a real two-process `ExecutionController` takeover test. |
+| Workload-controller interruption/restart | PASS, limited live recovery | After replacement readiness and source tombstone, the dedicated controller Pod was terminated and replaced by a new Ready Pod UID. The observed replacement UID/create record remained unique and authorized, no CREATE stayed pending, and workload readiness recovered. Repeated after Eviction acceptance with its response lost. This does not test Python `ExecutionController` process takeover. |
 | Admission webhook installation | PASS | Installer completed against only `kind-fleetright-safety-lab`; fail-closed webhook rejected a dry-run Pod probe. |
 | Secret scan | PASS with one reviewed false positive | `detect-secrets` found only the Kubernetes `secretName: fleetright-pod-admission-tls` reference; the manifest contains no credential value. |
 
@@ -49,7 +50,7 @@ Milestone 4 is not qualified; no tag or push was made.
 | Live API -> PostgreSQL -> controller -> Kubernetes evacuation | BLOCKED / NOT RUN | API/journal path passes deterministic integration tests, and live target path passes separately. The only pre-existing `cpu-api` in the lab is a legacy FWW; it was left untouched. No end-to-end live plan was fabricated. |
 | Delayed CREATE after takeover on live API server | NOT RUN | Unit adversarial tests still prove pending CREATE blocks retirement and late legacy Pods remain unverified. Need a live held CREATE/admission response test. |
 | Already-admitted Eviction response delayed across takeover | NOT RUN | Live coverage proves a stale request not yet admitted is fenced and separately reconciles a lost response after accepted Eviction. It does not prove an already-admitted request held across a real process takeover. |
-| Real process crash and controller takeover | NOT RUN | PostgreSQL journal unit/integration recovery tests pass; no live Kubernetes process interruption/takeover run was completed. |
+| Real process crash and controller takeover | PASS, limited / BLOCKED | Live Kubernetes workload-controller Pod interruption and restart pass after replacement preparation and after an uncertain Eviction. PostgreSQL journal takeover tests pass. A real two-process Python `ExecutionController` takeover against PostgreSQL/Kubernetes remains NOT RUN. |
 | Multi-replica or node drain, partial-drain recovery | DISABLED / NOT IMPLEMENTED | V2 deactivation and multi-action drain remain rejected. No Pod deletion or Node termination path was added. |
 | Kubernetes health-regression compensation | BLOCKED / NOT QUALIFIED | Docker compensation regressions were previously exercised; no Kubernetes compensation recovery was claimed. |
 | Kubernetes legacy owner policy | PASS, fail closed | Legacy CREATE history remains uncertain and target rejects it before mutation; new workload UIDs require the reserved-create and admission protocols. |

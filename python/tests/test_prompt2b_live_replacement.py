@@ -39,6 +39,62 @@ def test_live_workload_prepares_and_evacuates_source_with_real_pod_identity(
             **kwargs,
         )
 
+    def restart_workload_controller() -> str:
+        label = "app.kubernetes.io/name=fleetright-workload-controller"
+        current_pods = json.loads(
+            kubectl("get", "pods", "-n", "fleetright-v2", "-l", label, "-o", "json").stdout
+        )["items"]
+        current = next(
+            item
+            for item in current_pods
+            if item.get("metadata", {}).get("deletionTimestamp") is None
+        )
+        current_name, current_uid = current["metadata"]["name"], current["metadata"]["uid"]
+        deleted = kubectl(
+            "delete",
+            "pod",
+            current_name,
+            "-n",
+            "fleetright-v2",
+            "--grace-period=1",
+            "--wait=true",
+            "--timeout=30s",
+            check=False,
+        )
+        assert deleted.returncode == 0, deleted.stderr
+        rollout = kubectl(
+            "rollout",
+            "status",
+            "deployment/fleetright-workload-controller",
+            "-n",
+            "fleetright-v2",
+            "--timeout=60s",
+            check=False,
+            timeout=70,
+        )
+        assert rollout.returncode == 0, rollout.stderr
+        deadline = time.monotonic() + 60
+        while True:
+            pods = json.loads(
+                kubectl("get", "pods", "-n", "fleetright-v2", "-l", label, "-o", "json").stdout
+            )["items"]
+            replacement = next(
+                (
+                    item
+                    for item in pods
+                    if item.get("metadata", {}).get("uid") != current_uid
+                    and item.get("metadata", {}).get("deletionTimestamp") is None
+                ),
+                None,
+            )
+            if replacement is not None and any(
+                condition.get("type") == "Ready" and condition.get("status") == "True"
+                for condition in replacement.get("status", {}).get("conditions", [])
+            ):
+                return replacement["metadata"]["uid"]
+            assert time.monotonic() < deadline, pods
+            time.sleep(1)
+
     assert kubectl("config", "current-context").stdout.strip() == context
     nodes = json.loads(kubectl("get", "nodes", "-o", "json").stdout)["items"]
     workers = [
@@ -206,6 +262,18 @@ def test_live_workload_prepares_and_evacuates_source_with_real_pod_identity(
                 "replacementWorkloadGeneration": result["replacement_workload_generation"],
             }
         ]
+        replacement_controller_uid = restart_workload_controller()
+        after_restart = target.observe_scale(workload_id)
+        assert after_restart["uid"] == owner_uid
+        assert after_restart["ready_replicas"] == 2
+        assert after_restart["pending_pod_create"] is None
+        replacement_records = [
+            item
+            for item in after_restart["authorized_pod_creates"]
+            if item["planID"] == plan_id and item["operationID"] == operation_id
+        ]
+        assert len(replacement_records) == 1
+        assert replacement_records[0]["podUID"] == result["replacement_pod_uid"]
 
         role = {
             "apiVersion": "rbac.authorization.k8s.io/v1",
@@ -430,6 +498,8 @@ def test_live_workload_prepares_and_evacuates_source_with_real_pod_identity(
                 fencing_token=14,
             )
         takeover_target._kubectl = takeover_kubectl  # type: ignore[method-assign]
+        restarted_controller_uid = restart_workload_controller()
+        assert restarted_controller_uid != replacement_controller_uid
 
         deadline = time.monotonic() + 120
         retired = takeover_target.observe_source_retirement(
