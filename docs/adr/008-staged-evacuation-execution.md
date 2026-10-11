@@ -2,6 +2,36 @@
 
 Status: Blocked
 
+## 2026-10-11 source-retirement admission audit
+
+The tombstone helper is still not called from a production retirement
+admission path. This session made helper retries revalidate the current source
+Pod UID and added tests for pending CREATE, legacy provenance and both outcomes
+of a shared-resourceVersion reservation/tombstone race. An exact existing
+tombstone survives source disappearance and controller retry.
+
+This is persistence and classification evidence, not retirement authority.
+The control API continues to reject destructive V2 actions and Kubernetes
+scale-down; the target also rejects uncertain, pending, legacy and retired
+history before mutation. A live read-only probe against the safety lab rejected
+the legacy workload without changing its resourceVersion. No production path
+currently validates a verified plan, replacement UID, source Node UID,
+capacity and placement together with tombstone persistence.
+
+The reservation/status CAS serializes participating writes only. It cannot
+revoke an old request already admitted by Kubernetes or exclude an older writer
+with CREATE permission. The deterministic delayed-request test remains a
+hazard reproduction; live pre-admitted request injection and the live Kind
+scale-up E2E were not run in this session. Continue to treat legacy CREATE
+history as uncertain. Do not infer safety from LIST results, temporary Pod
+absence, lease expiry or a wait interval.
+
+**Decision:** `RETIREMENT ADMISSION FAIL-CLOSED: PASS`; tombstone integration
+and retirement execution qualification remain BLOCKED. No eviction, drain,
+deactivation, scale-down or destructive compensation is enabled. See the
+2026-10-11 source-retirement admission audit in
+`docs/V2_EXECUTION_PROGRESS.md` for checks and exact outcomes.
+
 ## 2026-10-11 status update
 
 The 2026-10-11 Prompt 2B continuation adds a create-time immutable

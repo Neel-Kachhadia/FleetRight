@@ -1,5 +1,88 @@
 # V2 Execution Progress
 
+## 2026-10-11 Prompt 2B — source-retirement admission audit
+
+**Scope:** Prompt 2B only. Prompt 3 has not started. No destructive action was
+enabled. Session started at 10:10:39 UTC from
+`phase4/safe-execution-reconciliation` at `7bbb80561725748aec0364fc15a86dc236feb0a0`.
+
+**Decision:** retirement execution remains BLOCKED. The repository has no
+production source-retirement admission caller for
+`_write_retired_slot_tombstone`; API admission rejects MOVE/DEACTIVATE/V2 and
+Kubernetes scale-down, and the workload target rejects every downscale. The
+helper is durable intent persistence only. A CR status CAS cannot cancel or
+fence a Pod CREATE already admitted separately by the Kubernetes API server.
+
+### Changes and limits
+
+- Tombstone replay now re-reads the live source Pod and checks its exact UID,
+  owner/slot identity and approved scheduling. A changed UID rejects replay.
+  If the source has disappeared and the exact durable tombstone already exists,
+  replay is idempotent; it never clears the tombstone.
+- The helper rejects legacy/unmarked workload UIDs, unresolved
+  `pendingPodCreate`, sticky `podCreateHistoryUncertain`, and changed source
+  identity before appending a tombstone. New focused tests cover those checks
+  and both winners in a deterministic reservation-versus-tombstone resource
+  version race. This proves status CAS conflict behavior in the test adapter;
+  it does not create a production retirement admission path.
+- New-protocol CREATE reservations and retirement intent share the workload
+  status resourceVersion, so participating writers cannot both commit from the
+  same version. This does not prove that old controller binaries or an already
+  admitted request are fenced. Lost responses and lease expiry do not cancel
+  the request.
+- Legacy UIDs stay uncertain across reconcile/takeover and are rejected. The
+  preserved delayed-CREATE reproduction still creates a late Pod after source
+  removal; reconcile marks it unverified and BLOCKED. A Pod LIST or temporary
+  absence is not treated as proof that no request remains in flight.
+- The tombstone record binds workload UID, logical slot, source Pod UID,
+  generation, plan ID and operation ID. There is no production gate here to
+  verify an approved operation, current plan, replacement UID, source Node
+  identity, capacity or placement as one retirement authorization. Therefore
+  this record is not retirement authority and cannot report source exclusion.
+
+### Verification
+
+| Check | Result | Evidence / limit |
+|---|---|---|
+| Focused workload-controller and execution-target tests | PASS, 107 | `python/tests/test_workload_controller.py` and `python/tests/test_prompt2b_execution_targets.py`; includes pending/legacy rejection, CAS race, source UID replay and monotonic scale-up coverage. |
+| Original delayed CREATE reproduction | PASS, 1 | `test_pre_upgrade_inflight_create_can_recreate_a_retired_slot` remains a passing hazard reproduction: it demonstrates late stale Pod creation and BLOCKED classification, not safe retirement. |
+| PostgreSQL journal integration | PASS, 34 | `python/tests/test_prompt2b_journal.py`, authenticated isolated `fleetright_test` database. Initial environment check also confirmed DB health and authenticated `SELECT 1`. |
+| Control API and execution admission | PASS, 25 passed / 4 skipped | `python/tests/test_prompt2a_control_api.py`; skips require optional live Docker/Kind E2E setup. |
+| Real Kubernetes downscale admission probe | PASS, rejected | Against `fleetright-safety-lab`, `fleetright-v2/cpu-api` rejected with `FleetRightWorkload Pod CREATE history is uncertain`; resourceVersion remained `37141`. Probe was read-only and made no mutation. |
+| Existing Kind live SCALE_UP E2E | NOT RUN | The focused test skipped because `FLEETRIGHT_RUN_KIND_E2E=1` and the separate executor kubeconfig/controller context and health URL are unavailable. No executor credentials were created. |
+| Live pre-admitted CREATE injection | NOT RUN | The deterministic regression uses a barrier; no API-server request was held after admission in this session. |
+| Ruff check | PASS | `.venv/bin/python -m ruff check python`. |
+| Ruff format | PARTIAL | All three changed Python files pass format check. Repository-wide check reports only untouched `experiment.py`, `reconciler.py` and `test_prompt2b_journal.py`. |
+| Python compilation / diff | PASS | `compileall -q python`; `git diff --check`. |
+
+### Gate decision
+
+| Requirement | Result | Evidence |
+|---|---|---|
+| Tombstone integrated into real retirement admission | BLOCKED | No production caller or supported retirement transition exists. |
+| Pending CREATE blocks unsafe retirement | PASS, fail-closed | Helper and target tests reject unresolved CREATE; downscale remains disabled. |
+| Legacy uncertainty blocks unsafe retirement | PASS, fail-closed | Missing protocol is sticky uncertainty; live target rejects the legacy workload. |
+| Concurrent admission is serialized | PASS, limited | Deterministic shared-resourceVersion race permits one status write; no real retirement admission exists. |
+| Crash/takeover retains uncertainty and tombstone | PASS | Durable status survives retry/reconcile; tombstone is append-only. |
+| Late Pods are classified correctly | PASS, test-only injection | Reproduction classifies the late Pod as unverified and blocks completion. |
+| Source identity is revalidated | PASS, limited | Helper replay checks source Pod UID; source Node and replacement identity are not bound by an admission path. |
+| No false source-exclusion completion | PASS, fail-closed | No destructive completion path exists; unexpected Pod remains unverified and BLOCKED. |
+| Existing SCALE_UP remains functional | PASS, unit/integration | Focused controller/target and PostgreSQL/control API suites pass; live Kind E2E was not run. |
+| Evidence is committed | PASS | Helper and tests: `eb9e0df`; this audit is committed separately. |
+
+**RETIREMENT ADMISSION FAIL-CLOSED: PASS** — current execution policy and the
+live target reject retirement/downscale. **Tombstone integration: BLOCKED** —
+no production admission path exists. **RETIREMENT EXECUTION QUALIFICATION:
+BLOCKED / NOT QUALIFIED.** No eviction, drain, deactivation, scale-down or
+destructive compensation is enabled.
+
+**Next critical task:** add a versioned source-bound retirement admission at a
+real execution boundary only after all Pod CREATE writers, including old
+controllers and admitted requests, can be fenced by a proven API-server-level
+mechanism. Bind verified plan/operation, source Pod and Node UIDs, replacement
+UID, generation and capacity/placement checks there. If that cross-system
+fence cannot be proven, keep retirement disabled.
+
 ## 2026-10-11 Prompt 2B — delayed CREATE retirement boundary
 
 **Scope:** Resolve stale Pod CREATE classification and durable slot exclusion.
