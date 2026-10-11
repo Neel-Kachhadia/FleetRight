@@ -502,11 +502,30 @@ def _tokens() -> tuple[dict[str, Principal], dict[str, str]]:
     return {token: Principal(role, role) for role, token in raw.items()}, raw
 
 
-def _supported_scale_out_request(now_ms: int) -> dict[str, object]:
+def _supported_scale_out_request(
+    now_ms: int,
+    *,
+    current_replicas: int = 3,
+    demand_qps_milli: int = 1_400_000,
+) -> dict[str, object]:
     snapshot = _snapshot(now_ms, predictive_scale_out=True)
-    snapshot["nodes"] = snapshot["nodes"][:4]
-    snapshot["nodes"][3]["labels"] = [("zone", "zone-3"), ("rack", "rack-3")]
-    snapshot["workloads"][0]["demand_qps_milli"] = 1_400_000
+    snapshot["nodes"] = snapshot["nodes"][: max(4, current_replicas + 1)]
+    for index in range(3, len(snapshot["nodes"])):
+        snapshot["nodes"][index]["labels"] = [
+            ("zone", f"zone-{index}"),
+            ("rack", f"rack-{index}"),
+        ]
+    placements = snapshot["current_placements"]
+    while len(placements) < current_replicas:
+        index = len(placements)
+        placements.append(
+            {
+                "workload_id": "cpu-api",
+                "replica_id": f"cpu-api-{index}",
+                "node_id": snapshot["nodes"][index]["node_id"],
+            }
+        )
+    snapshot["workloads"][0]["demand_qps_milli"] = demand_qps_milli
     snapshot["workloads"][0]["min_topology_domains"] = 3
     snapshot["workloads"][0]["max_topology_skew"] = 0
     return {
@@ -515,7 +534,13 @@ def _supported_scale_out_request(now_ms: int) -> dict[str, object]:
     }
 
 
-def _create_verified_plan(client: TestClient, raw_tokens: dict[str, str]) -> dict[str, object]:
+def _create_verified_plan(
+    client: TestClient,
+    raw_tokens: dict[str, str],
+    *,
+    current_replicas: int = 3,
+    demand_qps_milli: int = 1_400_000,
+) -> dict[str, object]:
     now_ms = time.time_ns() // 1_000_000
     response = client.post(
         "/v1/optimize",
@@ -523,7 +548,11 @@ def _create_verified_plan(client: TestClient, raw_tokens: dict[str, str]) -> dic
             "Authorization": f"Bearer {raw_tokens['recommender']}",
             "Idempotency-Key": secrets.token_hex(16),
         },
-        json=_supported_scale_out_request(now_ms),
+        json=_supported_scale_out_request(
+            now_ms,
+            current_replicas=current_replicas,
+            demand_qps_milli=demand_qps_milli,
+        ),
     )
     assert response.status_code == 201, response.text
     assert response.json()["state"] == "VERIFIED", response.json()
@@ -1237,6 +1266,24 @@ def test_database_readiness_reports_unavailable() -> None:
     assert UnavailableRepository("unused").readiness() == (False, "database-unavailable")
 
 
+def test_supported_scale_out_request_can_plan_four_to_five(
+    clean_database: Database,
+) -> None:
+    tokens, raw_tokens = _tokens()
+    app = create_app(clean_database.repository, tokens=tokens)
+    with TestClient(app) as client:
+        plan = _create_verified_plan(
+            client, raw_tokens, current_replicas=4, demand_qps_milli=2_200_000
+        )
+    scale = next(
+        action
+        for action in plan["candidate_actions"]
+        if action["action_type"] == "SET_REPLICA_COUNT"
+    )
+    assert scale["payload"]["current_replicas"] == 4
+    assert scale["payload"]["proposed_replicas"] == 5
+
+
 def test_api_rejects_oversized_request_body(clean_database: Database) -> None:
     tokens, _ = _tokens()
     app = create_app(clean_database.repository, tokens=tokens)
@@ -1322,7 +1369,13 @@ def test_kubernetes_workload_api_recovers_after_ready_scale_up_crash(
 
     target = FleetRightWorkloadTarget(kubeconfig=kubeconfig, namespace="fleetright-v2")
     baseline = target.observe_scale("cpu-api")
-    assert baseline["replicas"] == baseline["ready_replicas"] == 3
+    assert baseline["replicas"] == baseline["ready_replicas"]
+    with docker_e2e_database.repository.transaction() as conn:
+        conn.execute(
+            "SELECT setval('execution_controller_fence_seq', %s, true)",
+            (baseline["fencing_token"],),
+        )
+    expected_replicas = baseline["replicas"] + 1
     health = WorkloadHealthObserver({"cpu-api": health_url})
     traffic_stop = threading.Event()
     traffic_errors: list[str] = []
@@ -1386,8 +1439,19 @@ def test_kubernetes_workload_api_recovers_after_ready_scale_up_crash(
         primary.start()
         recovery.start()
         with TestClient(app) as client:
-            plan = _create_verified_plan(client, raw_tokens)
+            plan = _create_verified_plan(
+                client,
+                raw_tokens,
+                current_replicas=baseline["replicas"],
+                demand_qps_milli=500_000 * baseline["replicas"] + 200_000,
+            )
             plan_id = plan["plan_id"]
+            scale = next(
+                action
+                for action in plan["candidate_actions"]
+                if action["action_type"] == "SET_REPLICA_COUNT"
+            )
+            assert scale["payload"]["proposed_replicas"] == expected_replicas
             approved = client.post(
                 f"/v1/plans/{plan_id}/approve",
                 headers={
@@ -1420,9 +1484,18 @@ def test_kubernetes_workload_api_recovers_after_ready_scale_up_crash(
             while not mutation_ready.exists() and time.monotonic() < deadline:
                 assert primary.is_alive(), f"execution controller exited: {primary.exitcode}"
                 time.sleep(0.1)
-            assert mutation_ready.exists(), "Kubernetes scale did not reach four Ready replicas"
+            if not mutation_ready.exists():
+                detail = client.get(
+                    f"/v1/plans/{plan_id}",
+                    headers={"Authorization": f"Bearer {raw_tokens['viewer']}"},
+                )
+                pytest.fail(
+                    "Kubernetes scale did not reach the approved Ready count; "
+                    f"execution={detail.json().get('execution')}; "
+                    f"target={target.observe_scale('cpu-api')}"
+                )
             scaled = target.observe_scale("cpu-api")
-            assert scaled["replicas"] == scaled["ready_replicas"] == 4
+            assert scaled["replicas"] == scaled["ready_replicas"] == expected_replicas
             with docker_e2e_database.repository.transaction() as conn:
                 action_state = conn.execute(
                     "SELECT execution_state FROM action_intents WHERE plan_id = %s",
@@ -1456,7 +1529,7 @@ def test_kubernetes_workload_api_recovers_after_ready_scale_up_crash(
                 )
             assert detail.status_code == 200
             final_target = target.observe_scale("cpu-api")
-            assert final_target["replicas"] == final_target["ready_replicas"] == 4
+            assert final_target["replicas"] == final_target["ready_replicas"] == expected_replicas
             with docker_e2e_database.repository.transaction() as conn:
                 execution = conn.execute(
                     "SELECT status FROM plan_executions WHERE plan_id = %s", (plan_id,)

@@ -30,24 +30,26 @@ disabled.
 | V2 identity | PASS | Existing owner-contract v1 remains in use; the planner now rejects duplicate Node UIDs. `EvacuationV2Test.RejectsDuplicateNodeUids` plus the existing owner-drift tests pass. |
 | New controller CREATE protocol | PASS, unit-level | `status.pendingPodCreate` binds workload UID, generation, deterministic Pod name, and logical slot. The controller reserves it before POST, retains it on unknown outcomes, observes the exact owner/slot/generation and approved placement after restart, and clears it only after known resolution. Tests cover delayed response, lost reservation response, lost CREATE response, CAS conflict, wrong generation, and definitive rejection. |
 | Legacy delayed CREATE after slot removal | FAIL, reproduced | `test_pre_upgrade_inflight_create_can_recreate_a_retired_slot` models a CREATE admitted before the marker protocol; after takeover and source removal it creates a new Pod UID whose allowed placement still includes the source Node. This is a passing reproduction of the unsafe behavior, not a safety pass. |
-| Target/CRD guard | PASS, unit and live API-server transition check | Target preflight requires the pending marker schema and root CEL rule; target fence/authorization reject a pending marker. The additive CRD was applied to the safety lab. A temporary workload in unwatched `default` accepted a pending marker, and a valid scale-up spec update was rejected with the CEL message; the marker was cleared and the probe deleted. The new controller was not deployed. |
-| Python + PostgreSQL | PASS, 181 passed, 4 skipped, 1 warning | `.venv/bin/python -m pytest -q python/tests`; captured at `/tmp/fleetright-pytest-final.log`. The configured isolated `fleetright_test` database was accessed by the real test driver. Skips are opt-in Docker/Kind cases. |
-| Docker Compose E2E + PostgreSQL | PASS, 184 passed, 1 skipped, 1 warning | `FLEETRIGHT_RUN_DOCKER_E2E=1 .venv/bin/python -m pytest -q python/tests`; captured at `/tmp/fleetright-docker-e2e-final.log`. The remaining skip is the opt-in Kind E2E. |
+| Target/CRD guard | PASS, unit and live API-server transition check | Target preflight requires the pending marker schema and root CEL rule; target fence/authorization reject a pending marker. The additive CRD is installed in the safety lab and the updated controller is deployed 1/1. A temporary workload in unwatched `default` accepted a pending marker, and a valid scale-up spec update was rejected with the CEL message; the marker was cleared and the probe deleted. |
+| Authenticated Kind API E2E | PASS, 1 passed (80.61s) | `/tmp/fleetright-kind-e2e-final.log`; live run of `test_kubernetes_workload_api_recovers_after_ready_scale_up_crash` against `fleetright-v2/cpu-api`, real PostgreSQL schema, authenticated optimize/verify/approve/execute and idempotent replay, 4→5 scale-up, primary process kill after mutation while journal state was RUNNING, 30-second lease expiry, and recovery controller commit from observed Kubernetes state with one durable dispatch. The isolated test DB sequence was seeded from the existing target fence so its new schema did not issue a stale token. |
+| Python + PostgreSQL + Docker E2E | PASS, 185 passed, 1 skipped, 1 warning (117.02s) | `FLEETRIGHT_RUN_DOCKER_E2E=1 .venv/bin/python -m pytest -q python/tests`; captured at `/tmp/fleetright-prompt2b-final-pytest.log`. Real isolated `fleetright_test` PostgreSQL; opt-in Docker process-crash, unknown-response and health-regression cases ran. The remaining aggregate skip is the opt-in Kind case, which passed separately above. |
 | C++ | PASS, 38/38 | `cmake --build build --target fleetright_cpp_tests fleetright-plan fleetright-verify -j2`; `ctest --test-dir build --output-on-failure`. |
 | Ruff / compile / diff | PASS, changed files | `ruff check python`, changed-file `ruff format --check`, Python `compileall`, and `git diff --check` pass. Repository-wide format check still reports three untouched files: `experiment.py`, `reconciler.py`, and `test_prompt2b_journal.py`. |
-| Safety-lab read | PASS | 3/3 Nodes Ready, all listed system Pods Running/Ready, controller 1/1, `cpu-api` 4/4 Ready in `fleetright-v2`. The opt-in live test requires 3/3, so it was not run. The only cluster writes were the additive CRD update and temporary probe in `default`; the probe was deleted, and `cpu-api` was untouched. |
+| Safety-lab read | PASS | After E2E: 3/3 Nodes Ready, controller 1/1, `cpu-api` 5/5 Ready, execution phase APPLIED, no pending Pod-create marker. The temporary short-lived executor kubeconfig and localhost-only port-forward were removed. |
 
 The reservation protocol is intentionally limited. The CRD root validation
 prevents spec changes while a new, journaled CREATE is unresolved. It cannot
 cancel an old admitted request that has no marker; an unresolved marker may
 block reconciliation indefinitely. This does not prove source retirement or
-make eviction safe.
+make eviction safe. The E2E fence-sequence seed is test-fixture setup for an
+ephemeral PostgreSQL schema against a persistent lab object; production fencing
+logic was not changed.
 
 ### Current operation boundary
 
 | Operation | State |
 |---|---|
-| `SCALE_UP` | ENABLED for existing monotonic Kubernetes and supported Docker paths; Docker regression passed in this session. The current Kind scale-up/takeover test was not rerun. |
+| `SCALE_UP` | ENABLED for existing monotonic Kubernetes and supported Docker paths; Docker regressions and live Kind API→PostgreSQL scale-up/takeover passed in this session. |
 | `SCALE_DOWN` | Docker admission remains evidence-gated; Kubernetes DISABLED. No new live scale-down qualification. |
 | `MOVE_REPLICA` | DISABLED |
 | `EVICT_SOURCE` | DISABLED |
