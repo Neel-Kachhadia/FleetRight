@@ -491,6 +491,22 @@ def test_source_retirement_target_blocks_before_writing_a_tombstone(
         )
 
 
+def test_source_retirement_target_blocks_without_create_persistence_fence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = FleetRightWorkloadTarget(namespace="fleetright-v2")
+    observed = target._observe(_workload_object(), "cpu-api")
+    monkeypatch.setattr(target, "observe_scale", lambda _workload: observed)
+    _install_source_observation(monkeypatch, target)
+
+    with pytest.raises(ActionBlocked, match="POD_CREATE_PERSISTENCE_FENCE_UNPROVEN"):
+        target.prepare_source_retirement(
+            "cpu-api",
+            "verified-plan",
+            _retirement_payload(replacement_pod_uid="replacement-pod-uid"),
+        )
+
+
 def test_source_retirement_target_rejects_changed_source_authority(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
