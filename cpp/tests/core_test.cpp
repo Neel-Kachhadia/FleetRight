@@ -329,6 +329,25 @@ TEST(EvacuationV2Test, RejectsUnsupportedSchemaUnknownFieldsAndTampering) {
   EXPECT_FALSE(fleetright::VerifyEvacuationV2(snapshot, plan).accepted());
 }
 
+TEST(EvacuationV2Test, RejectsDuplicateNodeUids) {
+  auto snapshot = EvacuationFixture();
+  auto plan = FeasibleEvacuationPlan(snapshot);
+  snapshot.mutable_nodes(1)->set_node_uid(snapshot.nodes(0).node_uid());
+  SealEvacuationSnapshot(&snapshot);
+  plan.set_snapshot_sha256(snapshot.content_sha256());
+  SealEvacuationPlan(&plan);
+
+  EXPECT_FALSE(fleetright::PlanEvacuationV2(snapshot).feasible());
+  const auto result = fleetright::VerifyEvacuationV2(snapshot, plan);
+  EXPECT_FALSE(result.accepted());
+  const auto snapshot_check = std::find_if(
+      result.invariants().begin(), result.invariants().end(), [](const auto &invariant) {
+        return invariant.invariant() == "v2_snapshot_identity_inventory_and_hash";
+      });
+  ASSERT_NE(snapshot_check, result.invariants().end());
+  EXPECT_FALSE(snapshot_check->passed());
+}
+
 TEST(EvacuationV2Test, RejectsControllerNamespaceAndOwnerContractMismatches) {
   auto snapshot = EvacuationFixture();
   snapshot.mutable_controllers(0)->set_namespace_("other-namespace");

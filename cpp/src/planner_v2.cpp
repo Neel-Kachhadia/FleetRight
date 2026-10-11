@@ -687,12 +687,12 @@ bool SnapshotValid(const EvacuationSnapshot &snapshot) {
       snapshot.pods_size() != model.current_placements_size())
     return false;
 
-  std::map<std::string, std::string> node_uids;
+  std::set<std::string> node_uids;
   std::set<std::string> seen_node_ids;
   for (const auto &node : snapshot.nodes())
     if (node.node_id().empty() || node.node_uid().empty() || node.resource_version().empty() ||
         !node_ids.contains(node.node_id()) || !seen_node_ids.insert(node.node_id()).second ||
-        !node_uids.emplace(node.node_id(), node.node_uid()).second)
+        !node_uids.insert(node.node_uid()).second)
       return false;
   std::map<std::string, const PodIdentity *> pod_by_key;
   std::set<std::string> pod_uids;
