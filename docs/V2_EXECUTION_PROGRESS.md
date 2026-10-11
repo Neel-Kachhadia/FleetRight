@@ -1,5 +1,57 @@
 # V2 Execution Progress
 
+## 2026-10-11 Prompt 2B continuation — owner contract and safety gate
+
+**Session start:** 2026-10-11 07:41:47 UTC; target finish 13:11:47 UTC;
+absolute hard stop 13:41:47 UTC.
+
+**Branch / starting HEAD:** `phase4/safe-execution-reconciliation` /
+`f543080` (`test: restore kind scale-up and stale-create coverage`). Tracked
+worktree was clean at start; pre-existing untracked `graphify-out/` was
+preserved. No milestone-4 tag exists.
+
+**Decision:** INCOMPLETE. The V2 owner contract now explicitly supports only
+`FleetRightWorkload` identity and the independent verifier checks it, but
+target-side destructive authority and durable retired-slot exclusion remain
+unproven. All destructive V2 actions remain disabled. Prompt 3 has not started.
+
+| Check | Result | Evidence |
+|---|---|---|
+| V2 owner contract | PASS, contract-only | `owner_contract_version=1` binds workload kind/name/UID/resourceVersion/generation, controller type/protocol, Pod owner and logical slot. API, planner and independent verifier reject legacy Deployment/ReplicaSet identity fields. |
+| Focused Python V2/execution/controller tests | PASS, 44 passed | `.venv/bin/python -m pytest -q python/tests/test_evacuation_v2.py python/tests/test_prompt2b_execution_targets.py` plus stale-generation and delayed-old-CREATE controller regressions. |
+| C++ build and regression | PASS, 37/37 | `cmake --build build -j2`; `ctest --test-dir build --output-on-failure`, including independent-verifier rejection of owner drift. |
+| Python repository suite without PostgreSQL | PASS, 114 passed, 59 skipped | `.venv/bin/python -m pytest -q python/tests` with `FLEETRIGHT_TEST_DATABASE_URL` unset. Database and opt-in integration coverage is not qualified by this run. |
+| Formatting and compilation | PASS | Ruff check/format on changed Python files, `clang-format --dry-run --Werror` on changed C++, Python `compileall`, and `git diff --check`. |
+| Delayed stale Pod CREATE regression | FAIL safety property reproduced | `test_delayed_old_create_can_recreate_removed_slot_after_takeover` passes by reproducing the violation. `test_stale_generation_cannot_create_pods_after_a_newer_workload_update` separately proves stale snapshots are rejected before CREATE; it does not cover a CREATE already in flight. |
+| Docker crash/takeover E2E | BLOCKED before test setup | The configured isolated PostgreSQL endpoint refused the connection before the fixture created a schema or touched a Compose project. |
+| Kind API-to-PostgreSQL E2E | NOT RUN | Nodes are 3/3 Ready, but CoreDNS is 0/2 Ready, kube-proxy is failing on all three nodes, and local-path storage is restarting. The existing `cpu-api` fixture is 4/4 rather than the test's required 3/3 baseline. No test mutation was attempted. |
+| PostgreSQL integration | BLOCKED | The configured test endpoint is not listening; no PostgreSQL schema or data was changed. |
+
+Claude Opus 5.5 Medium completed the requested bounded first-party review.
+Its findings were corrected: Python now matches C++ controller freshness and
+owner-UID uniqueness checks; the verifier test asserts the snapshot and plan
+binding invariants pass before checking the source-owner invariant fails; and
+legacy owner-field tests cover every retained Deployment/ReplicaSet field, the
+Pod controller UID, and the operation controller UID. The rerun passed 114
+Python tests and 37 C++ tests. GPT-6.1 Sol Max and Sol High separately reviewed
+the destructive-operation and workload lifecycle boundaries. Their remaining
+race finding is unchanged and keeps destructive V2 execution disabled.
+
+The source-level blocker is unchanged: workload status CAS and PostgreSQL
+leases do not serialize a Pod CREATE already admitted by the Kubernetes API.
+The regression demonstrates that a delayed old CREATE can persist after
+takeover and after the source ordinal is removed. A validating webhook or
+resourceVersion check alone does not close that in-flight request boundary.
+No Eviction authority exists in the executor RBAC, and the saved Kubernetes
+1.37.0 evidence shows that PDB admission/resourceVersion behavior does not
+provide a universal stale-request fence. Do not enable source eviction,
+staged replacement, scale-down, node drain, or destructive compensation.
+
+**Next exact implementation action:** prove and enforce a target-side barrier
+that serializes retired-slot exclusion with in-flight Pod CREATE and destructive
+dispatch; until its adversarial delayed-request test passes, keep all destructive
+V2 actions disabled. No milestone tag was created.
+
 ## 2026-10-10 Prompt 2B continuation — live Kind validation
 
 **Scope:** Prompt 2B continuation only. Prompt 3 has not started.

@@ -44,12 +44,11 @@ scale-up on a new `cpu-api` object marked `monotonic-scale-up-v1` is admitted; d
 execution and scale-down are disabled. Kubernetes execution requires an explicit namespace-scoped
 kubeconfig and narrowly scoped RBAC.
 
-The current session's dedicated safety-lab Kubernetes v1.37.0 API and `/readyz` endpoint responded
-after the API certificate's NotBefore time, but the lab is not qualified for live execution: CoreDNS,
-etcd, the API server, controller manager, scheduler, kindnet, and kube-proxy Pods reported container
-startup errors, and worker kube-proxy logged `fsnotify watcher init: too many open files`. Restarting
-the three nodes in this dedicated kind cluster did not stabilize kube-system. No FleetRight resources
-were applied and the opt-in live scale-up test was not run. The saved live negative control from
+The 2026-10-10 live Kind qualification passed authenticated API-to-PostgreSQL-to-Kubernetes
+scale-up and process takeover. On 2026-10-11 the three lab Nodes were still Ready, but CoreDNS was
+0/2 Ready, kube-proxy was failing on all three Nodes, and local-path storage was restarting. The
+existing FleetRight controller and workload were Running, with `cpu-api` at 4/4 Ready; the opt-in
+scale-up test requires a 3/3 baseline and was not run. The saved live negative control from
 2026-10-08 demonstrates that an unready same-UID Pod
 under `IfHealthyBudget` can be evicted after its resourceVersion changes even when the PDB reports
 zero allowed disruptions. PostgreSQL leases, a Pod UID, and a resourceVersion check do not fence
@@ -67,11 +66,15 @@ below desired replicas, using the immutable old allowed-node set; a stale in-fli
 same after the source UID is observed absent. The replacement may return to the source node. This
 prevents the current V2 source-exclusion and node-drain postconditions.
 
-The V2 inventory verifier binds source Pods to a Deployment and one active ReplicaSet UID, while the
-current execution target uses FleetRightWorkload-owned Pods. The existing V2 contract cannot bind to
-that target. The FleetRightWorkload PDB also uses `replicas - availabilityFloor` for `maxUnavailable`;
-it does not encode the profile-derived minimum replicas or N-1 reserve required by V2. Keep staged
-replacement, Eviction, and node drain disabled.
+As of 2026-10-11, V2 owner contract version 1 explicitly binds
+`FleetRightWorkload` kind/name/UID/resourceVersion/generation, controller type/protocol, and Pod
+owner/logical-slot identity. The API, C++ planner, and independent verifier reject legacy
+Deployment/ReplicaSet owner fields. This resolves the inventory owner-shape mismatch for planning;
+it does not establish destructive execution authority. The FleetRightWorkload PDB still uses
+`replicas - availabilityFloor` for `maxUnavailable`; it does not encode the profile-derived minimum
+replicas or N-1 reserve required by V2. The stale in-flight Pod CREATE regression still permits an
+old request to recreate a removed ordinal after takeover. Keep staged replacement, Eviction, and node
+drain disabled.
 
 V2 `MOVE_REPLICA`, `DEACTIVATE_NODE`, and resource resizing are rejected during planning admission
 and again before execution-journal creation. Durable staged replacement, PDB-safe eviction,
@@ -87,10 +90,11 @@ See [ADR-008](adr/008-staged-evacuation-execution.md).
 
 The separate V2 contract and independent C++ verifier prove a bounded
 constraint-based evacuation for one source Pod UID. A verified V2 plan remains
-inadmissible for execution: the current adapter does not enforce the approved
-node set and hard anti-affinity, provide an atomic UID/PDB eviction fence,
-recheck owner identities, or reconcile the staged protocol durably. No live
-evacuation is supported. V2 enumerates up to eight approved nodes and rejects
+inadmissible for execution: the current target does not enforce approved
+placement through a destructive mutation protocol, provide an atomic UID/PDB
+eviction fence, or reconcile staged actions durably. Owner identities are bound
+in the plan but are not revalidated by a destructive target because that target
+does not exist. No live evacuation is supported. V2 enumerates up to eight approved nodes and rejects
 larger outcome sets rather than sampling them. Its bounded N-1 proof supports
 one N-1 workload per plan and checks serving availability at each modeled
 stage plus every recovery insertion order using an explicit node-label failure

@@ -2,6 +2,21 @@
 
 Status: Blocked
 
+## 2026-10-11 status update
+
+V2 owner contract version 1 now binds `FleetRightWorkload` kind, namespace,
+name, UID, resourceVersion and generation; controller type and execution
+protocol; and each Pod's owner and logical slot. The API, C++ planner and
+independent verifier reject legacy Deployment/ReplicaSet owner fields. Focused
+Python and C++ tests pass. This aligns planning identity with the current
+workload owner; it does not authorize destructive execution.
+
+The delayed-CREATE regression still demonstrates that an old admitted Pod
+request can complete after takeover and source-slot removal. The current
+workload object CAS is not atomic with Pod CREATE or Eviction storage. No
+target-side dispatch authority or retired-slot exclusion barrier has been
+implemented, and destructive V2 actions remain disabled.
+
 ## Context
 
 `EvacuationStep` in the current plan schema names one logical replica, its exact
@@ -29,9 +44,9 @@ precondition with the freshly read Pod version for an unready Pod admitted by
 its unhealthy-Pod PDB policy ([upstream handler](https://github.com/kubernetes/kubernetes/blob/v1.37.0/pkg/registry/core/pod/storage/eviction.go#L216-L274)).
 UID still protects against deleting a different Pod recreated under the same
 name, but it does not prevent a stale controller from evicting the same source
-Pod. The current reconciler fences Deployments, not source Pods; the lease
-check and eviction request are separate operations, so its takeover path does
-not prove this handoff safe.
+Pod. The current reconciler fences the scale-up target object, not source-Pod
+Eviction; the lease check and eviction request are separate operations, so its
+takeover path does not prove this handoff safe.
 
 ## Decision
 
@@ -56,16 +71,18 @@ protocol must choose one enforceable promise:
   retirement. Do not treat one successful simulated placement as proof of all
   possible runtime placements.
 
-The durable action contract must bind the proof digest, Deployment and owning
-ReplicaSet identities, source Pod name and UID, baseline Pod inventory,
-approved placement set, surge limit, and expected final conditions. It must
-journal each stage before external mutation, bind the source Pod's UID and
-resource version to the current durable fence receipt, reconcile ambiguous
-Eviction responses by source UID and observed owner state, wait for replacement
-readiness, and fail closed unless the mutation admission path rejects stale
-fencing tokens for every supported Eviction branch. A database lease, Pod
-pre-read, or resource-version receipt alone is insufficient for that guarantee.
-Any replacement/retirement path that bypasses PDB admission is unsupported.
+The durable action contract must bind the proof digest, versioned
+`FleetRightWorkload` identity, source Pod name/UID/logical slot, source Node
+name/UID, baseline inventory, approved placement set, surge limit, and expected
+final conditions. It must journal every stage before mutation, reconcile
+uncertain outcomes by observed UID and owner state, and wait for replacement
+readiness before source retirement. A target-side barrier must serialize
+retired-slot exclusion with all in-flight and future Pod CREATEs and destructive
+dispatches across controller takeover. A database lease, workload
+resourceVersion check, Pod pre-read, or validating-webhook check alone is
+insufficient for an already admitted request. Eviction must use PDB admission
+and preserve the verifier's availability, capacity, topology, and recovery
+constraints for every supported Kubernetes Eviction branch.
 
 ## Consequences
 
