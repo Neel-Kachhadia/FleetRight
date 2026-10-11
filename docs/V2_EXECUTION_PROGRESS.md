@@ -11,7 +11,7 @@ Prompt 3 has not started. Destructive V2 actions remain disabled.
 `06c67c406bfe1f9bfb12324d70e0804eebbc3ccf`. The pre-existing untracked
 `graphify-out/` is preserved.
 
-**Ending HEAD:** `47e141763129722ccb16becf35630bb6f444e781`.
+**Feature commit:** `47e141763129722ccb16becf35630bb6f444e781`.
 
 ### Implemented
 
