@@ -57,6 +57,37 @@ logic was not changed.
 | `DRAIN_NODE` | DISABLED |
 | destructive `COMPENSATE` | DISABLED / not implemented |
 
+### Prompt 2B completion gates
+
+| Gate | State | Evidence or limit |
+|---|---|---|
+| V2 owner contract consistent | PASS | Python API, C++ planner/verifier and owner-drift tests bind the managed owner identity. |
+| Independent verifier correct | PASS | CTest 38/38, including tamper, owner drift, capacity and topology checks. |
+| Stale-plan rejection | PASS | Existing plan-binding, expiry and changed-approval-binding tests pass. |
+| Durable source retirement | FAIL | No retired-slot tombstone or staged retirement journal exists. |
+| Delayed CREATE safety | FAIL | `test_pre_upgrade_inflight_create_can_recreate_a_retired_slot` reproduces the stale request after takeover. New requests are reserved, but the old admitted request has no marker. |
+| Replacement identity correctness | BLOCKED | Planner binds V2 source identity; execution has no staged replacement operation. |
+| Allowed destination enforcement | PASS, scale-up only | Controller checks Pod placement against approved Node name/UID; controller unit tests pass. |
+| Resource and surge constraints | BLOCKED | Planner/verifier check them, but no runtime staged replacement path consumes that approval. |
+| Destructive execution authority | BLOCKED | V2 destructive actions are not admitted; scoped executor has no Eviction permission. |
+| Stale-controller safety | BLOCKED | Scale-up takeover passes; an older in-flight Pod CREATE remains unfenced. |
+| Crash and takeover recovery | PASS, scale-up only | Live Kind and Docker controller-process crash/takeover tests commit from observed target state with one dispatch. |
+| Durable staged replacement | BLOCKED | Not implemented. |
+| Replacement readiness before eviction | BLOCKED | No source eviction execution path exists. |
+| PDB-safe source eviction | BLOCKED | Executor never calls policy/v1 Eviction; no FleetRight PDB-safe eviction qualification. |
+| Lost-response reconciliation | PASS, scale-up/create only | Journaled scale-up and new Pod-create outcomes reconcile; eviction unknown outcomes are unsupported. |
+| Duplicate operation prevention | PASS, scale-up only | Authenticated execute replay returns the same claim; live takeover records one dispatch. |
+| Node cordon and bounded drain | NOT RUN | Drain is disabled and no drain executor exists. |
+| Partial-drain recovery | NOT RUN | No node-drain workflow exists to resume. |
+| Health-driven compensation | BLOCKED | Health regression fails safely; restoring capacity and verifying recovery are not implemented. |
+| Docker E2E | PASS | Final Python/PostgreSQL suite ran the opt-in Docker crash, timeout and health-regression cases. |
+| Real Kubernetes E2E | BLOCKED | Authenticated API→PostgreSQL→controller scale-up/takeover passes; all required destructive live cases remain disabled and were not run. |
+| PostgreSQL integration | PASS | Final full Python run used the isolated PostgreSQL test database. |
+| Scoped RBAC positive and negative tests | PASS, scale-up only | Live harness verifies named workload patch access and denies Pod delete, Eviction, Secret read and Node patch. |
+| Relevant Python regression suite | PASS | 185 passed, 1 Kind skip in the aggregate run; Kind E2E passed separately. |
+| Relevant C++ regression suite | PASS | CTest 38/38. |
+| Formatting and lint | BLOCKED, partial | Ruff check, changed-file format, compileall and diff check pass; repository-wide Ruff format still flags three untouched files. |
+
 ### Skills and independent review
 
 - Frontier Engineering Max instructions and actual local interfaces were
