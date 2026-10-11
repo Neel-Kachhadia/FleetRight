@@ -1,5 +1,79 @@
 # V2 Execution Progress
 
+## 2026-10-11 Prompt 2B — delayed CREATE retirement boundary
+
+**Scope:** Resolve stale Pod CREATE classification and durable slot exclusion.
+Prompt 3 has not started. Destructive V2 actions remain disabled.
+
+**Session:** started about 09:20 UTC; elapsed about 41 minutes at this checkpoint.
+
+**Branch / starting HEAD:** `phase4/safe-execution-reconciliation` /
+`06c67c406bfe1f9bfb12324d70e0804eebbc3ccf`. The pre-existing untracked
+`graphify-out/` is preserved.
+
+### Implemented
+
+- New workload UIDs must carry immutable `podCreateProtocol:
+  reserved-create-v1`. Legacy UIDs without it remain explicitly uncertain and
+  are rejected by workload execution admission; they require a new workload UID.
+- Each Pod CREATE now has a fresh attempt ID. The durable intent and authorized
+  Pod UID record bind workload UID, Pod UID/name, logical slot, generation,
+  plan, operation, and attempt. An old duplicate cannot match a later retry.
+- Append-only authorization and retired-slot status are guarded by CRD CEL.
+  Retired slots bind source Pod UID and operation identity. Ordinary reconcile
+  cannot recreate a retired desired slot or report it reconciled; a different
+  UID in that slot is unverified, contributes to surge accounting, and sets
+  sticky uncertainty. The controller writes uncertainty and `BLOCKED` together.
+- The execution target rejects legacy owners, pending CREATEs, uncertain or
+  unverified Pods, and any retired-slot history. No eviction or other
+  destructive action was added or enabled.
+
+### Verification
+
+| Gate | Result | Evidence |
+|---|---|---|
+| Focused controller/target regressions | PASS, 101 | `.venv/bin/python -m pytest -q python/tests/test_workload_controller.py python/tests/test_prompt2b_execution_targets.py` |
+| Full Python/PostgreSQL/Docker suite | PASS, 205 passed, 1 skipped, 1 warning | Isolated test DB, `FLEETRIGHT_RUN_DOCKER_E2E=1`; traceback output suppressed. Existing journal takeover coverage ran. |
+| Ruff / format / compile / diff | PASS | Four changed Python files; Python compileall and `git diff --check`. |
+| CRD server dry-run and apply | PASS | Safety-lab API accepted the CEL schema after replacing quadratic append checks with map-list merge equality. |
+| Live first status write and tombstone append | PASS | Isolated `fleetright-retirement-test` namespace; new workload status and tombstone accepted. |
+| Live immutable retirement / sticky uncertainty checks | PASS | API rejected tombstone removal and clearing `podCreateHistoryUncertain`. |
+| Live stale Pod observation / restart | PASS, classification only | API-assigned Pod UID scheduled on `fleetright-safety-lab-worker`; controller reported 1 unverified Pod, 0 ready, 1 surge, false Reconciled. After isolated controller restart, the tombstone and uncertainty remained. |
+| Live already-admitted delayed CREATE injection | NOT RUN | The live test created an old-identity Pod after tombstoning; it did not emulate an API request already admitted before retirement. The deterministic barrier test retains that boundary. |
+| PostgreSQL restart of the tombstone | NOT RUN | Retirement state lives in Kubernetes status; live controller restart was tested. The full PostgreSQL journal suite passed separately. |
+| C++ | NOT RUN | No C++ contract or source changed. |
+
+### Adversarial case classification
+
+| Case | Result | Evidence / limit |
+|---|---|---|
+| 1–7: delayed CREATE, authority loss/takeover, stale identity and UID conflicts, concurrent status CAS, unknown outcome restart | PASS | Deterministic barriers, status-response loss, and controller restart/takeover regressions. |
+| 8: retirement state across PostgreSQL restart | NOT RUN | Tombstones are stored in Kubernetes status; the live Kubernetes controller restart was tested, but no PostgreSQL restart was paired with this tombstone. |
+| 9: ordinary reconcile cannot restore a retired slot | PASS | Tombstone takeover regression leaves the slot absent and blocked. |
+| 10: no destructive admission after stale Pod disappearance | PASS, admission guard only | Sticky uncertainty and retired history block target fencing after the Pod disappears. Eviction itself remains disabled and was not invoked. |
+| 11: unresolved legacy/pre-upgrade uncertainty | PASS | Legacy owner UID is durably marked uncertain and rejected by execution admission. |
+| 12: monotonic SCALE_UP | PASS | Existing Python controller/target and PostgreSQL/Docker regressions passed; the shared legacy Kind workload remains intentionally ineligible. |
+
+### Safety limit
+
+The preserved `test_pre_upgrade_inflight_create_can_recreate_a_retired_slot`
+still proves that Kubernetes may materialize an old request after source-slot
+removal. The new controller classifies that Pod as unverified and blocks later
+execution; a legacy workload UID is blocked before destructive admission. This
+does not cancel the already admitted request or prove a source eviction safe.
+The tombstone helper is not connected to an enabled retirement/eviction path.
+Keep `MOVE_REPLICA`, `EVICT_SOURCE`, `DRAIN_NODE`, destructive scale-down, and
+destructive compensation disabled. Do not claim Prompt 2B complete.
+
+**Current result:** `RETIREMENT SAFETY GATE: BLOCKED` pending a defensible
+legacy-request boundary and a separately qualified retirement/eviction path.
+No push or milestone tag is authorized.
+
+**Next exact task:** integrate durable retirement intent into a future staged
+source-retirement path and prove it cannot proceed for a legacy or unresolved
+CREATE; then qualify delayed Eviction fencing independently before enabling
+any destructive operation.
+
 ## 2026-10-11 Prompt 2B continuation — partial CREATE intent barrier
 
 **Scope:** Prompt 2B only. Prompt 3 has not started.

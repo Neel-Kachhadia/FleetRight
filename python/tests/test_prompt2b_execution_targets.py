@@ -11,8 +11,12 @@ import fleetright.execution as execution_module
 import pytest
 from fleetright.api import create_app
 from fleetright.execution import (
+    _WORKLOAD_AUTHORIZED_POD_CREATES_RULE,
+    _WORKLOAD_CREATE_HISTORY_UNCERTAIN_RULE,
     _WORKLOAD_EXECUTION_RULES,
     _WORKLOAD_PENDING_CREATE_RULE,
+    _WORKLOAD_POD_CREATE_PROTOCOL_RULE,
+    _WORKLOAD_RETIRED_SLOTS_RULE,
     ActionBlocked,
     DockerComposeTarget,
     FleetRightWorkloadTarget,
@@ -400,6 +404,7 @@ def _workload_object() -> dict[str, object]:
         "spec": {
             "workloadID": "cpu-api",
             "executionProtocol": "monotonic-scale-up-v1",
+            "podCreateProtocol": "reserved-create-v1",
             "replicas": 2,
             "availabilityFloor": 1,
         },
@@ -482,11 +487,20 @@ def _execution_crd(rules: set[str]) -> dict[str, object]:
                     "name": "v1alpha1",
                     "schema": {
                         "openAPIV3Schema": {
-                            "x-kubernetes-validations": [{"rule": _WORKLOAD_PENDING_CREATE_RULE}],
+                            "x-kubernetes-validations": [
+                                {"rule": rule}
+                                for rule in (
+                                    _WORKLOAD_PENDING_CREATE_RULE,
+                                    _WORKLOAD_AUTHORIZED_POD_CREATES_RULE,
+                                    _WORKLOAD_RETIRED_SLOTS_RULE,
+                                    _WORKLOAD_CREATE_HISTORY_UNCERTAIN_RULE,
+                                )
+                            ],
                             "properties": {
                                 "spec": {
                                     "properties": {
                                         "executionProtocol": {"enum": ["monotonic-scale-up-v1"]},
+                                        "podCreateProtocol": {"enum": ["reserved-create-v1"]},
                                         "executionRequest": {
                                             "required": [
                                                 "planID",
@@ -507,7 +521,17 @@ def _execution_crd(rules: set[str]) -> dict[str, object]:
                                             ]
                                         },
                                     },
-                                    "x-kubernetes-validations": [{"rule": rule} for rule in rules],
+                                    "x-kubernetes-validations": [
+                                        {
+                                            "rule": rule,
+                                            **(
+                                                {"optionalOldSelf": True}
+                                                if rule == _WORKLOAD_POD_CREATE_PROTOCOL_RULE
+                                                else {}
+                                            ),
+                                        }
+                                        for rule in {*rules, _WORKLOAD_POD_CREATE_PROTOCOL_RULE}
+                                    ],
                                 },
                                 "status": {
                                     "properties": {
@@ -517,8 +541,43 @@ def _execution_crd(rules: set[str]) -> dict[str, object]:
                                                 "workloadGeneration",
                                                 "podName",
                                                 "replicaID",
+                                                "planID",
+                                                "operationID",
+                                                "createID",
                                             ]
-                                        }
+                                        },
+                                        "authorizedPodCreates": {
+                                            "x-kubernetes-list-type": "map",
+                                            "x-kubernetes-list-map-keys": ["podUID"],
+                                            "maxItems": 1_000,
+                                            "items": {
+                                                "required": [
+                                                    "workloadUID",
+                                                    "podUID",
+                                                    "podName",
+                                                    "replicaID",
+                                                    "workloadGeneration",
+                                                    "planID",
+                                                    "operationID",
+                                                    "createID",
+                                                ]
+                                            },
+                                        },
+                                        "retiredReplicaSlots": {
+                                            "x-kubernetes-list-type": "map",
+                                            "x-kubernetes-list-map-keys": ["replicaID"],
+                                            "maxItems": 1_000,
+                                            "items": {
+                                                "required": [
+                                                    "workloadUID",
+                                                    "replicaID",
+                                                    "podUID",
+                                                    "workloadGeneration",
+                                                    "planID",
+                                                    "operationID",
+                                                ]
+                                            },
+                                        },
                                     }
                                 },
                             },
@@ -541,6 +600,21 @@ def test_workload_preflight_requires_old_fence_advance_rule(
     )
     assert advance_rule in _WORKLOAD_EXECUTION_RULES
     crd = _execution_crd(_WORKLOAD_EXECUTION_RULES - {advance_rule})
+    monkeypatch.setattr(target, "_json", lambda *_args: crd)
+
+    with pytest.raises(TargetPreconditionFailed, match="execution CRD is not installed"):
+        target._require_fencing_schema()
+
+
+def test_workload_preflight_requires_create_time_pod_protocol_rule(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = FleetRightWorkloadTarget(namespace="fleetright-v2")
+    crd = _execution_crd(_WORKLOAD_EXECUTION_RULES)
+    spec = crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
+    for rule in spec["x-kubernetes-validations"]:
+        if rule["rule"] == _WORKLOAD_POD_CREATE_PROTOCOL_RULE:
+            del rule["optionalOldSelf"]
     monkeypatch.setattr(target, "_json", lambda *_args: crd)
 
     with pytest.raises(TargetPreconditionFailed, match="execution CRD is not installed"):
@@ -607,6 +681,29 @@ def test_workload_preflight_requires_root_pending_create_spec_guard(
         target._require_fencing_schema()
 
 
+@pytest.mark.parametrize(
+    "missing_rule",
+    [
+        _WORKLOAD_AUTHORIZED_POD_CREATES_RULE,
+        _WORKLOAD_RETIRED_SLOTS_RULE,
+        _WORKLOAD_CREATE_HISTORY_UNCERTAIN_RULE,
+    ],
+)
+def test_workload_preflight_requires_durable_create_and_retirement_guards(
+    monkeypatch: pytest.MonkeyPatch, missing_rule: str
+) -> None:
+    target = FleetRightWorkloadTarget(namespace="fleetright-v2")
+    crd = _execution_crd(_WORKLOAD_EXECUTION_RULES)
+    root = crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]
+    root["x-kubernetes-validations"] = [
+        rule for rule in root["x-kubernetes-validations"] if rule["rule"] != missing_rule
+    ]
+    monkeypatch.setattr(target, "_json", lambda *_args: crd)
+
+    with pytest.raises(TargetPreconditionFailed, match="execution CRD is not installed"):
+        target._require_fencing_schema()
+
+
 @pytest.mark.parametrize("method", ["fence_scale", "authorize_scale"])
 def test_workload_authority_blocks_while_pod_create_outcome_is_unknown(
     monkeypatch: pytest.MonkeyPatch, method: str
@@ -618,6 +715,9 @@ def test_workload_authority_blocks_while_pod_create_outcome_is_unknown(
         "workloadGeneration": 4,
         "podName": "frw-workload-r2",
         "replicaID": "cpu-api-2",
+        "planID": "plan-1",
+        "operationID": "action-1",
+        "createID": "attempt-1",
     }
     observed = target._observe(state, "cpu-api")
     monkeypatch.setattr(target, "observe_scale", lambda _: observed)
@@ -632,6 +732,63 @@ def test_workload_authority_blocks_while_pod_create_outcome_is_unknown(
             operation_id="action-1",
             target_replicas=3,
         )
+
+
+@pytest.mark.parametrize("method", ["fence_scale", "authorize_scale"])
+@pytest.mark.parametrize(
+    ("status_update", "reason"),
+    [
+        ({"podCreateHistoryUncertain": True}, "POD_CREATE_HISTORY_UNCERTAIN"),
+        ({"unverifiedPodCreates": 1}, "POD_CREATE_HISTORY_UNCERTAIN"),
+        (
+            {
+                "retiredReplicaSlots": [
+                    {
+                        "workloadUID": "workload-uid",
+                        "replicaID": "cpu-api-1",
+                        "podUID": "source-pod-uid",
+                        "workloadGeneration": 4,
+                        "planID": "plan-retire",
+                        "operationID": "retire-1",
+                    }
+                ]
+            },
+            "RETIRED_SLOT_HISTORY_PRESENT",
+        ),
+    ],
+)
+def test_workload_authority_stays_blocked_after_stale_pod_disappears(
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    status_update: dict[str, object],
+    reason: str,
+) -> None:
+    target = FleetRightWorkloadTarget(namespace="fleetright-v2")
+    state = _workload_object()
+    state["status"].update(status_update)
+    observed = target._observe(state, "cpu-api")
+    monkeypatch.setattr(target, "observe_scale", lambda _: observed)
+    monkeypatch.setattr(target, "_require_fencing_schema", lambda: None)
+
+    with pytest.raises(ActionBlocked, match=reason):
+        getattr(target, method)(
+            "cpu-api",
+            12,
+            expected=observed,
+            plan_id="plan-1",
+            operation_id="action-1",
+            target_replicas=3,
+        )
+
+
+def test_legacy_workload_cannot_be_promoted_for_execution() -> None:
+    target = FleetRightWorkloadTarget(namespace="fleetright-v2")
+    state = _workload_object()
+    del state["spec"]["podCreateProtocol"]
+    state["status"]["podCreateHistoryUncertain"] = True
+
+    with pytest.raises(TargetPreconditionFailed, match="Pod CREATE history is uncertain"):
+        target._observe(state, "cpu-api")
 
 
 def test_pending_create_reservation_wins_authority_resource_version_cas(
@@ -650,6 +807,9 @@ def test_pending_create_reservation_wins_authority_resource_version_cas(
             "workloadGeneration": 4,
             "podName": "frw-workload-r2",
             "replicaID": "cpu-api-2",
+            "planID": "plan-1",
+            "operationID": "action-1",
+            "createID": "attempt-1",
         }  # type: ignore[index]
         state["metadata"]["resourceVersion"] = "8"  # type: ignore[index]
         if patch["metadata"]["resourceVersion"] != "8":

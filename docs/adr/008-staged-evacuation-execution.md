@@ -4,6 +4,22 @@ Status: Blocked
 
 ## 2026-10-11 status update
 
+The 2026-10-11 Prompt 2B continuation adds a create-time immutable
+`podCreateProtocol`, per-attempt Pod identity, append-only authorized-create and
+retired-slot records, and sticky stale-Pod uncertainty. New workloads bind each
+Pod UID to the workload UID, slot, generation, plan, operation, and attempt.
+Legacy workload UIDs cannot be enrolled in place and fail closed. The
+FleetRightWorkload target rejects uncertain state, unresolved creates, and any
+retired-slot history. A live safety-lab controller restart preserved the
+tombstone and uncertainty; API attempts to remove either safety record were
+rejected.
+
+The old already-admitted CREATE boundary remains: a late Pod can still
+materialize after slot removal. The controller classifies it as unverified and
+blocks follow-on execution, but it cannot cancel the request. No retirement or
+Eviction path is enabled, and this work does not qualify a delayed Eviction.
+Prompt 2B remains incomplete.
+
 V2 owner contract version 1 now binds `FleetRightWorkload` kind, namespace,
 name, UID, resourceVersion and generation; controller type and execution
 protocol; and each Pod's owner and logical slot. The API, C++ planner and

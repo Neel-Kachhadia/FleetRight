@@ -9,6 +9,10 @@ from typing import Any
 
 import pytest
 from fleetright.workload_controller import (
+    POD_CREATE_ATTEMPT_ANNOTATION,
+    POD_CREATE_OPERATION_ANNOTATION,
+    POD_CREATE_PLAN_ANNOTATION,
+    POD_CREATE_PROTOCOL,
     REPLICA_ID_LABEL,
     TEMPLATE_HASH_ANNOTATION,
     WORKLOAD_GENERATION_ANNOTATION,
@@ -20,6 +24,7 @@ from fleetright.workload_controller import (
     _pod_name,
     _pod_object,
     _validate_spec,
+    _write_retired_slot_tombstone,
     reconcile_workload,
 )
 
@@ -27,6 +32,7 @@ from fleetright.workload_controller import (
 def _workload(**spec_overrides: Any) -> dict[str, Any]:
     spec: dict[str, Any] = {
         "workloadID": "api",
+        "podCreateProtocol": POD_CREATE_PROTOCOL,
         "replicas": 1,
         "availabilityFloor": 1,
         "surgeBudget": 0,
@@ -340,6 +346,13 @@ def test_delayed_create_is_journaled_and_takeover_resolves_exact_pod() -> None:
     assert api.pods[slot_name]["metadata"]["uid"] == created_uid
     assert "pendingPodCreate" not in api.status
     assert api.status["execution"]["phase"] == "APPLIED"
+    authorization = next(
+        item for item in api.status["authorizedPodCreates"] if item["podUID"] == created_uid
+    )
+    assert (
+        authorization["createID"]
+        == api.pods[slot_name]["metadata"]["annotations"][POD_CREATE_ATTEMPT_ANNOTATION]
+    )
     assert api.status["conditions"][2]["reason"] == "Reconciled"
 
 
@@ -376,6 +389,12 @@ def test_pre_upgrade_inflight_create_can_recreate_a_retired_slot() -> None:
         },
     )
     old_pod = _pod_object(old_snapshot, 1)
+    for annotation in (
+        POD_CREATE_ATTEMPT_ANNOTATION,
+        POD_CREATE_OPERATION_ANNOTATION,
+        POD_CREATE_PLAN_ANNOTATION,
+    ):
+        old_pod["metadata"]["annotations"].pop(annotation)
     entered_post, release_post = Event(), Event()
 
     def delayed_old_create() -> None:
@@ -423,6 +442,14 @@ def test_pre_upgrade_inflight_create_can_recreate_a_retired_slot() -> None:
         )
         next_operation["status"] = deepcopy(api.status)
         reconcile_workload(api, next_operation, _nodes())
+        _write_retired_slot_tombstone(
+            api,
+            next_operation,
+            api.pods[retired_name],
+            "plan-retire",
+            "retire-1",
+            _nodes(),
+        )
         # Model successful source eviction while the pre-upgrade CREATE remains in flight.
         del api.pods[retired_name]
         assert api.get_pod(retired_name) is None
@@ -440,6 +467,266 @@ def test_pre_upgrade_inflight_create_can_recreate_a_retired_slot() -> None:
         if term.get("matchFields")
     )
     assert recreated["metadata"]["annotations"][WORKLOAD_GENERATION_ANNOTATION] == "2"
+
+    observed = deepcopy(next_operation)
+    observed["metadata"]["resourceVersion"] = str(
+        int(next_operation["metadata"]["resourceVersion"]) + 1
+    )
+    observed["status"] = deepcopy(api.status)
+    reconcile_workload(api, observed, _nodes())
+    assert api.status["unverifiedPodCreates"] == 1
+    assert api.status["podCreateHistoryUncertain"] is True
+    assert api.status["readyReplicas"] == 1
+    assert api.status["execution"]["phase"] == "BLOCKED"
+    assert api.status["conditions"][2]["reason"] == "RetiredReplicaPodObserved"
+
+
+def test_retired_slot_tombstone_survives_controller_takeover_and_blocks_recreation() -> None:
+    class LostRetirementResponseAPI(FakeAPI):
+        lose_response = True
+
+        def patch_status(
+            self, name: str, resource_version: str, status: dict[str, Any]
+        ) -> dict[str, Any]:
+            result = super().patch_status(name, resource_version, status)
+            if self.lose_response and "retiredReplicaSlots" in status:
+                self.lose_response = False
+                raise RuntimeError("controller lost the tombstone response")
+            return result
+
+    api = LostRetirementResponseAPI()
+    workload = _workload()
+    reconcile_workload(api, workload, _nodes())
+    source = next(iter(api.pods.values()))
+    with pytest.raises(RuntimeError, match="lost the tombstone response"):
+        _write_retired_slot_tombstone(api, workload, source, "plan-retire", "retire-1", _nodes())
+
+    interim = deepcopy(workload)
+    interim["metadata"]["resourceVersion"] = str(int(workload["metadata"]["resourceVersion"]) + 1)
+    interim["status"] = deepcopy(api.status)
+    _write_retired_slot_tombstone(api, interim, source, "plan-retire", "retire-1", _nodes())
+    reconcile_workload(api, interim, _nodes())
+
+    assert api.pods[source["metadata"]["name"]]["metadata"]["uid"] == source["metadata"]["uid"]
+    assert api.status.get("podCreateHistoryUncertain") is not True
+    assert api.status["conditions"][2]["reason"] == "RetiredReplicaRequiresNewOperation"
+    del api.pods[source["metadata"]["name"]]
+
+    _write_retired_slot_tombstone(api, interim, source, "plan-retire", "retire-1", _nodes())
+
+    takeover = deepcopy(interim)
+    takeover["status"] = deepcopy(api.status)
+    reconcile_workload(api, takeover, _nodes())
+
+    assert api.pods == {}
+    assert api.status["retiredReplicaSlots"][0]["replicaID"] == "api-0"
+    assert api.status["conditions"][2]["reason"] == "RetiredReplicaRequiresNewOperation"
+
+
+def test_authorized_create_history_capacity_blocks_before_pod_post() -> None:
+    class PostTrackingAPI(FakeAPI):
+        create_calls = 0
+
+        def create_pod(self, pod: dict[str, Any]) -> dict[str, Any]:
+            self.create_calls += 1
+            return super().create_pod(pod)
+
+    api = PostTrackingAPI()
+    workload = _workload()
+    workload["status"] = {
+        "authorizedPodCreates": [
+            {
+                "workloadUID": "workload-uid",
+                "podUID": f"old-pod-{index}",
+                "podName": f"old-pod-{index}",
+                "replicaID": f"api-{index}",
+                "workloadGeneration": 1,
+                "planID": "plan-old",
+                "operationID": "operation-old",
+                "createID": f"attempt-{index}",
+            }
+            for index in range(1_000)
+        ]
+    }
+
+    reconcile_workload(api, workload, _nodes())
+
+    assert api.create_calls == 0
+    assert api.pods == {}
+    assert api.status["conditions"][2]["reason"] == "PodCreateHistoryFull"
+
+
+@pytest.mark.parametrize(
+    ("annotation", "value"),
+    [
+        (WORKLOAD_GENERATION_ANNOTATION, "2"),
+        (POD_CREATE_OPERATION_ANNOTATION, "old-operation"),
+        (POD_CREATE_ATTEMPT_ANNOTATION, "old-attempt"),
+    ],
+)
+def test_same_ordinal_stale_pod_uid_and_create_identity_are_unverified(
+    annotation: str, value: str
+) -> None:
+    api = FakeAPI()
+    workload = _workload()
+    reconcile_workload(api, workload, _nodes())
+    name = _pod_name("workload-uid", 0)
+    stale = deepcopy(api.pods[name])
+    stale["metadata"]["uid"] = "pod-uid-from-stale-create"
+    stale["metadata"]["annotations"][annotation] = value
+    api.pods[name] = stale
+
+    takeover = deepcopy(workload)
+    takeover["metadata"]["resourceVersion"] = "2"
+    takeover["status"] = deepcopy(api.status)
+    reconcile_workload(api, takeover, _nodes())
+
+    assert api.status["replicas"] == 0
+    assert api.status["readyReplicas"] == 0
+    assert api.status["unverifiedPodCreates"] == 1
+    assert api.status["podCreateHistoryUncertain"] is True
+
+
+def test_legacy_workload_uid_is_durably_uncertain() -> None:
+    api = FakeAPI()
+    legacy = _workload()
+    del legacy["spec"]["podCreateProtocol"]
+
+    reconcile_workload(api, legacy, _nodes())
+
+    assert api.pods == {}
+    assert api.status["podCreateHistoryUncertain"] is True
+    assert api.status["conditions"][2]["reason"] == "LegacyPodCreateUncertain"
+
+
+def test_stale_pod_history_stays_blocked_after_stale_pod_disappears() -> None:
+    api = FakeAPI()
+    workload = _workload()
+    reconcile_workload(api, workload, _nodes())
+    name = _pod_name("workload-uid", 0)
+    stale = deepcopy(api.pods[name])
+    stale["metadata"]["uid"] = "pod-uid-from-stale-create"
+    stale["metadata"]["annotations"][POD_CREATE_ATTEMPT_ANNOTATION] = "old-attempt"
+    api.pods[name] = stale
+
+    observed = deepcopy(workload)
+    observed["metadata"]["resourceVersion"] = "2"
+    observed["status"] = deepcopy(api.status)
+    reconcile_workload(api, observed, _nodes())
+    assert api.status["podCreateHistoryUncertain"] is True
+    del api.pods[name]
+
+    takeover = deepcopy(workload)
+    takeover["metadata"]["resourceVersion"] = str(int(observed["metadata"]["resourceVersion"]) + 1)
+    takeover["status"] = deepcopy(api.status)
+    reconcile_workload(api, takeover, _nodes())
+
+    assert api.pods == {}
+    assert api.status["podCreateHistoryUncertain"] is True
+    assert api.status["conditions"][2]["reason"] == "PodCreateHistoryUncertain"
+
+
+def test_stale_detection_and_blocked_phase_persist_atomically_across_restart() -> None:
+    class CrashAfterSafetyWriteAPI(FakeAPI):
+        crash_after_block = True
+
+        def patch_status(
+            self, name: str, resource_version: str, status: dict[str, Any]
+        ) -> dict[str, Any]:
+            result = super().patch_status(name, resource_version, status)
+            if (
+                self.crash_after_block
+                and status.get("podCreateHistoryUncertain") is True
+                and status.get("execution", {}).get("phase") == "BLOCKED"
+            ):
+                self.crash_after_block = False
+                raise RuntimeError("controller process stopped after durable status write")
+            return result
+
+    api = CrashAfterSafetyWriteAPI()
+    workload = _workload()
+    reconcile_workload(api, workload, _nodes())
+    pod = next(iter(api.pods.values()))
+    pod["status"] = {
+        "phase": "Running",
+        "conditions": [{"type": "Ready", "status": "True"}],
+    }
+    reconcile_workload(api, workload, _nodes())
+    workload["metadata"]["generation"] = 2
+    workload["spec"].update(
+        executionProtocol="monotonic-scale-up-v1",
+        executionFence={
+            "planID": "plan-1",
+            "operationID": "action-1",
+            "generation": 1,
+            "expectedGeneration": 1,
+            "expectedReplicas": 1,
+            "fencedGeneration": 2,
+        },
+        executionRequest={
+            "planID": "plan-1",
+            "operationID": "action-1",
+            "generation": 1,
+            "expectedReplicas": 1,
+            "targetReplicas": 1,
+        },
+    )
+    name = _pod_name("workload-uid", 0)
+    stale = deepcopy(api.pods[name])
+    stale["metadata"]["uid"] = "late-pod-uid"
+    stale["metadata"]["annotations"][POD_CREATE_ATTEMPT_ANNOTATION] = "old-attempt"
+    api.pods[name] = stale
+    workload["status"] = deepcopy(api.status)
+
+    with pytest.raises(RuntimeError, match="process stopped"):
+        reconcile_workload(api, workload, _nodes())
+
+    assert api.status["podCreateHistoryUncertain"] is True
+    assert api.status["execution"]["phase"] == "BLOCKED"
+    del api.pods[name]
+
+    takeover = deepcopy(workload)
+    takeover["metadata"]["resourceVersion"] = "99"
+    takeover["status"] = deepcopy(api.status)
+    reconcile_workload(api, takeover, _nodes())
+
+    assert api.pods == {}
+    assert api.status["podCreateHistoryUncertain"] is True
+    assert api.status["execution"]["phase"] == "BLOCKED"
+
+
+def test_delayed_duplicate_create_cannot_match_a_new_attempt_for_the_same_slot() -> None:
+    class LateDuplicateAPI(FakeAPI):
+        delayed_pod: dict[str, Any] | None = None
+
+        def create_pod(self, pod: dict[str, Any]) -> dict[str, Any]:
+            if self.delayed_pod is not None:
+                name = pod["metadata"]["name"]
+                stale = deepcopy(self.delayed_pod)
+                stale["metadata"]["uid"] = "pod-uid-late-duplicate"
+                self.pods[name] = stale
+                self.delayed_pod = None
+                raise ApiError(409, "late duplicate CREATE occupied the name")
+            return super().create_pod(pod)
+
+    api = LateDuplicateAPI()
+    workload = _workload()
+    reconcile_workload(api, workload, _nodes())
+    name = _pod_name("workload-uid", 0)
+    previous = deepcopy(api.pods[name])
+    previous_attempt = previous["metadata"]["annotations"][POD_CREATE_ATTEMPT_ANNOTATION]
+    del api.pods[name]
+    api.delayed_pod = previous
+
+    takeover = deepcopy(workload)
+    takeover["metadata"]["resourceVersion"] = str(int(workload["metadata"]["resourceVersion"]) + 1)
+    takeover["status"] = deepcopy(api.status)
+    reconcile_workload(api, takeover, _nodes())
+
+    assert api.status["pendingPodCreate"]["createID"] != previous_attempt
+    assert api.status["podCreateHistoryUncertain"] is True
+    assert api.status["unverifiedPodCreates"] == 1
+    assert api.status["conditions"][2]["reason"] == "PodCreateIdentityConflict"
 
 
 def test_status_reservation_conflict_stops_before_pod_create() -> None:
@@ -522,6 +809,9 @@ def test_pending_create_rejects_wrong_generation_without_clearing_intent() -> No
         "workloadGeneration": 1,
         "podName": name,
         "replicaID": "api-0",
+        "planID": "plan-0",
+        "operationID": "operation-0",
+        "createID": "attempt-0",
     }
     api.status["pendingPodCreate"] = pending
     api.pods[name]["metadata"]["annotations"][WORKLOAD_GENERATION_ANNOTATION] = "2"
@@ -1029,6 +1319,20 @@ def test_count_satisfied_with_ordinal_gap_does_not_delete_or_create_surge() -> N
             "phase": "Running",
             "conditions": [{"type": "Ready", "status": "True"}],
         }
+        api.status = api.status or {}
+        api.status.setdefault("authorizedPodCreates", []).append(
+            {
+                "workloadUID": "workload-uid",
+                "podUID": api.pods[pod["metadata"]["name"]]["metadata"]["uid"],
+                "podName": pod["metadata"]["name"],
+                "replicaID": pod["metadata"]["labels"][REPLICA_ID_LABEL],
+                "workloadGeneration": 1,
+                "planID": pod["metadata"]["annotations"][POD_CREATE_PLAN_ANNOTATION],
+                "operationID": pod["metadata"]["annotations"][POD_CREATE_OPERATION_ANNOTATION],
+                "createID": pod["metadata"]["annotations"][POD_CREATE_ATTEMPT_ANNOTATION],
+            }
+        )
+    workload["status"] = deepcopy(api.status)
     expected_names = set(api.pods)
 
     reconcile_workload(api, workload, _nodes())

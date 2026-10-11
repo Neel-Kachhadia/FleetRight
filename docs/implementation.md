@@ -347,8 +347,10 @@ kubectl -n fleetright port-forward service/cpu-api 8081:8080
 ```
 
 The current scale-up target additionally requires the CRD, the separate workload controller, and a
-new `FleetRightWorkload` object created with `executionProtocol: monotonic-scale-up-v1` and current
-allowed-node names and UIDs. The repository has no checked-in sample object or turnkey setup for
+new `FleetRightWorkload` object created with `executionProtocol: monotonic-scale-up-v1`,
+`podCreateProtocol: reserved-create-v1`, and current allowed-node names and UIDs. Existing workload
+UIDs without the Pod-create marker are rejected for execution and require a new workload UID. The
+repository has no checked-in sample object or turnkey setup for
 that target, so the commands above do not qualify its live execution path.
 
 When that target has been provisioned in an isolated cluster, mint a short-lived ServiceAccount

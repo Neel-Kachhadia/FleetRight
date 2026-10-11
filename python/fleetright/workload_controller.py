@@ -19,6 +19,7 @@ from urllib.request import (
     Request,
     build_opener,
 )
+from uuid import uuid4
 
 API_VERSION = "fleetright.io/v1alpha1"
 GROUP_VERSION_PATH = "/apis/fleetright.io/v1alpha1"
@@ -27,6 +28,10 @@ WORKLOAD_ID_LABEL = "fleetright.io/workload-id"
 REPLICA_ID_LABEL = "fleetright.io/replica-id"
 TEMPLATE_HASH_ANNOTATION = "fleetright.io/pod-template-sha256"
 WORKLOAD_GENERATION_ANNOTATION = "fleetright.io/workload-generation"
+POD_CREATE_PLAN_ANNOTATION = "fleetright.io/pod-create-plan"
+POD_CREATE_OPERATION_ANNOTATION = "fleetright.io/pod-create-operation"
+POD_CREATE_ATTEMPT_ANNOTATION = "fleetright.io/pod-create-attempt"
+POD_CREATE_PROTOCOL = "reserved-create-v1"
 _DNS_LABEL = re.compile(r"[a-z0-9](?:[-a-z0-9]*[a-z0-9])?\Z")
 _QUANTITY = re.compile(r"([0-9]+(?:\.[0-9]+)?|\.[0-9]+)(n|u|m|Ki|Mi|Gi|Ti|Pi|Ei|K|M|G|T|P|E)?\Z")
 _DECIMAL_MULTIPLIERS = {
@@ -311,13 +316,13 @@ def _pod_create_intent(workload: dict[str, Any], ordinal: int) -> dict[str, Any]
         "workloadGeneration": metadata["generation"],
         "podName": _pod_name(metadata["uid"], ordinal),
         "replicaID": f"{spec['workloadID']}-{ordinal}",
+        "planID": "bootstrap",
+        "operationID": f"bootstrap-{metadata['generation']}-{ordinal}",
+        "createID": uuid4().hex,
     }
     request = spec.get("executionRequest")
     if isinstance(request, dict):
-        intent.update(
-            planID=request["planID"],
-            operationID=request["operationID"],
-        )
+        intent.update(planID=request["planID"], operationID=request["operationID"])
     return intent
 
 
@@ -356,12 +361,15 @@ def _placement_fingerprint(spec: dict[str, Any], template: dict[str, Any]) -> st
     return hashlib.sha256(canonical).hexdigest()
 
 
-def _pod_object(workload: dict[str, Any], ordinal: int) -> dict[str, Any]:
+def _pod_object(
+    workload: dict[str, Any], ordinal: int, intent: dict[str, Any] | None = None
+) -> dict[str, Any]:
     metadata, spec = workload["metadata"], workload["spec"]
     template = _validate_template(spec.get("podTemplate"))
     placement = spec["placement"]
     allowed_nodes = [node["name"] for node in placement["allowedNodes"]]
     labels = _pod_labels(workload, ordinal)
+    intent = intent or _pod_create_intent(workload, ordinal)
     topology = placement.get("topology")
     pod_security_context = {
         "runAsNonRoot": True,
@@ -430,6 +438,9 @@ def _pod_object(workload: dict[str, Any], ordinal: int) -> dict[str, Any]:
                 **template.get("annotations", {}),
                 TEMPLATE_HASH_ANNOTATION: _placement_fingerprint(spec, template),
                 WORKLOAD_GENERATION_ANNOTATION: str(metadata["generation"]),
+                POD_CREATE_PLAN_ANNOTATION: intent["planID"],
+                POD_CREATE_OPERATION_ANNOTATION: intent["operationID"],
+                POD_CREATE_ATTEMPT_ANNOTATION: intent["createID"],
             },
             "ownerReferences": [_owner_reference(workload)],
         },
@@ -475,8 +486,65 @@ def _is_owned(value: dict[str, Any], workload: dict[str, Any]) -> bool:
 
 
 def _check_existing_pod(pod: dict[str, Any], workload: dict[str, Any]) -> int:
-    metadata, spec = pod.get("metadata", {}), workload["spec"]
+    ordinal = _check_existing_pod_identity(pod, workload)
+    metadata = pod["metadata"]
+    annotations = metadata["annotations"]
+    logical_id = metadata["labels"][REPLICA_ID_LABEL]
+    pod_uid = metadata.get("uid")
+    records = _authorized_pod_creates(workload)
+    if (
+        not isinstance(pod_uid, str)
+        or not pod_uid
+        or not any(
+            isinstance(record, dict)
+            and record.get("workloadUID") == workload["metadata"]["uid"]
+            and record.get("podUID") == pod_uid
+            and record.get("podName") == metadata.get("name")
+            and record.get("replicaID") == logical_id
+            and str(record.get("workloadGeneration"))
+            == annotations.get(WORKLOAD_GENERATION_ANNOTATION)
+            and record.get("planID") == annotations.get(POD_CREATE_PLAN_ANNOTATION)
+            and record.get("operationID") == annotations.get(POD_CREATE_OPERATION_ANNOTATION)
+            and record.get("createID") == annotations.get(POD_CREATE_ATTEMPT_ANNOTATION)
+            for record in records
+        )
+    ):
+        raise SafetyError(
+            "PodCreateIdentityConflict", "Pod UID or create operation lacks durable authorization"
+        )
+    return ordinal
+
+
+def _check_pending_pod(
+    pod: dict[str, Any], workload: dict[str, Any], intent: dict[str, Any]
+) -> int:
+    ordinal = _check_existing_pod_identity(pod, workload)
+    annotations = pod.get("metadata", {}).get("annotations", {})
+    if (
+        intent["podName"] != _pod_name(workload["metadata"]["uid"], ordinal)
+        or intent["replicaID"] != f"{workload['spec']['workloadID']}-{ordinal}"
+        or intent["workloadGeneration"] != workload["metadata"]["generation"]
+        or intent["planID"] != annotations.get(POD_CREATE_PLAN_ANNOTATION)
+        or intent["operationID"] != annotations.get(POD_CREATE_OPERATION_ANNOTATION)
+        or intent["createID"] != annotations.get(POD_CREATE_ATTEMPT_ANNOTATION)
+        or str(intent["workloadGeneration"]) != annotations.get(WORKLOAD_GENERATION_ANNOTATION)
+    ):
+        raise SafetyError(
+            "PodCreateIdentityConflict", "observed Pod does not match its durable create intent"
+        )
+    if not isinstance(pod.get("metadata", {}).get("uid"), str):
+        raise SafetyError("PodCreateIdentityConflict", "created Pod UID is missing")
+    return ordinal
+
+
+def _check_existing_pod_identity(pod: dict[str, Any], workload: dict[str, Any]) -> int:
+    """Validate API ownership and logical identity before matching a durable UID record."""
+    metadata, spec = pod.get("metadata"), workload["spec"]
+    if not isinstance(metadata, dict):
+        raise SafetyError("PodIdentityConflict", "an existing Pod requires metadata")
     labels = metadata.get("labels", {})
+    if not isinstance(labels, dict):
+        raise SafetyError("PodIdentityConflict", "an existing Pod requires identity labels")
     logical_id = labels.get(REPLICA_ID_LABEL, "")
     prefix = f"{spec['workloadID']}-"
     if (
@@ -495,12 +563,71 @@ def _check_existing_pod(pod: dict[str, Any], workload: dict[str, Any]) -> int:
             "PodIdentityConflict",
             "an existing Pod name conflicts with its logical replica identity",
         )
-    expected_hash = _placement_fingerprint(spec, spec["podTemplate"])
-    if metadata.get("annotations", {}).get(TEMPLATE_HASH_ANNOTATION) != expected_hash:
+    if not isinstance(metadata.get("uid"), str) or not metadata["uid"]:
+        raise SafetyError("PodIdentityConflict", "an existing Pod UID is required")
+    logical_id = labels[REPLICA_ID_LABEL]
+    retirement = next(
+        (
+            record
+            for record in workload.get("status", {}).get("retiredReplicaSlots", [])
+            if isinstance(record, dict) and record.get("replicaID") == logical_id
+        ),
+        None,
+    )
+    if retirement is not None and retirement.get("podUID") != metadata["uid"]:
+        raise SafetyError(
+            "RetiredReplicaPodObserved", "a Pod appeared in a durably retired logical slot"
+        )
+    annotations = metadata.get("annotations")
+    if (
+        not isinstance(annotations, dict)
+        or not isinstance(annotations.get(WORKLOAD_GENERATION_ANNOTATION), str)
+        or not annotations[WORKLOAD_GENERATION_ANNOTATION].isdecimal()
+        or not all(
+            isinstance(annotations.get(key), str) and annotations[key]
+            for key in (
+                POD_CREATE_PLAN_ANNOTATION,
+                POD_CREATE_OPERATION_ANNOTATION,
+                POD_CREATE_ATTEMPT_ANNOTATION,
+            )
+        )
+    ):
+        raise SafetyError(
+            "PodCreateIdentityConflict", "Pod generation or create operation identity is invalid"
+        )
+    if annotations.get(TEMPLATE_HASH_ANNOTATION) != _placement_fingerprint(
+        spec, spec["podTemplate"]
+    ):
         raise SafetyError(
             "PodTemplateChanged", "existing Pods use a different immutable Pod template"
         )
     return ordinal
+
+
+def _has_create_authorization(pod: dict[str, Any], workload: dict[str, Any]) -> bool:
+    try:
+        _check_existing_pod_identity(pod, workload)
+    except (SafetyError, AttributeError, TypeError):
+        return False
+    metadata = pod["metadata"]
+    annotations = metadata["annotations"]
+    logical_id = metadata["labels"][REPLICA_ID_LABEL]
+    generation = int(annotations[WORKLOAD_GENERATION_ANNOTATION])
+    records = workload.get("status", {}).get("authorizedPodCreates", [])
+    if not isinstance(records, list):
+        return False
+    return any(
+        isinstance(record, dict)
+        and record.get("workloadUID") == workload["metadata"]["uid"]
+        and record.get("podUID") == metadata["uid"]
+        and record.get("podName") == metadata["name"]
+        and record.get("replicaID") == logical_id
+        and record.get("workloadGeneration") == generation
+        and record.get("planID") == annotations[POD_CREATE_PLAN_ANNOTATION]
+        and record.get("operationID") == annotations[POD_CREATE_OPERATION_ANNOTATION]
+        and record.get("createID") == annotations[POD_CREATE_ATTEMPT_ANNOTATION]
+        for record in records
+    )
 
 
 def _allowed_nodes(
@@ -535,12 +662,69 @@ def _allowed_nodes(
     return names, uids
 
 
+def _retired_replica_slots(workload: dict[str, Any]) -> list[dict[str, Any]]:
+    slots = workload.get("status", {}).get("retiredReplicaSlots", [])
+    if not isinstance(slots, list) or any(
+        not isinstance(record, dict)
+        or not all(
+            isinstance(record.get(key), str) and record[key]
+            for key in (
+                "workloadUID",
+                "replicaID",
+                "podUID",
+                "planID",
+                "operationID",
+            )
+        )
+        or type(record.get("workloadGeneration")) is not int
+        for record in slots
+    ):
+        raise SafetyError("InvalidRetirementHistory", "retired replica slot history is invalid")
+    return slots
+
+
+def _authorized_pod_creates(workload: dict[str, Any]) -> list[dict[str, Any]]:
+    records = workload.get("status", {}).get("authorizedPodCreates", [])
+    if not isinstance(records, list) or any(
+        not isinstance(record, dict)
+        or not all(
+            isinstance(record.get(key), str) and record[key]
+            for key in (
+                "workloadUID",
+                "podUID",
+                "podName",
+                "replicaID",
+                "planID",
+                "operationID",
+                "createID",
+            )
+        )
+        or type(record.get("workloadGeneration")) is not int
+        or record.get("workloadGeneration") < 1
+        or record.get("workloadUID") != workload.get("metadata", {}).get("uid")
+        for record in records
+    ):
+        raise SafetyError("InvalidCreateHistory", "authorized Pod create history is invalid")
+    if len({record["podUID"] for record in records}) != len(records):
+        raise SafetyError("InvalidCreateHistory", "authorized Pod UIDs must be unique")
+    return records
+
+
 def _validate_spec(
     workload: dict[str, Any], nodes: list[dict[str, Any]]
 ) -> tuple[list[str], dict[str, str]]:
     spec = workload.get("spec")
     if not isinstance(spec, dict):
         raise SafetyError("InvalidSpec", "spec must be an object")
+    if spec.get("podCreateProtocol") != POD_CREATE_PROTOCOL:
+        raise SafetyError(
+            "LegacyPodCreateUncertain",
+            "legacy workload UID has untracked Pod CREATE history; create a new workload UID",
+        )
+    if workload.get("status", {}).get("podCreateHistoryUncertain") is True:
+        raise SafetyError(
+            "PodCreateHistoryUncertain", "workload has durable Pod CREATE history uncertainty"
+        )
     metadata = workload.get("metadata")
     if (
         not isinstance(metadata, dict)
@@ -563,6 +747,17 @@ def _validate_spec(
         raise SafetyError(
             "InvalidIdentity", "workloadID must be a DNS label of at most 44 characters"
         )
+    retired_slots = _retired_replica_slots(workload)
+    _authorized_pod_creates(workload)
+    retired_ids = [record["replicaID"] for record in retired_slots]
+    if len(retired_ids) != len(set(retired_ids)) or any(
+        record["workloadUID"] != metadata["uid"]
+        or not record["replicaID"].startswith(f"{workload_id}-")
+        or not record["replicaID"][len(workload_id) + 1 :].isdecimal()
+        or record["workloadGeneration"] < 1
+        for record in retired_slots
+    ):
+        raise SafetyError("InvalidRetirementHistory", "retired replica slot identity is invalid")
     for field, minimum, maximum in (("replicas", 0, 1_000), ("availabilityFloor", 0, 1_000)):
         value = spec.get(field)
         if type(value) is not int or not minimum <= value <= maximum:
@@ -683,17 +878,49 @@ def _status(
     message: str,
     old: dict[str, Any],
 ) -> dict[str, Any]:
-    live_pods = [
+    owned_live = [
         pod
         for pod in pods
-        if _is_owned(pod, workload)
+        if pod.get("metadata", {}).get("labels", {}).get(WORKLOAD_UID_LABEL)
+        == workload.get("metadata", {}).get("uid")
         and pod.get("status", {}).get("phase") not in {"Succeeded", "Failed"}
     ]
+    live_pods = [pod for pod in owned_live if _has_create_authorization(pod, workload)]
+    unverified_pods = [pod for pod in owned_live if not _has_create_authorization(pod, workload)]
     replicas = sum(1 for pod in live_pods if not pod.get("metadata", {}).get("deletionTimestamp"))
     ready_replicas = sum(1 for pod in live_pods if _pod_ready(pod))
     desired = workload.get("spec", {}).get("replicas", 0)
     floor = workload.get("spec", {}).get("availabilityFloor", 0)
-    counts_are_trustworthy = reason in {"Reconciled", "ScaleDownRequiresStagedExecution"}
+    history_uncertain = (
+        old.get("podCreateHistoryUncertain") is True
+        or reason == "LegacyPodCreateUncertain"
+        or reason == "PodCreateHistoryUncertain"
+        or reason
+        in {
+            "PodCreateIdentityConflict",
+            "PodIdentityConflict",
+            "PodOutsideAllowedNodes",
+            "NodeIdentityChanged",
+            "PodTemplateChanged",
+            "RetiredReplicaPodObserved",
+        }
+        or bool(unverified_pods)
+    )
+    retired_ids = {
+        record.get("replicaID")
+        for record in old.get("retiredReplicaSlots", [])
+        if isinstance(record, dict)
+    }
+    retired_in_desired_range = any(
+        f"{workload.get('spec', {}).get('workloadID')}-{ordinal}" in retired_ids
+        for ordinal in range(desired)
+    )
+    counts_are_trustworthy = (
+        reason in {"Reconciled", "ScaleDownRequiresStagedExecution"}
+        and not unverified_pods
+        and not history_uncertain
+        and not retired_in_desired_range
+    )
     ready = counts_are_trustworthy and ready_replicas >= desired
     available = counts_are_trustworthy and ready_replicas >= floor
     old_conditions = old.get("conditions", [])
@@ -742,7 +969,8 @@ def _status(
         "replicas": replicas,
         "readyReplicas": ready_replicas,
         "availableReplicas": ready_replicas,
-        "surgeReplicas": max(0, len(live_pods) - desired),
+        "surgeReplicas": max(0, len(owned_live) - desired),
+        "unverifiedPodCreates": len(unverified_pods),
         "labelSelector": _selector(metadata.get("uid", "")),
         "activeOperationRefs": old.get("activeOperationRefs", []),
         "conditions": conditions,
@@ -751,6 +979,12 @@ def _status(
         status["execution"] = old["execution"]
     if isinstance(old.get("pendingPodCreate"), dict):
         status["pendingPodCreate"] = old["pendingPodCreate"]
+    if history_uncertain:
+        status["podCreateHistoryUncertain"] = True
+    if isinstance(old.get("authorizedPodCreates"), list):
+        status["authorizedPodCreates"] = old["authorizedPodCreates"]
+    if isinstance(old.get("retiredReplicaSlots"), list):
+        status["retiredReplicaSlots"] = old["retiredReplicaSlots"]
     return status
 
 
@@ -834,12 +1068,27 @@ def _write_status(
     pods: list[dict[str, Any]],
     reason: str,
     message: str,
+    execution_phase: str | None = None,
 ) -> None:
     metadata = workload["metadata"]
     old = workload.get("status", {})
     desired = _status(workload, pods, reason, message, old)
+    request = workload.get("spec", {}).get("executionRequest")
+    if execution_phase is not None and isinstance(request, dict):
+        desired["execution"] = {
+            **{
+                key: request[key]
+                for key in ("planID", "operationID", "generation", "targetReplicas")
+            },
+            "phase": execution_phase,
+        }
     if desired != old:
-        api.patch_status(metadata["name"], metadata["resourceVersion"], desired)
+        result = api.patch_status(metadata["name"], metadata["resourceVersion"], desired)
+        result_metadata = result.get("metadata", {}) if isinstance(result, dict) else {}
+        result_status = result.get("status") if isinstance(result, dict) else None
+        if isinstance(result_metadata.get("resourceVersion"), str):
+            metadata["resourceVersion"] = result_metadata["resourceVersion"]
+        workload["status"] = result_status if isinstance(result_status, dict) else desired
 
 
 def _write_execution_phase(api: Any, workload: dict[str, Any], phase: str) -> None:
@@ -868,6 +1117,9 @@ def _write_pending_pod_create(api: Any, workload: dict[str, Any], intent: dict[s
     old_status = workload.get("status", {})
     if old_status.get("pendingPodCreate") is not None:
         raise SafetyError("PodCreateOutcomeUnknown", "another Pod create outcome is unresolved")
+    # shortcut: cap lifetime authorized history at 1,000; use a new workload UID beyond this cap.
+    if len(_authorized_pod_creates(workload)) >= 1_000:
+        raise SafetyError("PodCreateHistoryFull", "authorized Pod create history is at capacity")
     status = {**old_status, "pendingPodCreate": intent}
     result = api.patch_status(
         workload["metadata"]["name"], workload["metadata"]["resourceVersion"], status
@@ -911,6 +1163,116 @@ def _clear_pending_pod_create(api: Any, workload: dict[str, Any]) -> bool:
     status.pop("pendingPodCreate")
     workload["status"] = status
     return True
+
+
+def _authorize_pending_pod_create(
+    api: Any, workload: dict[str, Any], intent: dict[str, Any], pod: dict[str, Any]
+) -> None:
+    _check_pending_pod(pod, workload, intent)
+    annotations = pod["metadata"]["annotations"]
+    record = {
+        "workloadUID": intent["workloadUID"],
+        "podUID": pod["metadata"]["uid"],
+        "podName": intent["podName"],
+        "replicaID": intent["replicaID"],
+        "workloadGeneration": intent["workloadGeneration"],
+        "planID": annotations[POD_CREATE_PLAN_ANNOTATION],
+        "operationID": annotations[POD_CREATE_OPERATION_ANNOTATION],
+        "createID": annotations[POD_CREATE_ATTEMPT_ANNOTATION],
+    }
+    old_status = workload.get("status", {})
+    authorized = list(_authorized_pod_creates(workload))
+    if record not in authorized:
+        if len(authorized) >= 1_000:
+            raise SafetyError(
+                "PodCreateHistoryFull", "authorized Pod create history is at capacity"
+            )
+        if any(
+            item.get("podUID") == record["podUID"] for item in authorized if isinstance(item, dict)
+        ):
+            raise SafetyError(
+                "PodCreateIdentityConflict", "Pod UID is bound to another create intent"
+            )
+        authorized.append(record)
+    status = {**old_status, "authorizedPodCreates": authorized, "pendingPodCreate": None}
+    result = api.patch_status(
+        workload["metadata"]["name"], workload["metadata"]["resourceVersion"], status
+    )
+    metadata = result.get("metadata", {}) if isinstance(result, dict) else {}
+    returned_status = result.get("status") if isinstance(result, dict) else None
+    if (
+        not isinstance(metadata.get("resourceVersion"), str)
+        or not isinstance(returned_status, dict)
+        or returned_status.get("pendingPodCreate") is not None
+        or record not in returned_status.get("authorizedPodCreates", [])
+    ):
+        raise SafetyError(
+            "PodCreateOutcomeUnknown", "Kubernetes did not durably authorize the observed Pod UID"
+        )
+    workload["metadata"]["resourceVersion"] = metadata["resourceVersion"]
+    workload["status"] = dict(returned_status)
+    workload["status"].pop("pendingPodCreate", None)
+
+
+def _write_retired_slot_tombstone(
+    api: Any,
+    workload: dict[str, Any],
+    pod: dict[str, Any],
+    plan_id: str,
+    operation_id: str,
+    nodes: list[dict[str, Any]],
+) -> None:
+    # The durable tombstone must win before any source Pod deletion is attempted.
+    if not all(isinstance(value, str) and value for value in (plan_id, operation_id)):
+        raise SafetyError("InvalidRetirementIntent", "retirement operation identity is required")
+    _, approved_uids = _validate_spec(workload, nodes)
+    old_status = workload.get("status", {})
+    if old_status.get("pendingPodCreate") is not None or old_status.get(
+        "podCreateHistoryUncertain"
+    ):
+        raise SafetyError(
+            "PodCreateHistoryUncertain", "unresolved Pod create history blocks retirement"
+        )
+    metadata = pod["metadata"]
+    annotations = metadata["annotations"]
+    record = {
+        "workloadUID": workload["metadata"]["uid"],
+        "replicaID": metadata["labels"][REPLICA_ID_LABEL],
+        "podUID": metadata["uid"],
+        "workloadGeneration": int(annotations[WORKLOAD_GENERATION_ANNOTATION]),
+        "planID": plan_id,
+        "operationID": operation_id,
+    }
+    retired = list(_retired_replica_slots(workload))
+    existing = next((item for item in retired if item["replicaID"] == record["replicaID"]), None)
+    if existing is not None and existing != record:
+        raise SafetyError(
+            "RetirementIdentityConflict", "logical slot already has another tombstone"
+        )
+    if existing is not None:
+        return
+    _check_existing_pod(pod, workload)
+    _validate_scheduled_pod(pod, approved_uids, nodes)
+    current = api.get_pod(pod["metadata"]["name"])
+    if current is None or current.get("metadata", {}).get("uid") != pod["metadata"]["uid"]:
+        raise SafetyError("RetirementIdentityConflict", "source Pod UID changed before tombstoning")
+    retired.append(record)
+    status = {**old_status, "retiredReplicaSlots": retired}
+    result = api.patch_status(
+        workload["metadata"]["name"], workload["metadata"]["resourceVersion"], status
+    )
+    result_metadata = result.get("metadata", {}) if isinstance(result, dict) else {}
+    returned_status = result.get("status") if isinstance(result, dict) else None
+    if (
+        not isinstance(result_metadata.get("resourceVersion"), str)
+        or not isinstance(returned_status, dict)
+        or record not in returned_status.get("retiredReplicaSlots", [])
+    ):
+        raise SafetyError(
+            "RetirementIntentUnknown", "Kubernetes did not confirm the slot tombstone"
+        )
+    workload["metadata"]["resourceVersion"] = result_metadata["resourceVersion"]
+    workload["status"] = dict(returned_status)
 
 
 def _ensure_pdb(api: Any, workload: dict[str, Any]) -> None:
@@ -980,7 +1342,14 @@ def reconcile_workload(api: Any, workload: dict[str, Any], nodes: list[dict[str,
                 not isinstance(pending, dict)
                 or not all(
                     isinstance(pending.get(key), str) and pending[key]
-                    for key in ("workloadUID", "podName", "replicaID")
+                    for key in (
+                        "workloadUID",
+                        "podName",
+                        "replicaID",
+                        "planID",
+                        "operationID",
+                        "createID",
+                    )
                 )
                 or type(pending.get("workloadGeneration")) is not int
             ):
@@ -991,29 +1360,14 @@ def reconcile_workload(api: Any, workload: dict[str, Any], nodes: list[dict[str,
                 raise SafetyError(
                     "PodCreateIdentityConflict", "pending Pod create workload changed"
                 )
-            if (pending.get("planID") is None) != (pending.get("operationID") is None):
-                raise SafetyError(
-                    "PodCreateIdentityConflict", "pending Pod create operation is invalid"
-                )
             pending_pod = api.get_pod(pending["podName"])
             if pending_pod is None:
                 return
-            ordinal = _check_existing_pod(pending_pod, workload)
-            annotations = pending_pod.get("metadata", {}).get("annotations", {})
-            if (
-                pending["podName"] != _pod_name(uid, ordinal)
-                or pending["replicaID"] != f"{workload['spec']['workloadID']}-{ordinal}"
-                or annotations.get(WORKLOAD_GENERATION_ANNOTATION)
-                != str(pending["workloadGeneration"])
-            ):
-                raise SafetyError(
-                    "PodCreateIdentityConflict", "observed Pod does not match its create intent"
-                )
+            _check_pending_pod(pending_pod, workload, pending)
             _validate_scheduled_pod(pending_pod, approved_uids, nodes)
             if all(pod.get("metadata", {}).get("name") != pending["podName"] for pod in pods):
                 pods.append(pending_pod)
-            if not _clear_pending_pod_create(api, workload):
-                return
+            _authorize_pending_pod_create(api, workload, pending, pending_pod)
 
         _validate_execution_request(workload)
         _ensure_pdb(api, workload)
@@ -1024,29 +1378,7 @@ def reconcile_workload(api: Any, workload: dict[str, Any], nodes: list[dict[str,
                 raise SafetyError(
                     "PodIdentityConflict", "duplicate logical replica identity exists"
                 )
-            scheduled_name = pod.get("spec", {}).get("nodeName")
-            if scheduled_name and (scheduled_name not in approved_uids):
-                raise SafetyError(
-                    "PodOutsideAllowedNodes",
-                    "existing Pod is scheduled outside the allowed Node set",
-                )
-            if scheduled_name:
-                current_node = next(
-                    (
-                        node
-                        for node in nodes
-                        if node.get("metadata", {}).get("name") == scheduled_name
-                    ),
-                    None,
-                )
-                if (
-                    current_node is None
-                    or current_node.get("metadata", {}).get("uid") != approved_uids[scheduled_name]
-                ):
-                    raise SafetyError(
-                        "NodeIdentityChanged",
-                        "scheduled Pod Node UID differs from the approved identity",
-                    )
+            _validate_scheduled_pod(pod, approved_uids, nodes)
             pods_by_ordinal[ordinal] = pod
             if pod.get("status", {}).get("phase") in {"Succeeded", "Failed"} and not pod.get(
                 "metadata", {}
@@ -1059,6 +1391,15 @@ def reconcile_workload(api: Any, workload: dict[str, Any], nodes: list[dict[str,
         _write_execution_phase(api, workload, "RECONCILING")
 
         desired = workload["spec"]["replicas"]
+        retired_ids = {record["replicaID"] for record in _retired_replica_slots(workload)}
+        if any(
+            f"{workload['spec']['workloadID']}-{ordinal}" in retired_ids
+            for ordinal in range(desired)
+        ):
+            raise SafetyError(
+                "RetiredReplicaRequiresNewOperation",
+                "ordinary reconciliation cannot complete while a desired slot is retired",
+            )
         live_pods = [
             pod for pod in pods if pod.get("status", {}).get("phase") not in {"Succeeded", "Failed"}
         ]
@@ -1096,6 +1437,14 @@ def reconcile_workload(api: Any, workload: dict[str, Any], nodes: list[dict[str,
         for ordinal in range(desired):
             if ordinal in pods_by_ordinal:
                 continue
+            replica_id = f"{workload['spec']['workloadID']}-{ordinal}"
+            if any(
+                record["replicaID"] == replica_id for record in _retired_replica_slots(workload)
+            ):
+                raise SafetyError(
+                    "RetiredReplicaRequiresNewOperation",
+                    "ordinary reconciliation cannot restore a durably retired logical slot",
+                )
             if live_count >= maximum_live:
                 break
             name = _pod_name(uid, ordinal)
@@ -1110,7 +1459,7 @@ def reconcile_workload(api: Any, workload: dict[str, Any], nodes: list[dict[str,
             intent = _pod_create_intent(workload, ordinal)
             _write_pending_pod_create(api, workload, intent)
             try:
-                created = api.create_pod(_pod_object(workload, ordinal))
+                created = api.create_pod(_pod_object(workload, ordinal, intent))
             except ApiError as error:
                 if error.status == 409:
                     existing = api.get_pod(name)
@@ -1119,17 +1468,9 @@ def reconcile_workload(api: Any, workload: dict[str, Any], nodes: list[dict[str,
                             "PodCreateOutcomeUnknown",
                             "Pod create conflicted but the deterministic name is not observable",
                         ) from error
-                    _check_existing_pod(existing, workload)
-                    if existing.get("metadata", {}).get("annotations", {}).get(
-                        WORKLOAD_GENERATION_ANNOTATION
-                    ) != str(intent["workloadGeneration"]):
-                        raise SafetyError(
-                            "PodCreateIdentityConflict",
-                            "existing Pod does not match the pending create generation",
-                        ) from error
+                    _check_pending_pod(existing, workload, intent)
                     _validate_scheduled_pod(existing, approved_uids, nodes)
-                    if not _clear_pending_pod_create(api, workload):
-                        return
+                    _authorize_pending_pod_create(api, workload, intent, existing)
                     pods_by_ordinal[ordinal] = existing
                     pods.append(existing)
                     live_count += 1
@@ -1142,8 +1483,8 @@ def reconcile_workload(api: Any, workload: dict[str, Any], nodes: list[dict[str,
                         f"Kubernetes API rejected Pod creation (HTTP {error.status})",
                     ) from error
                 raise
-            if not _clear_pending_pod_create(api, workload):
-                return
+            _check_pending_pod(created, workload, intent)
+            _authorize_pending_pod_create(api, workload, intent, created)
             pods_by_ordinal[ordinal] = created
             pods.append(created)
             live_count += 1
@@ -1151,14 +1492,45 @@ def reconcile_workload(api: Any, workload: dict[str, Any], nodes: list[dict[str,
             _write_execution_phase(api, workload, "APPLIED")
         _write_status(api, workload, pods, "Reconciled", "workload reconciled from API state")
     except SafetyError as error:
-        _write_execution_phase(api, workload, "BLOCKED")
         current_pods = api.list_pods(uid) if isinstance(uid, str) and uid else []
-        _write_status(api, workload, current_pods, error.reason, str(error))
+        _write_status(
+            api,
+            workload,
+            current_pods,
+            error.reason,
+            str(error),
+            execution_phase="BLOCKED",
+        )
 
 
 def _validate_scheduled_pod(
     pod: dict[str, Any], approved_uids: dict[str, str], nodes: list[dict[str, Any]]
 ) -> None:
+    terms = (
+        pod.get("spec", {})
+        .get("affinity", {})
+        .get("nodeAffinity", {})
+        .get("requiredDuringSchedulingIgnoredDuringExecution", {})
+        .get("nodeSelectorTerms")
+    )
+    actual_allowed: set[str] = set()
+    if isinstance(terms, list):
+        for term in terms:
+            fields = term.get("matchFields", []) if isinstance(term, dict) else []
+            if (
+                not isinstance(fields, list)
+                or len(fields) != 1
+                or not isinstance(fields[0], dict)
+                or fields[0].get("key") != "metadata.name"
+                or fields[0].get("operator") != "In"
+                or not isinstance(fields[0].get("values"), list)
+                or len(fields[0]["values"]) != 1
+                or not isinstance(fields[0]["values"][0], str)
+            ):
+                raise SafetyError("PodOutsideAllowedNodes", "Pod allowed placement is invalid")
+            actual_allowed.add(fields[0]["values"][0])
+    if actual_allowed != set(approved_uids):
+        raise SafetyError("PodOutsideAllowedNodes", "Pod allowed placement differs from workload")
     scheduled_name = pod.get("spec", {}).get("nodeName")
     if not scheduled_name:
         return

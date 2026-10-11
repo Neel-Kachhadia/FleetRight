@@ -44,6 +44,12 @@ spec:
           x-kubernetes-validations:
             - rule: "!has(oldSelf.status) || !has(oldSelf.status.pendingPodCreate) || self.spec == oldSelf.spec"
               message: spec cannot change while a Pod create outcome is unresolved
+            - rule: "!has(oldSelf.status) || !has(oldSelf.status.authorizedPodCreates) || (has(self.status) && has(self.status.authorizedPodCreates) && self.status.authorizedPodCreates + oldSelf.status.authorizedPodCreates == self.status.authorizedPodCreates)"
+              message: authorized Pod create records cannot be removed or changed
+            - rule: "!has(oldSelf.status) || !has(oldSelf.status.retiredReplicaSlots) || (has(self.status) && has(self.status.retiredReplicaSlots) && self.status.retiredReplicaSlots + oldSelf.status.retiredReplicaSlots == self.status.retiredReplicaSlots)"
+              message: retired logical slots cannot be removed or changed
+            - rule: "!has(oldSelf.status) || !has(oldSelf.status.podCreateHistoryUncertain) || !oldSelf.status.podCreateHistoryUncertain || (has(self.status) && has(self.status.podCreateHistoryUncertain) && self.status.podCreateHistoryUncertain)"
+              message: Pod create history uncertainty cannot be cleared
           properties:
             spec:
               type: object
@@ -70,6 +76,9 @@ spec:
                   message: surgeBudget is immutable for monotonic execution
                 - rule: self.replicas >= oldSelf.replicas
                   message: replicas cannot decrease through this execution protocol
+                - rule: "oldSelf.hasValue() ? (!has(oldSelf.value().podCreateProtocol) ? !has(self.podCreateProtocol) : self.podCreateProtocol == oldSelf.value().podCreateProtocol) : self.podCreateProtocol == 'reserved-create-v1'"
+                  optionalOldSelf: true
+                  message: Pod create protocol is immutable and legacy workloads cannot be enrolled
                 - rule: "!has(self.executionRequest) || self.executionProtocol == 'monotonic-scale-up-v1'"
                   message: execution requests require a workload created for monotonic scale-up
                 - rule: "!has(oldSelf.executionProtocol) || self.executionProtocol == oldSelf.executionProtocol"
@@ -111,6 +120,10 @@ spec:
                   type: string
                   enum: [monotonic-scale-up-v1]
                   description: Must be set at workload creation; legacy objects cannot be promoted in place.
+                podCreateProtocol:
+                  type: string
+                  enum: [reserved-create-v1]
+                  description: Must be set when the workload UID is created; legacy owners remain uncertain.
                 workloadID:
                   type: string
                   minLength: 1
@@ -423,6 +436,12 @@ spec:
                   type: integer
                   format: int32
                   minimum: 0
+                unverifiedPodCreates:
+                  type: integer
+                  format: int32
+                  minimum: 0
+                podCreateHistoryUncertain:
+                  type: boolean
                 labelSelector:
                   type: string
                 activeOperationRefs:
@@ -443,7 +462,7 @@ spec:
                         minimum: 0
                 pendingPodCreate:
                   type: object
-                  required: [workloadUID, workloadGeneration, podName, replicaID]
+                  required: [workloadUID, workloadGeneration, podName, replicaID, planID, operationID, createID]
                   properties:
                     workloadUID:
                       type: string
@@ -464,6 +483,73 @@ spec:
                     operationID:
                       type: string
                       minLength: 1
+                    createID:
+                      type: string
+                      minLength: 1
+                      maxLength: 64
+                authorizedPodCreates:
+                  type: array
+                  x-kubernetes-list-type: map
+                  x-kubernetes-list-map-keys: [podUID]
+                  maxItems: 1000
+                  items:
+                    type: object
+                    required: [workloadUID, podUID, podName, replicaID, workloadGeneration, planID, operationID, createID]
+                    properties:
+                      workloadUID:
+                        type: string
+                        minLength: 1
+                      podUID:
+                        type: string
+                        minLength: 1
+                      podName:
+                        type: string
+                        minLength: 1
+                      replicaID:
+                        type: string
+                        minLength: 1
+                      workloadGeneration:
+                        type: integer
+                        format: int64
+                        minimum: 1
+                      planID:
+                        type: string
+                        minLength: 1
+                      operationID:
+                        type: string
+                        minLength: 1
+                      createID:
+                        type: string
+                        minLength: 1
+                        maxLength: 64
+                retiredReplicaSlots:
+                  type: array
+                  x-kubernetes-list-type: map
+                  x-kubernetes-list-map-keys: [replicaID]
+                  maxItems: 1000
+                  items:
+                    type: object
+                    required: [workloadUID, replicaID, podUID, workloadGeneration, planID, operationID]
+                    properties:
+                      workloadUID:
+                        type: string
+                        minLength: 1
+                      replicaID:
+                        type: string
+                        minLength: 1
+                      podUID:
+                        type: string
+                        minLength: 1
+                      workloadGeneration:
+                        type: integer
+                        format: int64
+                        minimum: 1
+                      planID:
+                        type: string
+                        minLength: 1
+                      operationID:
+                        type: string
+                        minLength: 1
                 execution:
                   type: object
                   required: [planID, operationID, generation, targetReplicas, phase]

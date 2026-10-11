@@ -109,6 +109,30 @@ _WORKLOAD_EXECUTION_RULES = {
 _WORKLOAD_PENDING_CREATE_RULE = (
     "!has(oldSelf.status) || !has(oldSelf.status.pendingPodCreate) || self.spec == oldSelf.spec"
 )
+_WORKLOAD_POD_CREATE_PROTOCOL_RULE = (
+    "oldSelf.hasValue() ? (!has(oldSelf.value().podCreateProtocol) ? "
+    "!has(self.podCreateProtocol) : "
+    "self.podCreateProtocol == oldSelf.value().podCreateProtocol) : "
+    "self.podCreateProtocol == 'reserved-create-v1'"
+)
+_WORKLOAD_AUTHORIZED_POD_CREATES_RULE = (
+    "!has(oldSelf.status) || !has(oldSelf.status.authorizedPodCreates) || "
+    "(has(self.status) && has(self.status.authorizedPodCreates) && "
+    "self.status.authorizedPodCreates + oldSelf.status.authorizedPodCreates == "
+    "self.status.authorizedPodCreates)"
+)
+_WORKLOAD_RETIRED_SLOTS_RULE = (
+    "!has(oldSelf.status) || !has(oldSelf.status.retiredReplicaSlots) || "
+    "(has(self.status) && has(self.status.retiredReplicaSlots) && "
+    "self.status.retiredReplicaSlots + oldSelf.status.retiredReplicaSlots == "
+    "self.status.retiredReplicaSlots)"
+)
+_WORKLOAD_CREATE_HISTORY_UNCERTAIN_RULE = (
+    "!has(oldSelf.status) || !has(oldSelf.status.podCreateHistoryUncertain) || "
+    "!oldSelf.status.podCreateHistoryUncertain || "
+    "(has(self.status) && has(self.status.podCreateHistoryUncertain) && "
+    "self.status.podCreateHistoryUncertain)"
+)
 
 # ponytail: ceilings cover three checked-in workloads; add one with each new target.
 EXECUTION_HEALTH_CEILINGS = {
@@ -513,6 +537,16 @@ class FleetRightWorkloadTarget(KubernetesTarget):
             if isinstance(status_properties, dict)
             else {}
         )
+        authorized_pods = (
+            status_properties.get("authorizedPodCreates", {})
+            if isinstance(status_properties, dict)
+            else {}
+        )
+        retired_slots = (
+            status_properties.get("retiredReplicaSlots", {})
+            if isinstance(status_properties, dict)
+            else {}
+        )
         if not isinstance(rules, list):
             rules = []
         if not isinstance(root_rules, list):
@@ -526,11 +560,38 @@ class FleetRightWorkloadTarget(KubernetesTarget):
             required_request_fields = []
         if not isinstance(required_pending_fields, list):
             required_pending_fields = []
+        authorized_pod_properties = (
+            authorized_pods.get("items", {}) if isinstance(authorized_pods, dict) else {}
+        )
+        retired_slot_properties = (
+            retired_slots.get("items", {}) if isinstance(retired_slots, dict) else {}
+        )
+        authorized_pod_required = (
+            authorized_pod_properties.get("required", [])
+            if isinstance(authorized_pod_properties, dict)
+            else []
+        )
+        retired_slot_required = (
+            retired_slot_properties.get("required", [])
+            if isinstance(retired_slot_properties, dict)
+            else []
+        )
         installed_rules = {
             rule.get("rule")
             for rule in rules
             if isinstance(rule, dict) and isinstance(rule.get("rule"), str)
         }
+        protocol_rule = next(
+            (
+                rule
+                for rule in rules
+                if isinstance(rule, dict) and rule.get("rule") == _WORKLOAD_POD_CREATE_PROTOCOL_RULE
+            ),
+            {},
+        )
+        pod_create_protocol = (
+            properties.get("podCreateProtocol", {}) if isinstance(properties, dict) else {}
+        )
         installed_root_rules = {
             rule.get("rule")
             for rule in root_rules
@@ -538,7 +599,15 @@ class FleetRightWorkloadTarget(KubernetesTarget):
         }
         if not (
             _WORKLOAD_EXECUTION_RULES <= installed_rules
-            and _WORKLOAD_PENDING_CREATE_RULE in installed_root_rules
+            and _WORKLOAD_POD_CREATE_PROTOCOL_RULE in installed_rules
+            and protocol_rule.get("optionalOldSelf") is True
+            and {
+                _WORKLOAD_PENDING_CREATE_RULE,
+                _WORKLOAD_AUTHORIZED_POD_CREATES_RULE,
+                _WORKLOAD_RETIRED_SLOTS_RULE,
+                _WORKLOAD_CREATE_HISTORY_UNCERTAIN_RULE,
+            }
+            <= installed_root_rules
             and isinstance(fence, dict)
             and set(required_fence_fields)
             >= {
@@ -556,7 +625,38 @@ class FleetRightWorkloadTarget(KubernetesTarget):
             and protocol.get("enum") == ["monotonic-scale-up-v1"]
             and isinstance(pending, dict)
             and set(required_pending_fields)
-            >= {"workloadUID", "workloadGeneration", "podName", "replicaID"}
+            >= {
+                "workloadUID",
+                "workloadGeneration",
+                "podName",
+                "replicaID",
+                "planID",
+                "operationID",
+                "createID",
+            }
+            and isinstance(pod_create_protocol, dict)
+            and pod_create_protocol.get("enum") == ["reserved-create-v1"]
+            and isinstance(authorized_pods, dict)
+            and authorized_pods.get("x-kubernetes-list-type") == "map"
+            and authorized_pods.get("x-kubernetes-list-map-keys") == ["podUID"]
+            and authorized_pods.get("maxItems") == 1_000
+            and set(authorized_pod_required)
+            >= {
+                "workloadUID",
+                "podUID",
+                "podName",
+                "replicaID",
+                "workloadGeneration",
+                "planID",
+                "operationID",
+                "createID",
+            }
+            and isinstance(retired_slots, dict)
+            and retired_slots.get("x-kubernetes-list-type") == "map"
+            and retired_slots.get("x-kubernetes-list-map-keys") == ["replicaID"]
+            and retired_slots.get("maxItems") == 1_000
+            and set(retired_slot_required)
+            >= {"workloadUID", "replicaID", "podUID", "workloadGeneration", "planID", "operationID"}
         ):
             raise TargetPreconditionFailed("FleetRightWorkload execution CRD is not installed")
 
@@ -583,6 +683,11 @@ class FleetRightWorkloadTarget(KubernetesTarget):
         observed_replicas = status.get("replicas", 0)
         conditions = status.get("conditions", [])
         generation = metadata.get("generation")
+        history_uncertain = status.get("podCreateHistoryUncertain", False)
+        unverified_pod_creates = status.get("unverifiedPodCreates", 0)
+        authorized_pod_creates = status.get("authorizedPodCreates", [])
+        retired_slots = status.get("retiredReplicaSlots", [])
+        pending_create = status.get("pendingPodCreate")
         if (
             spec.get("workloadID") != name
             or not isinstance(metadata.get("uid"), str)
@@ -598,9 +703,71 @@ class FleetRightWorkloadTarget(KubernetesTarget):
             or (request is not None and not isinstance(request, dict))
             or (fence is not None and not isinstance(fence, dict))
             or (execution is not None and not isinstance(execution, dict))
+            or type(history_uncertain) is not bool
+            or type(unverified_pod_creates) is not int
+            or unverified_pod_creates < 0
+            or not isinstance(authorized_pod_creates, list)
+            or any(
+                not isinstance(record, dict)
+                or not all(
+                    isinstance(record.get(key), str) and record[key]
+                    for key in (
+                        "workloadUID",
+                        "podUID",
+                        "podName",
+                        "replicaID",
+                        "planID",
+                        "operationID",
+                        "createID",
+                    )
+                )
+                or type(record.get("workloadGeneration")) is not int
+                or record.get("workloadGeneration") < 1
+                or record.get("workloadUID") != metadata.get("uid")
+                for record in authorized_pod_creates
+            )
+            or len(
+                {record["podUID"] for record in authorized_pod_creates if isinstance(record, dict)}
+            )
+            != len(authorized_pod_creates)
+            or not isinstance(retired_slots, list)
+            or any(
+                not isinstance(record, dict)
+                or not all(
+                    isinstance(record.get(key), str) and record[key]
+                    for key in (
+                        "workloadUID",
+                        "replicaID",
+                        "podUID",
+                        "planID",
+                        "operationID",
+                    )
+                )
+                or type(record.get("workloadGeneration")) is not int
+                or record.get("workloadGeneration") < 1
+                or record.get("workloadUID") != metadata.get("uid")
+                for record in retired_slots
+            )
+            or len({record["replicaID"] for record in retired_slots if isinstance(record, dict)})
+            != len(retired_slots)
             or (
-                status.get("pendingPodCreate") is not None
-                and not isinstance(status.get("pendingPodCreate"), dict)
+                pending_create is not None
+                and (
+                    not isinstance(pending_create, dict)
+                    or not all(
+                        isinstance(pending_create.get(key), str) and pending_create[key]
+                        for key in (
+                            "workloadUID",
+                            "podName",
+                            "replicaID",
+                            "planID",
+                            "operationID",
+                            "createID",
+                        )
+                    )
+                    or type(pending_create.get("workloadGeneration")) is not int
+                    or pending_create.get("workloadUID") != metadata.get("uid")
+                )
             )
         ):
             raise TargetError("FleetRightWorkload identity or status is invalid")
@@ -610,6 +777,8 @@ class FleetRightWorkloadTarget(KubernetesTarget):
             raise TargetPreconditionFailed(
                 "existing FleetRightWorkload was not created for monotonic scale-up"
             )
+        if spec.get("podCreateProtocol") != "reserved-create-v1":
+            raise TargetPreconditionFailed("FleetRightWorkload Pod CREATE history is uncertain")
         token = request.get("generation", 0) if isinstance(request, dict) else 0
         if type(token) is not int or token < 0:
             raise TargetError("FleetRightWorkload execution generation is invalid")
@@ -674,7 +843,11 @@ class FleetRightWorkloadTarget(KubernetesTarget):
             "execution_request": request,
             "execution_fence": fence,
             "execution": execution,
-            "pending_pod_create": status.get("pendingPodCreate"),
+            "pending_pod_create": pending_create,
+            "pod_create_history_uncertain": history_uncertain,
+            "unverified_pod_creates": unverified_pod_creates,
+            "authorized_pod_creates": authorized_pod_creates,
+            "retired_replica_slots": retired_slots,
         }
 
     def fence_scale(
@@ -696,6 +869,10 @@ class FleetRightWorkloadTarget(KubernetesTarget):
         ):
             raise TargetPreconditionFailed("invalid workload execution fence")
         current = self.observe_scale(workload_id)
+        if current["pod_create_history_uncertain"] or current["unverified_pod_creates"]:
+            raise ActionBlocked("POD_CREATE_HISTORY_UNCERTAIN")
+        if current["retired_replica_slots"]:
+            raise ActionBlocked("RETIRED_SLOT_HISTORY_PRESENT")
         if current["pending_pod_create"] is not None:
             raise ActionBlocked("POD_CREATE_OUTCOME_UNKNOWN")
         if current["uid"] != expected.get("uid"):
@@ -837,6 +1014,10 @@ class FleetRightWorkloadTarget(KubernetesTarget):
         ):
             raise TargetPreconditionFailed("invalid durable workload authorization")
         current = self.observe_scale(workload_id)
+        if current["pod_create_history_uncertain"] or current["unverified_pod_creates"]:
+            raise ActionBlocked("POD_CREATE_HISTORY_UNCERTAIN")
+        if current["retired_replica_slots"]:
+            raise ActionBlocked("RETIRED_SLOT_HISTORY_PRESENT")
         if current["pending_pod_create"] is not None:
             raise ActionBlocked("POD_CREATE_OUTCOME_UNKNOWN")
         request = current["execution_request"]
