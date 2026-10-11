@@ -82,6 +82,28 @@ and database objects were not modified. Continue work before the hard deadline;
 keep DRAIN_NODE, DEACTIVATE_NODE, scale-down and Kubernetes compensation
 disabled unless their required evidence passes.
 
+### 15:30 UTC follow-up — new workload admission and live-plan constraint
+
+`FLEETRIGHT_KUBERNETES_WORKLOADS` now enrolls additional DNS-label workload IDs
+for Kubernetes execution; the default remains `cpu-api`, duplicate/invalid
+names are rejected, and new IDs use a conservative 120 ms / 1,000 ppm health
+ceiling. Unit and PostgreSQL API tests cover the allowlist and bounded policy.
+
+The API-to-Kubernetes live preparation test now requires five Ready Nodes and
+reports an explicit skip when the lab is smaller. On the current three-Node
+lab, the attempted plan was rejected before execution: the independent V2
+planner reported `fewer than two active healthy destination nodes`. The
+test-created unique FleetRightWorkload was removed during cleanup; the legacy
+`cpu-api` object was untouched. This live API/journal/controller gate remains
+**BLOCKED**, and the skip is not qualification evidence. A five-Node run is
+still needed to bind the new-workload allowlist to an observed replacement UID
+through the production path.
+
+After this follow-up, changed-file Ruff check/format, Python compilation, and
+`git diff --check` passed. The explicit live test result was `1 skipped` on
+this lab. Existing direct-target live replacement/PDB evidence remains as
+recorded above; this does not establish API-to-Kubernetes completion.
+
 ## 2026-10-11 Prompt 2B — journaled source-retirement preparation gate
 
 **Session start:** 10:35:07 UTC. **Starting SHA:**

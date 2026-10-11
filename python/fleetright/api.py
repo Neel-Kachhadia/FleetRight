@@ -1279,7 +1279,20 @@ def _public_plan(row: dict[str, object]) -> dict[str, object]:
 
 def _supported_execution_workloads(target: str | None) -> set[str]:
     if target == "kubernetes-workload":
-        return {"cpu-api"}
+        configured = os.getenv("FLEETRIGHT_KUBERNETES_WORKLOADS")
+        if configured is None:
+            return {"cpu-api"}
+        names = [name.strip() for name in configured.split(",") if name.strip()]
+        if (
+            len(names) > 64
+            or len(set(names)) != len(names)
+            or any(
+                len(name) > 63 or not re.fullmatch(r"[a-z0-9](?:[-a-z0-9]*[a-z0-9])?", name)
+                for name in names
+            )
+        ):
+            raise RuntimeError("FLEETRIGHT_KUBERNETES_WORKLOADS must be unique DNS labels")
+        return set(names)
     return EXECUTION_WORKLOADS if target in {None, "", "docker"} else set()
 
 

@@ -38,6 +38,7 @@ from fleetright.execution import (
 )
 from fleetright.reconciler import ExecutionController
 from fleetright.scenario import oracle_snapshot_fields
+from fleetright.workload_controller import REPLICA_ID_LABEL, _placement_fingerprint
 from psycopg import sql
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg.types.json import Jsonb
@@ -535,6 +536,21 @@ def _supported_scale_out_request(
     }
 
 
+def test_kubernetes_execution_allowlist_can_enroll_a_new_managed_workload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("FLEETRIGHT_KUBERNETES_WORKLOADS", raising=False)
+    assert api_module._supported_execution_workloads("kubernetes-workload") == {"cpu-api"}
+    monkeypatch.setenv("FLEETRIGHT_KUBERNETES_WORKLOADS", "cpu-api, p2b-live-test")
+    assert api_module._supported_execution_workloads("kubernetes-workload") == {
+        "cpu-api",
+        "p2b-live-test",
+    }
+    monkeypatch.setenv("FLEETRIGHT_KUBERNETES_WORKLOADS", "cpu-api,cpu-api")
+    with pytest.raises(RuntimeError, match="unique DNS labels"):
+        api_module._supported_execution_workloads("kubernetes-workload")
+
+
 def _create_verified_plan(
     client: TestClient,
     raw_tokens: dict[str, str],
@@ -983,6 +999,298 @@ def test_v2_plan_publishes_journaled_replacement_intent(
         assert target.workload["spec"]["executionRequest"]["purpose"] == ("staged-replacement-v1")
         assert execution_state == "EXECUTING"
         assert target.calls == 1
+
+
+@pytest.mark.skipif(
+    os.getenv("FLEETRIGHT_RUN_KIND_E2E") != "1",
+    reason="set FLEETRIGHT_RUN_KIND_E2E=1 for live API-to-workload execution",
+)
+def test_live_v2_api_journal_controller_prepares_replacement(
+    clean_database: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from test_evacuation_v2 import _v2_snapshot
+
+    kubeconfig = os.getenv(
+        "FLEETRIGHT_LAB_ADMIN_KUBECONFIG",
+        "/home/neel/.cache/fleetright/safety-lab.kubeconfig",
+    )
+    context = "kind-fleetright-safety-lab"
+
+    def kubectl(
+        *args: str, check: bool = True, **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["kubectl", f"--kubeconfig={kubeconfig}", f"--context={context}", *args],
+            capture_output=True,
+            check=check,
+            text=True,
+            timeout=kwargs.pop("timeout", 30),  # type: ignore[arg-type]
+            **kwargs,
+        )
+
+    assert kubectl("config", "current-context").stdout.strip() == context
+    nodes = json.loads(kubectl("get", "nodes", "-o", "json").stdout)["items"]
+    ready_nodes = [
+        node
+        for node in nodes
+        if any(
+            condition.get("type") == "Ready" and condition.get("status") == "True"
+            for condition in node.get("status", {}).get("conditions", [])
+        )
+    ]
+    if len(ready_nodes) < 5:
+        pytest.skip("verified V2 evacuation fixture requires five Ready lab Nodes")
+    workers = [
+        node
+        for node in ready_nodes
+        if not any(key.endswith("/control-plane") for key in node["metadata"].get("labels", {}))
+    ]
+    assert len(workers) >= 2
+    workload_id = f"p2b-api-{uuid.uuid4().hex[:10]}"
+    plan_key = f"p2b-api-plan-{uuid.uuid4().hex[:12]}"
+    workload = {
+        "apiVersion": "fleetright.io/v1alpha1",
+        "kind": "FleetRightWorkload",
+        "metadata": {"name": workload_id, "namespace": "fleetright-v2"},
+        "spec": {
+            "workloadID": workload_id,
+            "executionProtocol": "monotonic-scale-up-v1",
+            "podCreateProtocol": "reserved-create-v1",
+            "podCreateAdmissionProtocol": "claimed-create-v1",
+            "replicas": 3,
+            "availabilityFloor": 2,
+            "surgeBudget": 2,
+            "networkMbps": 0,
+            "disruption": {"maxConcurrentDisruptions": 1},
+            "placement": {
+                "allowedNodes": [
+                    {"name": node["metadata"]["name"], "uid": node["metadata"]["uid"]}
+                    for node in ready_nodes[:5]
+                ],
+                "topology": {
+                    "key": "kubernetes.io/hostname",
+                    "maxSkew": 1,
+                    "minDomains": 2,
+                },
+                "requirePodAntiAffinity": False,
+            },
+            "podTemplate": {
+                "containers": [
+                    {
+                        "name": "app",
+                        "image": "fleetright-workload:local",
+                        "imagePullPolicy": "IfNotPresent",
+                        "ports": [{"containerPort": 8080, "protocol": "TCP"}],
+                        "readinessProbe": {"httpGet": {"path": "/ready", "port": 8080}},
+                        "resources": {"requests": {"cpu": "100m", "memory": "64Mi"}},
+                    }
+                ],
+                "tolerations": [
+                    {
+                        "key": "node-role.kubernetes.io/control-plane",
+                        "operator": "Exists",
+                        "effect": "NoSchedule",
+                    },
+                    {
+                        "key": "node-role.kubernetes.io/master",
+                        "operator": "Exists",
+                        "effect": "NoSchedule",
+                    },
+                ],
+            },
+        },
+    }
+    kubectl("apply", "-f", "-", input=json.dumps(workload))
+    target = FleetRightWorkloadTarget(kubeconfig=kubeconfig, namespace="fleetright-v2")
+    try:
+        deadline = time.monotonic() + 120
+        observed = target.observe_scale(workload_id)
+        while observed["ready_replicas"] != 3 or observed["available_replicas"] != 3:
+            assert time.monotonic() < deadline, observed
+            time.sleep(1)
+            observed = target.observe_scale(workload_id)
+        pod_list = json.loads(
+            kubectl(
+                "get",
+                "pods",
+                "-n",
+                "fleetright-v2",
+                "-l",
+                f"fleetright.io/workload-uid={observed['uid']}",
+                "-o",
+                "json",
+            ).stdout
+        )["items"]
+        pod_by_slot = {pod["metadata"]["labels"][REPLICA_ID_LABEL]: pod for pod in pod_list}
+        assert len(pod_by_slot) == 3
+        now_ms = time.time_ns() // 1_000_000
+        source, _, _ = _v2_snapshot(now_ms)
+        source["snapshot_id"] = f"{workload_id}-snapshot"
+        source["workloads"][0]["workload_id"] = workload_id
+        source["workloads"][0]["topology_key"] = "kubernetes.io/hostname"
+        source["workloads"][0]["min_topology_domains"] = 2
+        source["workloads"][0]["max_topology_skew"] = 1
+        source["capacity_profiles"][0]["workload_id"] = workload_id
+        source["nodes"] = source["nodes"][:5]
+        model_nodes = [node["metadata"]["name"] for node in ready_nodes[:5]]
+        model_by_id = {node["node_id"]: node for node in source["nodes"]}
+        for index, node_name in enumerate(model_nodes):
+            model = list(model_by_id.values())[index]
+            model["node_id"] = node_name
+            model["active"] = True
+            model["health"] = "NODE_HEALTH_HEALTHY"
+            model["labels"] = [("kubernetes.io/hostname", node_name)]
+        ordered_pods = [pod_by_slot[f"{workload_id}-{ordinal}"] for ordinal in range(3)]
+        source["current_placements"] = [
+            {
+                "workload_id": workload_id,
+                "replica_id": f"{workload_id}-{ordinal}",
+                "node_id": pod["spec"]["nodeName"],
+            }
+            for ordinal, pod in enumerate(ordered_pods)
+        ]
+        pdb = json.loads(
+            kubectl("get", "pdb", workload_id, "-n", "fleetright-v2", "-o", "json").stdout
+        )
+        inventory_nodes = [
+            {
+                "node_id": node["metadata"]["name"],
+                "node_uid": node["metadata"]["uid"],
+                "resource_version": node["metadata"]["resourceVersion"],
+            }
+            for node in ready_nodes
+            if node["metadata"]["name"] in model_nodes
+        ]
+        inventory_pods = [
+            {
+                "workload_id": workload_id,
+                "replica_id": pod["metadata"]["labels"][REPLICA_ID_LABEL],
+                "node_id": pod["spec"]["nodeName"],
+                "pod_name": pod["metadata"]["name"],
+                "pod_uid": pod["metadata"]["uid"],
+                "owner_kind": "FleetRightWorkload",
+                "owner_name": workload_id,
+                "owner_uid": observed["uid"],
+                "logical_slot_id": pod["metadata"]["labels"][REPLICA_ID_LABEL],
+                "ready": True,
+                "terminating": False,
+            }
+            for pod in ordered_pods
+        ]
+        inventory_controller = {
+            "workload_id": workload_id,
+            "namespace": "fleetright-v2",
+            "owner_kind": "FleetRightWorkload",
+            "owner_name": workload_id,
+            "owner_uid": observed["uid"],
+            "owner_resource_version": observed["resource_version"],
+            "owner_generation": observed["generation"],
+            "controller_type": "fleetright-workload-controller/v1",
+            "execution_protocol": "monotonic-scale-up-v1",
+            "pod_template_sha256": _placement_fingerprint(
+                workload["spec"], workload["spec"]["podTemplate"]
+            ),
+            "desired_replicas": 3,
+            "pdb_allowed_disruptions": pdb["status"]["disruptionsAllowed"],
+            "pdb_resource_version": pdb["metadata"]["resourceVersion"],
+            "observed_at_ms": now_ms,
+        }
+        source["evacuation_v2"] = {
+            **source["evacuation_v2"],
+            "cluster_uid": json.loads(
+                kubectl("get", "namespace", "kube-system", "-o", "json").stdout
+            )["metadata"]["uid"],
+            "namespace": "fleetright-v2",
+            "inventory_observed_at_ms": now_ms,
+            "controllers": [inventory_controller],
+            "pods": inventory_pods,
+            "nodes": inventory_nodes,
+        }
+        snapshot = {**source, "plan_schema_version": 2}
+        monkeypatch.setenv("FLEETRIGHT_KUBERNETES_WORKLOADS", workload_id)
+        tokens, raw_tokens = _tokens()
+
+        class HealthyObserver:
+            def observe(self, _workload_id: str, **_kwargs: object) -> dict[str, object]:
+                return {
+                    "ready": True,
+                    "fresh_sample": True,
+                    "healthy": True,
+                    "p99_within_slo": True,
+                    "error_rate_within_slo": True,
+                    "queue_growth_within_limit": True,
+                    "observed_at_ms": time.time_ns() // 1_000_000,
+                }
+
+        app = create_app(
+            clean_database.repository,
+            tokens=tokens,
+            mode="EXECUTE",
+            execution_target="kubernetes-workload",
+            target_adapter=target,
+            health_observer=HealthyObserver(),
+            start_execution_worker=False,
+        )
+        with TestClient(app) as client:
+            optimized = client.post(
+                "/v1/optimize",
+                headers={
+                    "Authorization": f"Bearer {raw_tokens['recommender']}",
+                    "Idempotency-Key": plan_key,
+                },
+                json={"snapshot": snapshot},
+            )
+            assert optimized.status_code == 201, optimized.text
+            plan = optimized.json()
+            assert plan["state"] == "VERIFIED", plan
+            assert len(plan["candidate_actions"]) == 1, plan["candidate_actions"]
+            assert plan["candidate_actions"][0]["action_type"] == "PREPARE_SOURCE_RETIREMENT"
+            operator = f"Bearer {raw_tokens['operator']}"
+            approved = client.post(
+                f"/v1/plans/{plan['plan_id']}/approve",
+                headers={"Authorization": operator, "Idempotency-Key": f"approve-{plan_key}"},
+                json={},
+            )
+            assert approved.status_code == 200, approved.text
+            accepted = client.post(
+                f"/v1/plans/{plan['plan_id']}/execute",
+                headers={"Authorization": operator, "Idempotency-Key": f"execute-{plan_key}"},
+                json={},
+            )
+            assert accepted.status_code == 202, accepted.text
+            deadline = time.monotonic() + 180
+            while time.monotonic() < deadline:
+                app.state.execution_controller.run_once()
+                detail = client.get(
+                    f"/v1/plans/{plan['plan_id']}",
+                    headers={"Authorization": f"Bearer {raw_tokens['viewer']}"},
+                ).json()
+                action = detail["candidate_actions"][0]
+                progress = action.get("execution_result", {}).get("progress", [])
+                latest = progress[-1].get("result", {}) if progress else {}
+                if latest.get("stage") == "READY_FOR_SAFE_EVICTION":
+                    break
+                assert detail["execution"]["status"] not in {"FAILED_SAFE", "COMPENSATING"}, detail
+                time.sleep(0.5)
+            assert latest.get("stage") == "READY_FOR_SAFE_EVICTION", detail
+            source_pod = target.get_pod(plan["candidate_actions"][0]["payload"]["source_pod_name"])
+            assert source_pod is not None
+            assert source_pod["metadata"].get("deletionTimestamp") is None
+            replacement_uid = latest.get("replacement_pod_uid")
+            assert isinstance(replacement_uid, str) and replacement_uid
+            assert clean_database.repository.get_plan(plan["plan_id"])["state"] == "APPROVED"
+    finally:
+        kubectl(
+            "delete",
+            "fleetrightworkload",
+            workload_id,
+            "-n",
+            "fleetright-v2",
+            "--wait=true",
+            "--ignore-not-found=true",
+            check=False,
+            timeout=60,
+        )
 
 
 @pytest.mark.parametrize("unsupported_action", ["MOVE_REPLICA", "DEACTIVATE_NODE"])

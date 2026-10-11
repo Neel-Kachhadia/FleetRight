@@ -388,11 +388,16 @@ export FLEETRIGHT_KUBERNETES_NAMESPACE=fleetright-v2
 export FLEETRIGHT_HEALTH_TARGETS_JSON='{"cpu-api":"http://127.0.0.1:8081"}'
 export FLEETRIGHT_MODE=EXECUTE
 export FLEETRIGHT_EXECUTION_TARGET=kubernetes-workload
+export FLEETRIGHT_KUBERNETES_WORKLOADS=cpu-api,new-managed-workload
 PYTHONPATH=python .venv/bin/uvicorn fleetright.api:app --host 127.0.0.1 --port 8080
 ```
 
-Never point Kubernetes EXECUTE at the kind administrator kubeconfig. The Role grants only GET/PATCH
-on the named `cpu-api` FleetRightWorkload; the controller Role grants Pod CREATE but no Pod DELETE
-or Eviction. Existing unmarked FleetRightWorkload objects cannot be promoted in place. Pod
-Eviction, Deployment mutation, scale-down, and Node cordoning remain disabled by the checked-in
-RBAC and application configuration. Delete the temporary kubeconfig when finished.
+Never point Kubernetes EXECUTE at the kind administrator kubeconfig. The Role is bound to the
+`fleetright-controller` ServiceAccount and grants GET/PATCH on the named `cpu-api`
+FleetRightWorkload, Pod GET/LIST, PDB GET, and Eviction CREATE; the validating webhook checks each
+Eviction against the active operation and replacement evidence. Direct Pod DELETE, Deployment
+mutation, scale-down, and Node cordoning remain disabled. `FLEETRIGHT_KUBERNETES_WORKLOADS` is a
+comma-separated API admission allowlist (defaults to `cpu-api`); adding a name only enables
+admission and does not qualify that workload's capacity or topology. Existing unmarked
+FleetRightWorkload objects cannot be promoted in place. Delete the temporary kubeconfig when
+finished.

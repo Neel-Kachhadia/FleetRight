@@ -163,7 +163,7 @@ _WORKLOAD_CREATE_HISTORY_UNCERTAIN_RULE = (
     "self.status.podCreateHistoryUncertain)"
 )
 
-# ponytail: ceilings cover three checked-in workloads; add one with each new target.
+DEFAULT_EXECUTION_HEALTH_CEILING = (120, 1_000)
 EXECUTION_HEALTH_CEILINGS = {
     "cpu-api": (120, 1_000),
     "memory-api": (150, 1_000),
@@ -172,8 +172,8 @@ EXECUTION_HEALTH_CEILINGS = {
 
 
 def valid_execution_health_policy(workload_id: str, policy: object) -> bool:
-    ceiling = EXECUTION_HEALTH_CEILINGS.get(workload_id)
-    if not isinstance(policy, dict) or ceiling is None:
+    ceiling = EXECUTION_HEALTH_CEILINGS.get(workload_id, DEFAULT_EXECUTION_HEALTH_CEILING)
+    if not isinstance(policy, dict):
         return False
     latency, errors = policy.get("p99_limit_ms"), policy.get("error_slo_ppm")
     return (
@@ -189,20 +189,16 @@ def valid_execution_health_policy(workload_id: str, policy: object) -> bool:
 def bounded_execution_health_policy(
     workload_id: str, p99_limit_ms: object, error_slo_ppm: object
 ) -> dict[str, int] | None:
-    ceiling = EXECUTION_HEALTH_CEILINGS.get(workload_id)
+    ceiling = EXECUTION_HEALTH_CEILINGS.get(workload_id, DEFAULT_EXECUTION_HEALTH_CEILING)
     if type(p99_limit_ms) is not int or p99_limit_ms <= 0:
         return None
     if type(error_slo_ppm) is not int or not 0 <= error_slo_ppm <= 1_000_000:
         return None
-    return (
-        {
-            "p99_limit_ms": min(p99_limit_ms, ceiling[0]),
-            "error_slo_ppm": min(error_slo_ppm, ceiling[1]),
-            "max_queue_growth_milli": 0,
-        }
-        if ceiling is not None
-        else None
-    )
+    return {
+        "p99_limit_ms": min(p99_limit_ms, ceiling[0]),
+        "error_slo_ppm": min(error_slo_ppm, ceiling[1]),
+        "max_queue_growth_milli": 0,
+    }
 
 
 class TargetError(RuntimeError):

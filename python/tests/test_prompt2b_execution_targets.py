@@ -59,6 +59,13 @@ def test_execution_health_policy_is_capped_by_server_workload_contract() -> None
     }
     assert valid_execution_health_policy("cpu-api", policy)
     assert not valid_execution_health_policy("cpu-api", {**policy, "p99_limit_ms": 10_000})
+    custom = bounded_execution_health_policy("p2b-live-test", 500, 100_000)
+    assert custom == {
+        "p99_limit_ms": 120,
+        "error_slo_ppm": 1_000,
+        "max_queue_growth_milli": 0,
+    }
+    assert valid_execution_health_policy("p2b-live-test", custom)
 
 
 def test_workload_execute_requires_the_supported_explicit_namespace(
