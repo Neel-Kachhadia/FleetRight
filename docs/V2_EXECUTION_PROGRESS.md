@@ -12,6 +12,10 @@ absolute hard stop 14:16:37 UTC.
 start; pre-existing untracked `graphify-out/` was preserved. No push or
 milestone-4 tag was made.
 
+**Local implementation checkpoints:** `6c49823` rejects duplicate V2 Node
+UIDs; `6472277` adds the pending-CREATE intent protocol and this session's
+evidence. Neither commit was pushed.
+
 **Decision:** INCOMPLETE. The current worktree adds a bounded pending-Pod-CREATE
 barrier for new controller requests and rejects duplicate Node UIDs in V2
 snapshots. It does not fence a pre-upgrade request already admitted by
