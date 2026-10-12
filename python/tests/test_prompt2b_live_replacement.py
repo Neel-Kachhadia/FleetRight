@@ -10,7 +10,14 @@ from pathlib import Path
 
 import pytest
 import yaml
-from fleetright.execution import FleetRightWorkloadTarget, OutcomeUnknown, TargetError
+from fleetright.execution import (
+    ActionBlocked,
+    FleetRightWorkloadTarget,
+    OutcomeUnknown,
+    TargetError,
+    TargetPreconditionFailed,
+)
+from fleetright.workload_controller import REPLICA_ID_LABEL
 
 
 @pytest.mark.skipif(
@@ -25,7 +32,7 @@ def test_live_workload_prepares_and_evacuates_source_with_real_pod_identity(
         "FLEETRIGHT_LAB_ADMIN_KUBECONFIG",
         "/home/neel/.cache/fleetright/safety-lab.kubeconfig",
     )
-    context = "kind-fleetright-safety-lab"
+    context = os.getenv("FLEETRIGHT_LAB_CONTEXT", "kind-fleetright-safety-lab")
 
     def kubectl(
         *args: str, check: bool = True, **kwargs: object
@@ -130,8 +137,12 @@ def test_live_workload_prepares_and_evacuates_source_with_real_pod_identity(
                     {"name": node["metadata"]["name"], "uid": node["metadata"]["uid"]}
                     for node in workers
                 ],
-                "topology": {"key": "kubernetes.io/hostname", "maxSkew": 1},
-                "requirePodAntiAffinity": False,
+                "topology": {
+                    "key": "kubernetes.io/hostname",
+                    "minDomains": 2,
+                    "maxSkew": 1,
+                },
+                "requirePodAntiAffinity": True,
             },
             "podTemplate": {
                 "containers": [
@@ -180,9 +191,12 @@ def test_live_workload_prepares_and_evacuates_source_with_real_pod_identity(
             ).stdout
         )
         source_node_name = source["spec"]["nodeName"]
-        destination_node = next(
-            node for node in workers if node["metadata"]["name"] != source_node_name
-        )
+        destination_nodes = [
+            {"name": node["metadata"]["name"], "uid": node["metadata"]["uid"]}
+            for node in workers
+            if node["metadata"]["name"] != source_node_name
+        ]
+        assert len(destination_nodes) >= 2
         payload = {
             "operation_id": operation_id,
             "replica_id": source_record["replicaID"],
@@ -199,13 +213,8 @@ def test_live_workload_prepares_and_evacuates_source_with_real_pod_identity(
             "source_owner_name": workload_id,
             "source_owner_uid": owner_uid,
             "source_logical_slot_id": source_record["replicaID"],
-            "destination_node_ids": [destination_node["metadata"]["name"]],
-            "destination_nodes": [
-                {
-                    "name": destination_node["metadata"]["name"],
-                    "uid": destination_node["metadata"]["uid"],
-                }
-            ],
+            "destination_node_ids": [node["name"] for node in destination_nodes],
+            "destination_nodes": destination_nodes,
             "workload_generation": current["generation"],
             "baseline_replicas": 1,
             "surge_desired_replicas": 2,
@@ -214,15 +223,27 @@ def test_live_workload_prepares_and_evacuates_source_with_real_pod_identity(
             "maximum_temporary_surge_replicas": 2,
             "profile_required_replicas": 1,
             "readiness_stabilization_ms": 0,
+            "topology_key": "kubernetes.io/hostname",
+            "minimum_topology_domains": 2,
+            "maximum_topology_skew": 1,
         }
-        result = target.prepare_source_retirement(workload_id, plan_id, payload, fencing_token=13)
+
+        def prepare_after_observation() -> dict[str, object]:
+            try:
+                return target.prepare_source_retirement(
+                    workload_id, plan_id, payload, fencing_token=13
+                )
+            except TargetPreconditionFailed as error:
+                if str(error) != "target resource version changed":
+                    raise
+                return {"stage": "STATUS_CAS_RETRY"}
+
+        result = prepare_after_observation()
         deadline = time.monotonic() + 120
         while result["stage"] not in {"READY_FOR_SAFE_EVICTION", "PDB_BLOCKED"}:
             assert time.monotonic() < deadline, result
             time.sleep(1)
-            result = target.prepare_source_retirement(
-                workload_id, plan_id, payload, fencing_token=13
-            )
+            result = prepare_after_observation()
 
         if pdb_blocked:
             assert result["stage"] == "PDB_BLOCKED", result
@@ -239,8 +260,10 @@ def test_live_workload_prepares_and_evacuates_source_with_real_pod_identity(
         assert result["source_node_uid"] == payload["source_node_uid"]
         assert result["source_pod_resource_version"] == source["metadata"]["resourceVersion"]
         assert result["replacement_pod_uid"]
-        assert result["replacement_node_id"] == destination_node["metadata"]["name"]
-        assert result["replacement_node_uid"] == destination_node["metadata"]["uid"]
+        approved_destinations = {node["name"]: node["uid"] for node in destination_nodes}
+        assert (
+            approved_destinations[result["replacement_node_id"]] == result["replacement_node_uid"]
+        )
         assert result["replacement_pod_uid"] != source["metadata"]["uid"]
         observed = target.observe_scale(workload_id)
         assert observed["retired_replica_slots"] == [
@@ -260,6 +283,7 @@ def test_live_workload_prepares_and_evacuates_source_with_real_pod_identity(
                 "replacementNodeUID": result["replacement_node_uid"],
                 "replacementCreateID": result["replacement_create_id"],
                 "replacementWorkloadGeneration": result["replacement_workload_generation"],
+                "readinessStabilizationMs": result["readiness_stabilization_ms"],
             }
         ]
         replacement_controller_uid = restart_workload_controller()
@@ -431,7 +455,12 @@ def test_live_workload_prepares_and_evacuates_source_with_real_pod_identity(
         def send_stale_eviction() -> None:
             try:
                 executor_target.evict_source(
-                    workload_id, plan_id, payload, result, fencing_token=13
+                    workload_id,
+                    plan_id,
+                    payload,
+                    result,
+                    fencing_token=13,
+                    before_dispatch=lambda: True,
                 )
             except Exception as error:
                 stale_outcome.append(error)
@@ -496,6 +525,7 @@ def test_live_workload_prepares_and_evacuates_source_with_real_pod_identity(
                 payload,
                 prepared_after_takeover,
                 fencing_token=14,
+                before_dispatch=lambda: True,
             )
         takeover_target._kubectl = takeover_kubectl  # type: ignore[method-assign]
         restarted_controller_uid = restart_workload_controller()
@@ -519,6 +549,7 @@ def test_live_workload_prepares_and_evacuates_source_with_real_pod_identity(
                     payload,
                     retry_prepared,
                     fencing_token=14,
+                    before_dispatch=lambda: True,
                 )
             time.sleep(1)
             retired = takeover_target.observe_source_retirement(
@@ -553,25 +584,48 @@ def test_live_workload_prepares_and_evacuates_source_with_real_pod_identity(
             assert time.monotonic() < deadline, recovered_workload
             time.sleep(1)
             recovered_workload = takeover_target.observe_scale(workload_id)
-        takeover_target.verify_recovery(
-            plan_id,
-            {
-                "intent_id": recovery_operation_id,
-                "workload_id": workload_id,
-                "payload": {
-                    "target_precondition": {
-                        key: before_recovery[key] for key in ("uid", "generation", "replicas")
-                    },
-                    "current_replicas": 2,
-                    "proposed_replicas": 3,
-                    "destination_nodes": recovery_nodes,
-                    "topology_key": "kubernetes.io/hostname",
-                    "minimum_topology_domains": 0,
-                    "maximum_topology_skew": 1,
+        recovery_action = {
+            "intent_id": recovery_operation_id,
+            "workload_id": workload_id,
+            "payload": {
+                "target_precondition": {
+                    key: before_recovery[key] for key in ("uid", "generation", "replicas")
                 },
+                "current_replicas": 2,
+                "proposed_replicas": 3,
+                "destination_nodes": recovery_nodes,
+                "topology_key": "kubernetes.io/hostname",
+                "minimum_topology_domains": 2,
+                "maximum_topology_skew": 1,
             },
-            recovered_workload,
-        )
+        }
+        try:
+            takeover_target.verify_recovery(plan_id, recovery_action, recovered_workload)
+        except ActionBlocked as error:
+            pods = json.loads(
+                kubectl(
+                    "get",
+                    "pods",
+                    "-n",
+                    "fleetright-v2",
+                    "-l",
+                    f"fleetright.io/workload-uid={owner_uid}",
+                    "-o",
+                    "json",
+                ).stdout
+            )["items"]
+            placement = [
+                {
+                    "slot": pod.get("metadata", {}).get("labels", {}).get(REPLICA_ID_LABEL),
+                    "node": pod.get("spec", {}).get("nodeName"),
+                    "phase": pod.get("status", {}).get("phase"),
+                }
+                for pod in pods
+            ]
+            pytest.fail(
+                f"recovery verification failed: {error.reason}; "
+                f"topology={recovered_workload.get('placement_topology')}; pods={placement}"
+            )
     finally:
         kubectl(
             "delete",
@@ -614,3 +668,240 @@ def test_live_workload_prepares_and_evacuates_source_with_real_pod_identity(
             check=False,
             timeout=60,
         )
+
+
+@pytest.mark.skipif(
+    os.getenv("FLEETRIGHT_RUN_KIND_E2E") != "1",
+    reason="set FLEETRIGHT_RUN_KIND_E2E=1 to test the live Binding admission fence",
+)
+def test_live_pod_binding_admission_blocks_fleetright_cordoned_node() -> None:
+    kubeconfig = os.getenv(
+        "FLEETRIGHT_LAB_ADMIN_KUBECONFIG", "/tmp/fleetright-prompt2b-lab.kubeconfig"
+    )
+    context = os.getenv("FLEETRIGHT_LAB_CONTEXT", "kind-fleetright-prompt2b-lab")
+    namespace = "fleetright-v2"
+
+    def kubectl(
+        *args: str, check: bool = True, **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["kubectl", f"--kubeconfig={kubeconfig}", f"--context={context}", *args],
+            capture_output=True,
+            check=check,
+            text=True,
+            timeout=kwargs.pop("timeout", 30),  # type: ignore[arg-type]
+            **kwargs,
+        )
+
+    assert kubectl("config", "current-context").stdout.strip() == context
+    namespace_object = json.loads(kubectl("get", "namespace", namespace, "-o", "json").stdout)
+    assert namespace_object["metadata"]["uid"] == "df488d28-0a9a-4b1c-ba5d-ff4632be9b29"
+    configuration = json.loads(
+        kubectl(
+            "get",
+            "validatingwebhookconfiguration",
+            "fleetright-pod-admission",
+            "-o",
+            "json",
+        ).stdout
+    )
+    assert any(
+        "pods/binding" in rule.get("resources", [])
+        for webhook in configuration["webhooks"]
+        for rule in webhook["rules"]
+    )
+
+    nodes = json.loads(kubectl("get", "nodes", "-o", "json").stdout)["items"]
+    workers = [
+        node
+        for node in nodes
+        if not any(key.endswith("/control-plane") for key in node["metadata"].get("labels", {}))
+        and any(
+            condition.get("type") == "Ready" and condition.get("status") == "True"
+            for condition in node.get("status", {}).get("conditions", [])
+        )
+        and not node.get("spec", {}).get("unschedulable", False)
+    ]
+    pods = json.loads(kubectl("get", "pods", "-A", "-o", "json").stdout)["items"]
+
+    def has_only_exempt_pods(node_name: str) -> bool:
+        for pod in pods:
+            if pod.get("spec", {}).get("nodeName") != node_name:
+                continue
+            metadata = pod.get("metadata", {})
+            if metadata.get("annotations", {}).get("kubernetes.io/config.mirror"):
+                continue
+            if any(
+                owner.get("kind") == "DaemonSet" and owner.get("controller") is True
+                for owner in metadata.get("ownerReferences", [])
+            ):
+                continue
+            return False
+        return True
+
+    idle_workers = [node for node in workers if has_only_exempt_pods(node["metadata"]["name"])]
+    assert len(idle_workers) >= 1
+    source_node = idle_workers[0]
+    destination_node = next(
+        node for node in workers if node["metadata"]["name"] != source_node["metadata"]["name"]
+    )
+    source_name = source_node["metadata"]["name"]
+    source_uid = source_node["metadata"]["uid"]
+    plan_id = f"p2b-binding-{uuid.uuid4().hex[:12]}"
+    operation_id = f"binding-{uuid.uuid4().hex[:12]}"
+    pod_name = f"binding-probe-{uuid.uuid4().hex[:12]}"
+    original_annotations = source_node["metadata"].get("annotations", {})
+    original_unschedulable_present = "unschedulable" in source_node.get("spec", {})
+    original_unschedulable = source_node.get("spec", {}).get("unschedulable", False)
+    cordon_attempted = False
+    pod_created = False
+    target = FleetRightWorkloadTarget(kubeconfig=kubeconfig, namespace=namespace)
+    payload = {
+        "operation_id": operation_id,
+        "source_node_id": source_name,
+        "source_node_uid": source_uid,
+    }
+
+    try:
+        pod = {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": pod_name, "namespace": namespace},
+            "spec": {
+                "schedulerName": "fleetright-p2b-binding-probe",
+                "restartPolicy": "Never",
+                "securityContext": {
+                    "runAsNonRoot": True,
+                    "runAsUser": 10001,
+                    "seccompProfile": {"type": "RuntimeDefault"},
+                },
+                "containers": [
+                    {
+                        "name": "probe",
+                        "image": "registry.k8s.io/pause:3.10",
+                        "imagePullPolicy": "IfNotPresent",
+                        "securityContext": {
+                            "allowPrivilegeEscalation": False,
+                            "capabilities": {"drop": ["ALL"]},
+                            "runAsNonRoot": True,
+                            "runAsUser": 10001,
+                        },
+                    }
+                ],
+            },
+        }
+        direct_assignment = json.loads(json.dumps(pod))
+        direct_assignment["metadata"]["name"] = f"{pod_name}-direct"
+        direct_assignment["spec"]["nodeName"] = source_name
+        denied_create = kubectl(
+            "apply", "-f", "-", input=json.dumps(direct_assignment), check=False
+        )
+        assert denied_create.returncode != 0
+        assert "Pod CREATE cannot assign a Node directly" in denied_create.stderr
+        kubectl("apply", "-f", "-", input=json.dumps(pod))
+        pod_created = True
+        pending = json.loads(kubectl("get", "pod", pod_name, "-n", namespace, "-o", "json").stdout)
+        assert pending["spec"].get("nodeName", "") == ""
+        assert pending["status"].get("phase") == "Pending"
+        pod_uid = pending["metadata"]["uid"]
+
+        cordon_attempted = True
+        target.cordon_source_node(plan_id, payload, fencing_token=1)
+
+        def bind(node_name: str, expected_uid: str) -> subprocess.CompletedProcess[str]:
+            binding = {
+                "apiVersion": "v1",
+                "kind": "Binding",
+                "metadata": {"name": pod_name, "namespace": namespace, "uid": expected_uid},
+                "target": {"apiVersion": "v1", "kind": "Node", "name": node_name},
+            }
+            return kubectl(
+                "create",
+                f"--raw=/api/v1/namespaces/{namespace}/pods/{pod_name}/binding",
+                "-f",
+                "-",
+                input=json.dumps(binding),
+                check=False,
+            )
+
+        denied = bind(source_name, pod_uid)
+        assert denied.returncode != 0, denied.stdout
+        assert "Binding to a cordoned or FleetRight draining Node is denied" in denied.stderr
+        allowed = bind(destination_node["metadata"]["name"], pod_uid)
+        assert allowed.returncode == 0, allowed.stderr
+        bound = json.loads(kubectl("get", "pod", pod_name, "-n", namespace, "-o", "json").stdout)
+        assert bound["spec"]["nodeName"] == destination_node["metadata"]["name"]
+        kubectl("delete", "pod", pod_name, "-n", namespace, "--wait=true")
+        kubectl("apply", "-f", "-", input=json.dumps(pod))
+        recreated = json.loads(
+            kubectl("get", "pod", pod_name, "-n", namespace, "-o", "json").stdout
+        )
+        new_uid = recreated["metadata"]["uid"]
+        assert new_uid != pod_uid
+        stale_bind = bind(destination_node["metadata"]["name"], pod_uid)
+        assert stale_bind.returncode != 0, stale_bind.stdout
+        assert "Binding Pod is missing, changed, deleting, or already assigned" in stale_bind.stderr
+        current_bind = bind(destination_node["metadata"]["name"], new_uid)
+        assert current_bind.returncode == 0, current_bind.stderr
+    finally:
+        if pod_created:
+            kubectl(
+                "delete",
+                "pod",
+                pod_name,
+                "-n",
+                namespace,
+                "--wait=true",
+                "--ignore-not-found=true",
+                check=False,
+                timeout=30,
+            )
+        if cordon_attempted:
+            current = target._json("get", "node", source_name, "-o", "json")
+            metadata, spec = current.get("metadata", {}), current.get("spec", {})
+            annotations = metadata.get("annotations", {})
+            if (
+                metadata.get("uid") == source_uid
+                and annotations.get("fleetright.io/plan-id") == plan_id
+                and annotations.get("fleetright.io/operation-id") == operation_id
+                and annotations.get("fleetright.io/fencing-token") == "1"
+            ):
+                restored_annotations = dict(annotations)
+                for key in (
+                    "fleetright.io/plan-id",
+                    "fleetright.io/operation-id",
+                    "fleetright.io/fencing-token",
+                ):
+                    if key in original_annotations:
+                        restored_annotations[key] = original_annotations[key]
+                    else:
+                        restored_annotations.pop(key, None)
+                patch = [
+                    {"op": "test", "path": "/metadata/uid", "value": source_uid},
+                    {
+                        "op": "test",
+                        "path": "/metadata/resourceVersion",
+                        "value": metadata["resourceVersion"],
+                    },
+                ]
+                if restored_annotations:
+                    patch.append(
+                        {
+                            "op": "replace" if "annotations" in metadata else "add",
+                            "path": "/metadata/annotations",
+                            "value": restored_annotations,
+                        }
+                    )
+                elif "annotations" in metadata:
+                    patch.append({"op": "remove", "path": "/metadata/annotations"})
+                if original_unschedulable_present:
+                    patch.append(
+                        {
+                            "op": "replace" if "unschedulable" in spec else "add",
+                            "path": "/spec/unschedulable",
+                            "value": original_unschedulable,
+                        }
+                    )
+                elif "unschedulable" in spec:
+                    patch.append({"op": "remove", "path": "/spec/unschedulable"})
+                target._json("patch", "node", source_name, "--type=json", "-p", json.dumps(patch))

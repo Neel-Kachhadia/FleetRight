@@ -841,8 +841,23 @@ class Repository:
         if action is None:
             raise KeyError((plan_id, intent_id))
         Repository.assert_pending_execution_controller(conn, plan_id, controller_id, pending_token)
-        if action["execution_state"] not in {"RUNNING", "OUTCOME_UNKNOWN"}:
-            raise ControlError("only unresolved target actions need takeover fencing")
+        execution_result = action["execution_result"]
+        final_result = (
+            execution_result.get("result") if isinstance(execution_result, dict) else None
+        )
+        completed_retirement = (
+            action["action_type"] == "PREPARE_SOURCE_RETIREMENT"
+            and action["execution_state"] == "SUCCEEDED"
+            and isinstance(final_result, dict)
+            and final_result.get("stage") == "RETIREMENT_COMPLETE"
+        )
+        if (
+            action["execution_state"] not in {"RUNNING", "OUTCOME_UNKNOWN"}
+            and not completed_retirement
+        ):
+            raise ControlError(
+                "only unresolved or completed retirement actions need takeover fencing"
+            )
         return action
 
     @staticmethod
@@ -1335,6 +1350,17 @@ class Repository:
             "execution_error FROM action_intents WHERE plan_id = %s "
             "AND execution_state IN ('NOT_STARTED', 'RUNNING', 'OUTCOME_UNKNOWN') "
             "ORDER BY action_sequence",
+            (plan_id,),
+        ).fetchall()
+
+    @staticmethod
+    def completed_retirement_actions(
+        conn: psycopg.Connection, plan_id: str
+    ) -> list[dict[str, object]]:
+        return conn.execute(
+            "SELECT intent_id, action_type, workload_id, payload, execution_result "
+            "FROM action_intents WHERE plan_id = %s AND action_type = 'PREPARE_SOURCE_RETIREMENT' "
+            "AND execution_state = 'SUCCEEDED' ORDER BY action_sequence",
             (plan_id,),
         ).fetchall()
 

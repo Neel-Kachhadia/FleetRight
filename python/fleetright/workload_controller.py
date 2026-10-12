@@ -8,6 +8,7 @@ import re
 import ssl
 import time
 from copy import deepcopy
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -945,6 +946,8 @@ def _validate_spec(
             and (
                 execution["targetReplicas"] != execution["expectedReplicas"] + 1
                 or spec.get("surgeBudget", 0) < 1
+                or not isinstance(spec.get("placement"), dict)
+                or spec["placement"].get("requirePodAntiAffinity") is not True
                 or type(execution.get("minimumReadyReplicas")) is not int
                 or execution["minimumReadyReplicas"] < spec["availabilityFloor"]
                 or execution["minimumReadyReplicas"] > execution["targetReplicas"]
@@ -1039,6 +1042,38 @@ def _pod_ready(pod: dict[str, Any]) -> bool:
     return not pod.get("metadata", {}).get("deletionTimestamp") and any(
         condition.get("type") == "Ready" and condition.get("status") == "True"
         for condition in pod.get("status", {}).get("conditions", [])
+    )
+
+
+def _pod_ready_stable(pod: dict[str, Any], stabilization_ms: int) -> bool:
+    if type(stabilization_ms) is not int or stabilization_ms < 0:
+        return False
+    metadata = pod.get("metadata", {})
+    status = pod.get("status", {})
+    conditions = status.get("conditions") if isinstance(status, dict) else None
+    if not isinstance(metadata, dict) or not isinstance(conditions, list):
+        return False
+    conditions = [
+        condition
+        for condition in conditions
+        if isinstance(condition, dict) and condition.get("type") == "Ready"
+    ]
+    ready_since = conditions[0].get("lastTransitionTime") if len(conditions) == 1 else None
+    if (
+        metadata.get("deletionTimestamp") is not None
+        or status.get("phase") != "Running"
+        or len(conditions) != 1
+        or conditions[0].get("status") != "True"
+        or not isinstance(ready_since, str)
+    ):
+        return False
+    try:
+        ready_at = datetime.fromisoformat(ready_since.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return (
+        ready_at.utcoffset() is not None
+        and (datetime.now(UTC) - ready_at).total_seconds() * 1000 >= stabilization_ms
     )
 
 
@@ -1162,7 +1197,11 @@ def _validate_execution_request(workload: dict[str, Any]) -> None:
     expected = request["expectedReplicas"]
     fence = spec.get("executionFence")
     if isinstance(fence, dict) and (
-        fence.get("generation", 0) > request["generation"]
+        (
+            fence.get("generation", 0) > request["generation"]
+            and (fence.get("planID"), fence.get("operationID"))
+            != (request["planID"], request["operationID"])
+        )
         or (
             fence.get("generation") == request["generation"]
             and (fence.get("planID"), fence.get("operationID"))
@@ -1465,6 +1504,7 @@ def _write_retired_slot_tombstone(
             "replacementCreateID": replacement.get("replacement_create_id"),
             "replacementWorkloadGeneration": replacement.get("replacement_workload_generation"),
         }
+        stabilization_ms = replacement.get("readiness_stabilization_ms")
         if (
             not all(
                 isinstance(identity[key], str) and identity[key]
@@ -1478,6 +1518,8 @@ def _write_retired_slot_tombstone(
                 )
             )
             or type(identity["replacementWorkloadGeneration"]) is not int
+            or type(stabilization_ms) is not int
+            or stabilization_ms < 0
             or approved_uids.get(identity["replacementNodeName"]) != identity["replacementNodeUID"]
             or not any(
                 record.get("workloadUID") == workload["metadata"]["uid"]
@@ -1496,6 +1538,21 @@ def _write_retired_slot_tombstone(
                 "replacement identity is not authorized for this operation",
             )
         supplied_record.update(identity)
+        supplied_record["readinessStabilizationMs"] = stabilization_ms
+        replacement_pod = api.get_pod(identity["replacementPodName"])
+        replacement_metadata = (
+            replacement_pod.get("metadata") if isinstance(replacement_pod, dict) else None
+        )
+        if (
+            not isinstance(replacement_pod, dict)
+            or not isinstance(replacement_metadata, dict)
+            or replacement_metadata.get("uid") != identity["replacementPodUID"]
+            or not _pod_ready_stable(replacement_pod, stabilization_ms)
+        ):
+            raise SafetyError(
+                "ReplacementReadinessNotStable",
+                "replacement Pod readiness did not satisfy the evacuation hold time",
+            )
     retired = list(_retired_replica_slots(workload))
     existing = next(
         (item for item in retired if item["replicaID"] == supplied_record["replicaID"]), None
@@ -1529,6 +1586,7 @@ def _write_retired_slot_tombstone(
         record.update(
             {key: value for key, value in supplied_record.items() if key.startswith("replacement")}
         )
+        record["readinessStabilizationMs"] = supplied_record["readinessStabilizationMs"]
     if existing is not None and existing != record:
         raise SafetyError(
             "RetirementIdentityConflict", "logical slot already has another tombstone"
@@ -1669,8 +1727,6 @@ def reconcile_workload(api: Any, workload: dict[str, Any], nodes: list[dict[str,
                     "terminal logical replica requires an explicit replacement protocol",
                 )
 
-        _write_execution_phase(api, workload, "RECONCILING")
-
         desired = workload["spec"]["replicas"]
         retired_ids = {record["replicaID"] for record in _retired_replica_slots(workload)}
         live_pods = [
@@ -1705,6 +1761,8 @@ def reconcile_workload(api: Any, workload: dict[str, Any], nodes: list[dict[str,
             )
 
         maximum_live = desired
+        if live_count < maximum_live:
+            _write_execution_phase(api, workload, "RECONCILING")
         ordinal = 0
         while live_count < maximum_live:
             replica_id = f"{workload['spec']['workloadID']}-{ordinal}"

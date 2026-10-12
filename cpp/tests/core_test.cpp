@@ -248,6 +248,118 @@ FeasibleEvacuationPlan(const fleetright::v2::EvacuationSnapshot &snapshot) {
   return plan;
 }
 
+fleetright::v2::EvacuationSnapshot DrainFixture(int count = 4) {
+  auto snapshot = EvacuationFixture();
+  auto *model = snapshot.mutable_model_snapshot();
+  const auto workload_template = model->workloads(0);
+  const auto profile_template = model->capacity_profiles(0);
+  const auto controller_template = snapshot.controllers(0);
+  model->mutable_nodes()->DeleteSubrange(4, 2);
+  snapshot.mutable_nodes()->DeleteSubrange(4, 2);
+  for (auto &node : *model->mutable_nodes()) {
+    auto *label = node.add_labels();
+    label->set_key("kubernetes.io/hostname");
+    label->set_value(node.node_id());
+  }
+  model->clear_workloads();
+  model->clear_capacity_profiles();
+  model->clear_current_placements();
+  snapshot.clear_controllers();
+  snapshot.clear_pods();
+  for (int i = 0; i < count; ++i) {
+    const auto id = "drain-" + std::to_string(i);
+    auto *workload = model->add_workloads();
+    *workload = workload_template;
+    workload->set_workload_id(id);
+    workload->set_min_replicas(1);
+    workload->set_availability_floor(1);
+    workload->set_demand_qps_milli(100'000);
+    workload->set_concurrency_bound(10);
+    workload->set_topology_key("kubernetes.io/hostname");
+    workload->set_min_topology_domains(1);
+    workload->set_max_topology_skew(1);
+    SetResource(workload->mutable_current_resources(), 200, 256, 10);
+    auto *profile = model->add_capacity_profiles();
+    *profile = profile_template;
+    profile->set_workload_id(id);
+    profile->set_profile_id(id + "-profile");
+    *profile->mutable_allocation() = workload->current_resources();
+    SealProfile(profile);
+    auto *controller = snapshot.add_controllers();
+    *controller = controller_template;
+    controller->set_workload_id(id);
+    controller->set_owner_name(id);
+    controller->set_owner_uid(id + "-owner-uid");
+    controller->set_desired_replicas(1);
+    auto *placement = model->add_current_placements();
+    placement->set_workload_id(id);
+    placement->set_replica_id(id + "-0");
+    placement->set_node_id("node-0");
+    auto *pod = snapshot.add_pods();
+    pod->set_workload_id(id);
+    pod->set_replica_id(placement->replica_id());
+    pod->set_node_id("node-0");
+    pod->set_pod_name(placement->replica_id());
+    pod->set_pod_uid(id + "-source-uid");
+    pod->set_owner_kind("FleetRightWorkload");
+    pod->set_owner_name(id);
+    pod->set_owner_uid(controller->owner_uid());
+    pod->set_logical_slot_id(placement->replica_id());
+    pod->set_ready(true);
+  }
+  SealEvacuationSnapshot(&snapshot);
+  return snapshot;
+}
+
+fleetright::v2::EvacuationSnapshot DrainFixtureWithHardAffinityDomains() {
+  auto snapshot = DrainFixture();
+  auto *model = snapshot.mutable_model_snapshot();
+  const auto node_template = model->nodes(2);
+  auto *extra_node = model->add_nodes();
+  *extra_node = node_template;
+  extra_node->set_node_id("node-4");
+  for (auto &label : *extra_node->mutable_labels())
+    if (label.key() == "kubernetes.io/hostname")
+      label.set_value("node-4");
+  auto *extra_identity = snapshot.add_nodes();
+  *extra_identity = snapshot.nodes(2);
+  extra_identity->set_node_id("node-4");
+  extra_identity->set_node_uid("node-uid-4");
+  extra_identity->set_resource_version("node-rv-4");
+
+  for (int node_index = 0; node_index < model->nodes_size(); ++node_index) {
+    auto *node = model->mutable_nodes(node_index);
+    for (auto &label : *node->mutable_labels())
+      if (label.key() == "zone")
+        label.set_value(node_index == 3 ? "zone-0"
+                                        : "zone-" + std::to_string(node_index));
+  }
+  for (int index = 0; index < model->workloads_size(); ++index) {
+    auto *workload = model->mutable_workloads(index);
+    workload->set_topology_key("zone");
+    workload->set_min_topology_domains(2);
+    snapshot.mutable_controllers(index)->set_desired_replicas(2);
+    auto *placement = model->add_current_placements();
+    placement->set_workload_id(workload->workload_id());
+    placement->set_replica_id(workload->workload_id() + "-1");
+    placement->set_node_id("node-1");
+    auto *pod = snapshot.add_pods();
+    pod->set_workload_id(workload->workload_id());
+    pod->set_replica_id(placement->replica_id());
+    pod->set_node_id("node-1");
+    pod->set_pod_name(placement->replica_id());
+    pod->set_pod_uid(placement->replica_id() + "-uid");
+    pod->set_owner_kind("FleetRightWorkload");
+    pod->set_owner_name(workload->workload_id());
+    pod->set_owner_uid(snapshot.controllers(index).owner_uid());
+    pod->set_logical_slot_id(placement->replica_id());
+    pod->set_ready(true);
+    pod->set_terminating(false);
+  }
+  SealEvacuationSnapshot(&snapshot);
+  return snapshot;
+}
+
 void SealEvacuationPlan(fleetright::v2::EvacuationPlan *plan) {
   plan->clear_plan_id();
   plan->set_plan_id(fleetright::EvacuationPlanSha256(*plan));
@@ -259,6 +371,10 @@ TEST(EvacuationV2Test, AcceptsAConstraintPlanAndReplaysDeterministically) {
   const auto plan = FeasibleEvacuationPlan(snapshot);
   ASSERT_TRUE(plan.feasible());
   ASSERT_EQ(plan.operations_size(), 1);
+  EXPECT_EQ(plan.plan_actions_size(), 0);
+  EXPECT_EQ(plan.operations(0).depends_on_plan_action_sequences_size(), 0);
+  EXPECT_FALSE(plan.operations(0).deactivate_source_node_after_empty());
+  EXPECT_EQ(plan.operations(0).actions_size(), 5);
   EXPECT_EQ(plan.operations(0).destinations().mode(),
             fleetright::v2::DESTINATION_MODE_CONSTRAINT_NODE_SET);
   EXPECT_TRUE(plan.operations(0).destinations().require_hard_pod_anti_affinity());
@@ -271,6 +387,271 @@ TEST(EvacuationV2Test, AcceptsAConstraintPlanAndReplaysDeterministically) {
   EXPECT_EQ(result.SerializeAsString(),
             fleetright::VerifyEvacuationV2(snapshot, plan).SerializeAsString());
   EXPECT_EQ(plan.SerializeAsString(), fleetright::PlanEvacuationV2(snapshot).SerializeAsString());
+}
+
+TEST(EvacuationV2Test, SequentialDrainAcceptsTwoThroughFourDistinctWorkloads) {
+  for (int count = 2; count <= 4; ++count) {
+    SCOPED_TRACE(count);
+    const auto snapshot = DrainFixture(count);
+    const auto plan = FeasibleEvacuationPlan(snapshot);
+    ASSERT_TRUE(plan.feasible()) << plan.infeasible_reason();
+    EXPECT_EQ(plan.mode(), fleetright::v2::EVACUATION_PLAN_MODE_SEQUENTIAL_NODE_DRAIN);
+    ASSERT_EQ(plan.operations_size(), count);
+    EXPECT_EQ(plan.profile_bindings_size(), count);
+    EXPECT_EQ(plan.required_runtime_capabilities_size(), 10);
+    ASSERT_EQ(plan.plan_actions_size(), 2);
+    EXPECT_EQ(plan.plan_actions(0).sequence(), 0U);
+    EXPECT_EQ(plan.plan_actions(0).stage(), fleetright::v2::EVACUATION_STAGE_CORDON_SOURCE_NODE);
+    EXPECT_EQ(plan.plan_actions(0).depends_on_sequences_size(), 0);
+    EXPECT_EQ(plan.plan_actions(1).sequence(), static_cast<unsigned>(count + 1));
+    EXPECT_EQ(plan.plan_actions(1).stage(),
+              fleetright::v2::EVACUATION_STAGE_VERIFY_SOURCE_NODE_EMPTY);
+    ASSERT_EQ(plan.plan_actions(1).depends_on_sequences_size(), 1);
+    EXPECT_EQ(plan.plan_actions(1).depends_on_sequences(0), static_cast<unsigned>(count));
+    for (const auto &action : plan.plan_actions()) {
+      EXPECT_EQ(action.source_node_id(), "node-0");
+      EXPECT_EQ(action.source_node_uid(), "node-uid-0");
+    }
+    for (int i = 0; i < count; ++i) {
+      const auto &operation = plan.operations(i);
+      EXPECT_EQ(operation.sequence(), static_cast<unsigned>(i));
+      EXPECT_EQ(operation.source_node_id(), "node-0");
+      EXPECT_EQ(operation.source_node_uid(), "node-uid-0");
+      EXPECT_EQ(operation.baseline_replicas(), 1U);
+      EXPECT_EQ(operation.final_desired_replicas(), 2U);
+      EXPECT_EQ(operation.maximum_live_replicas(), 3U);
+      EXPECT_EQ(operation.maximum_concurrent_disruptions(), 1U);
+      EXPECT_TRUE(operation.destinations().require_hard_pod_anti_affinity());
+      EXPECT_EQ(operation.destinations().allowed_node_ids_size(), 3);
+      EXPECT_EQ(operation.deactivate_source_node_after_empty(), i == count - 1);
+      EXPECT_EQ(operation.actions_size(), i == count - 1 ? 6 : 5);
+      ASSERT_EQ(operation.depends_on_operation_sequences_size(), i == 0 ? 0 : 1);
+      ASSERT_EQ(operation.depends_on_plan_action_sequences_size(), i == 0 ? 1 : 0);
+      if (i == 0) {
+        EXPECT_EQ(operation.depends_on_plan_action_sequences(0), 0U);
+      }
+      if (i > 0) {
+        EXPECT_EQ(operation.depends_on_operation_sequences(0), static_cast<unsigned>(i - 1));
+      }
+    }
+    const auto result = fleetright::VerifyEvacuationV2(snapshot, plan);
+    EXPECT_TRUE(result.accepted()) << result.DebugString();
+    EXPECT_FALSE(result.execution_admitted());
+    EXPECT_EQ(plan.SerializeAsString(), fleetright::PlanEvacuationV2(snapshot).SerializeAsString());
+    EXPECT_EQ(result.SerializeAsString(),
+              fleetright::VerifyEvacuationV2(snapshot, plan).SerializeAsString());
+  }
+}
+
+TEST(EvacuationV2Test, SequentialDrainFiltersDestinationsByHardAffinityDomain) {
+  const auto snapshot = DrainFixtureWithHardAffinityDomains();
+  const auto plan = FeasibleEvacuationPlan(snapshot);
+  ASSERT_EQ(plan.operations_size(), 4);
+  for (const auto &operation : plan.operations()) {
+    EXPECT_EQ(operation.destinations().allowed_node_ids_size(), 2);
+    EXPECT_EQ(operation.destinations().allowed_node_ids(0), "node-2");
+    EXPECT_EQ(operation.destinations().allowed_node_ids(1), "node-4");
+  }
+  EXPECT_TRUE(fleetright::VerifyEvacuationV2(snapshot, plan).accepted());
+
+  auto tampered = plan;
+  auto *destinations = tampered.mutable_operations(0)->mutable_destinations();
+  destinations->clear_allowed_node_ids();
+  destinations->add_allowed_node_ids("node-2");
+  destinations->add_allowed_node_ids("node-3");
+  destinations->add_allowed_node_ids("node-4");
+  SealEvacuationPlan(&tampered);
+  EXPECT_FALSE(fleetright::VerifyEvacuationV2(snapshot, tampered).accepted());
+}
+
+TEST(EvacuationV2Test, SequentialDrainRejectsUncoveredSourceOccupant) {
+  const auto original_snapshot = DrainFixture();
+  auto plan = FeasibleEvacuationPlan(original_snapshot);
+  const auto final_action = plan.operations(3).actions(5);
+  plan.mutable_operations()->RemoveLast();
+  plan.mutable_profile_bindings()->RemoveLast();
+  auto *last = plan.mutable_operations(2);
+  last->set_deactivate_source_node_after_empty(true);
+  *last->add_actions() = final_action;
+  // Keep the plan-level action envelope valid for three operations so rejection
+  // still proves that the fourth source occupant cannot be left uncovered.
+  plan.mutable_plan_actions(1)->set_sequence(4);
+  plan.mutable_plan_actions(1)->set_depends_on_sequences(0, 3);
+  SealEvacuationPlan(&plan);
+  EXPECT_FALSE(fleetright::VerifyEvacuationV2(original_snapshot, plan).accepted());
+
+  plan = FeasibleEvacuationPlan(original_snapshot);
+  const auto snapshot = DrainFixture(5);
+  EXPECT_FALSE(fleetright::PlanEvacuationV2(snapshot).feasible());
+  plan.set_snapshot_sha256(snapshot.content_sha256());
+  SealEvacuationPlan(&plan);
+  EXPECT_FALSE(fleetright::VerifyEvacuationV2(snapshot, plan).accepted());
+}
+
+TEST(EvacuationV2Test, SequentialDrainRejectsPlanActionIdentityAndOrderTampering) {
+  const auto snapshot = DrainFixture();
+  const auto original = FeasibleEvacuationPlan(snapshot);
+  for (int variant = 0; variant < 10; ++variant) {
+    SCOPED_TRACE(variant);
+    auto plan = original;
+    switch (variant) {
+    case 0:
+      plan.clear_plan_actions();
+      break;
+    case 1:
+      plan.mutable_plan_actions()->SwapElements(0, 1);
+      break;
+    case 2:
+      plan.mutable_plan_actions(0)->set_source_node_uid("wrong-node-uid");
+      break;
+    case 3:
+      plan.mutable_plan_actions(1)->set_source_node_id("node-1");
+      break;
+    case 4:
+      plan.mutable_plan_actions(1)->set_depends_on_sequences(0, 1);
+      break;
+    case 5:
+      plan.mutable_plan_actions(0)->set_sequence(1);
+      break;
+    case 6:
+      plan.mutable_plan_actions(1)->set_sequence(4);
+      break;
+    case 7:
+      plan.mutable_operations(0)->clear_depends_on_plan_action_sequences();
+      break;
+    case 8:
+      plan.mutable_plan_actions(0)->set_expected_postcondition("cordon is optional");
+      break;
+    case 9:
+      plan.mutable_required_runtime_capabilities()->RemoveLast();
+      break;
+    }
+    SealEvacuationPlan(&plan);
+    EXPECT_FALSE(fleetright::VerifyEvacuationV2(snapshot, plan).accepted());
+  }
+}
+
+TEST(EvacuationV2Test, SequentialDrainActionBudgetIncludesCordonAndFinalVerification) {
+  auto snapshot = DrainFixture();
+  snapshot.mutable_model_snapshot()->mutable_policy()->set_maximum_plan_actions(23);
+  SealEvacuationSnapshot(&snapshot);
+  auto plan = FeasibleEvacuationPlan(snapshot);
+  EXPECT_TRUE(fleetright::VerifyEvacuationV2(snapshot, plan).accepted());
+
+  snapshot.mutable_model_snapshot()->mutable_policy()->set_maximum_plan_actions(22);
+  SealEvacuationSnapshot(&snapshot);
+  EXPECT_FALSE(fleetright::PlanEvacuationV2(snapshot).feasible());
+  plan.set_snapshot_sha256(snapshot.content_sha256());
+  plan.set_policy_sha256(fleetright::MessageSha256(snapshot.model_snapshot().policy()));
+  SealEvacuationPlan(&plan);
+  EXPECT_FALSE(fleetright::VerifyEvacuationV2(snapshot, plan).accepted());
+}
+
+TEST(EvacuationV2Test, SingleSourceRejectsPlanLevelNodeActionsAndDependencies) {
+  const auto snapshot = EvacuationFixture();
+  const auto original = FeasibleEvacuationPlan(snapshot);
+  const auto batch = FeasibleEvacuationPlan(DrainFixture());
+  for (int variant = 0; variant < 4; ++variant) {
+    SCOPED_TRACE(variant);
+    auto plan = original;
+    if (variant < 2)
+      *plan.add_plan_actions() = batch.plan_actions(variant);
+    else if (variant == 2)
+      plan.mutable_operations(0)->add_depends_on_plan_action_sequences(0);
+    else {
+      plan.mutable_operations(0)->set_deactivate_source_node_after_empty(true);
+      *plan.mutable_operations(0)->add_actions() = batch.operations(3).actions(5);
+    }
+    SealEvacuationPlan(&plan);
+    EXPECT_FALSE(fleetright::VerifyEvacuationV2(snapshot, plan).accepted());
+  }
+}
+
+TEST(EvacuationV2Test, SequentialDrainRejectsCumulativeDestinationOvercapacity) {
+  auto snapshot = DrainFixture();
+  auto plan = FeasibleEvacuationPlan(snapshot);
+  // Every individual operation's two replacements fit 500m, while several
+  // earlier completed workloads can consume that same allowed destination.
+  SetResource(snapshot.mutable_model_snapshot()->mutable_nodes(1)->mutable_reserved(), 1'500, 0, 0);
+  SealEvacuationSnapshot(&snapshot);
+  EXPECT_FALSE(fleetright::PlanEvacuationV2(snapshot).feasible());
+  plan.set_snapshot_sha256(snapshot.content_sha256());
+  SealEvacuationPlan(&plan);
+  const auto result = fleetright::VerifyEvacuationV2(snapshot, plan);
+  EXPECT_FALSE(result.accepted());
+  const auto cumulative = std::find_if(
+      result.invariants().begin(), result.invariants().end(), [](const auto &invariant) {
+        return invariant.invariant() == "v2_sequential_destination_outcomes_and_final_empty";
+      });
+  ASSERT_NE(cumulative, result.invariants().end());
+  EXPECT_FALSE(cumulative->passed());
+}
+
+TEST(EvacuationV2Test, SequentialDrainRejectsOrderAndAuthorityTampering) {
+  const auto snapshot = DrainFixture();
+  const auto original = FeasibleEvacuationPlan(snapshot);
+  for (int variant = 0; variant < 11; ++variant) {
+    SCOPED_TRACE(variant);
+    auto plan = original;
+    switch (variant) {
+    case 0:
+      plan.mutable_operations()->SwapElements(0, 1);
+      break;
+    case 1:
+      plan.mutable_operations(2)->set_depends_on_operation_sequences(0, 0);
+      break;
+    case 2:
+      plan.mutable_operations(1)->set_source_node_uid("different-node-uid");
+      break;
+    case 3:
+      plan.mutable_operations(1)->set_source_pod_uid("different-pod-uid");
+      break;
+    case 4:
+      plan.set_mode(fleetright::v2::EVACUATION_PLAN_MODE_SINGLE_SOURCE);
+      break;
+    case 5:
+      plan.mutable_operations(0)->set_deactivate_source_node_after_empty(true);
+      break;
+    case 6:
+      plan.mutable_operations(0)->mutable_destinations()->set_require_hard_pod_anti_affinity(false);
+      break;
+    case 7:
+      plan.mutable_operations(0)->mutable_actions()->SwapElements(2, 3);
+      break;
+    case 8:
+      plan.mutable_required_runtime_capabilities()->RemoveLast();
+      break;
+    case 9:
+      plan.mutable_operations(1)->set_workload_id(plan.operations(0).workload_id());
+      break;
+    case 10:
+      plan.set_mode(static_cast<fleetright::v2::EvacuationPlanMode>(99));
+      break;
+    }
+    SealEvacuationPlan(&plan);
+    EXPECT_FALSE(fleetright::VerifyEvacuationV2(snapshot, plan).accepted());
+  }
+}
+
+TEST(EvacuationV2Test, SequentialDrainRejectsTopologyDomainCollocationAndNMinusOne) {
+  auto snapshot = DrainFixture();
+  auto plan = FeasibleEvacuationPlan(snapshot);
+  snapshot.mutable_model_snapshot()->mutable_nodes(2)->mutable_labels(1)->set_value("node-1");
+  SealEvacuationSnapshot(&snapshot);
+  EXPECT_FALSE(fleetright::PlanEvacuationV2(snapshot).feasible());
+  plan.set_snapshot_sha256(snapshot.content_sha256());
+  SealEvacuationPlan(&plan);
+  EXPECT_FALSE(fleetright::VerifyEvacuationV2(snapshot, plan).accepted());
+
+  snapshot = DrainFixture();
+  plan = FeasibleEvacuationPlan(snapshot);
+  snapshot.mutable_model_snapshot()->mutable_workloads(0)->set_failure_tolerance(
+      fleetright::v1::FAILURE_TOLERANCE_N_MINUS_1);
+  SealEvacuationSnapshot(&snapshot);
+  EXPECT_FALSE(fleetright::PlanEvacuationV2(snapshot).feasible());
+  plan.set_snapshot_sha256(snapshot.content_sha256());
+  SealEvacuationPlan(&plan);
+  EXPECT_FALSE(fleetright::VerifyEvacuationV2(snapshot, plan).accepted());
 }
 
 TEST(EvacuationV2Test, RejectsInsufficientSurgeCapacity) {
@@ -295,6 +676,86 @@ TEST(EvacuationV2Test, RejectsUnenforceableExactDestination) {
   SealEvacuationPlan(&plan);
   const auto result = fleetright::VerifyEvacuationV2(snapshot, plan);
   EXPECT_FALSE(result.accepted());
+}
+
+TEST(EvacuationV2Test, FourNodesCannotReplaceWorkloadWideHardAntiAffinityWithOccupiedNodes) {
+  auto snapshot = EvacuationFixture();
+  snapshot.mutable_model_snapshot()->mutable_nodes()->DeleteSubrange(4, 2);
+  snapshot.mutable_nodes()->DeleteSubrange(4, 2);
+  SealEvacuationSnapshot(&snapshot);
+
+  // Three existing replicas leave only one eligible Node. Spare CPU on the occupied
+  // Nodes does not make them eligible under the proposed hard Pod anti-affinity.
+  const auto plan = fleetright::PlanEvacuationV2(snapshot);
+  EXPECT_FALSE(plan.feasible());
+  EXPECT_FALSE(fleetright::VerifyEvacuationV2(snapshot, plan).accepted());
+}
+
+TEST(EvacuationV2Test, IndependentVerifierRejectsOccupiedHardAntiAffinityDestination) {
+  const auto snapshot = EvacuationFixture();
+  auto plan = FeasibleEvacuationPlan(snapshot);
+  auto *operation = plan.mutable_operations(0);
+  operation->mutable_destinations()->clear_allowed_node_ids();
+  operation->mutable_destinations()->add_allowed_node_ids("node-1");
+  operation->mutable_destinations()->add_allowed_node_ids("node-3");
+  operation->clear_recovery_destination_node_ids();
+  operation->add_recovery_destination_node_ids("node-1");
+  operation->add_recovery_destination_node_ids("node-3");
+  SealEvacuationPlan(&plan);
+
+  // A replica plus a replacement fits node-1's resources, but the existing api-1
+  // makes this destination incompatible with the plan's hard anti-affinity.
+  const auto result = fleetright::VerifyEvacuationV2(snapshot, plan);
+  EXPECT_FALSE(result.accepted());
+  const auto contract = std::find_if(
+      result.invariants().begin(), result.invariants().end(), [](const auto &invariant) {
+        return invariant.invariant() == "v2_constraint_contract_and_action_order";
+      });
+  ASSERT_NE(contract, result.invariants().end());
+  EXPECT_FALSE(contract->passed());
+}
+
+TEST(EvacuationV2Test, IndependentVerifierRejectsRemovingRequiredHardAntiAffinity) {
+  const auto snapshot = EvacuationFixture();
+  auto plan = FeasibleEvacuationPlan(snapshot);
+  plan.mutable_operations(0)->mutable_destinations()->set_require_hard_pod_anti_affinity(false);
+  SealEvacuationPlan(&plan);
+  EXPECT_FALSE(fleetright::VerifyEvacuationV2(snapshot, plan).accepted());
+}
+
+TEST(EvacuationV2Test, IndependentVerifierRejectsDestinationResourceAndTopologyDrift) {
+  auto original = EvacuationFixture();
+  auto *workload = original.mutable_model_snapshot()->mutable_workloads(0);
+  workload->set_topology_key("zone");
+  workload->set_min_topology_domains(2);
+  workload->set_max_topology_skew(1);
+  SealEvacuationSnapshot(&original);
+  const auto original_plan = FeasibleEvacuationPlan(original);
+  ASSERT_TRUE(fleetright::VerifyEvacuationV2(original, original_plan).accepted());
+
+  for (const bool resource_drift : {true, false}) {
+    SCOPED_TRACE(resource_drift ? "resource capacity" : "topology skew");
+    auto snapshot = original;
+    auto *node = snapshot.mutable_model_snapshot()->mutable_nodes(4);
+    if (resource_drift)
+      SetResource(node->mutable_reserved(), 1'500, 0, 0);
+    else
+      node->mutable_labels(0)->set_value("zone-1");
+    SealEvacuationSnapshot(&snapshot);
+    EXPECT_FALSE(fleetright::PlanEvacuationV2(snapshot).feasible());
+
+    auto forged = original_plan;
+    forged.set_snapshot_sha256(snapshot.content_sha256());
+    SealEvacuationPlan(&forged);
+    const auto result = fleetright::VerifyEvacuationV2(snapshot, forged);
+    EXPECT_FALSE(result.accepted());
+    const auto outcomes = std::find_if(
+        result.invariants().begin(), result.invariants().end(), [](const auto &invariant) {
+          return invariant.invariant() == "v2_all_intermediate_and_final_outcomes";
+        });
+    ASSERT_NE(outcomes, result.invariants().end());
+    EXPECT_FALSE(outcomes->passed());
+  }
 }
 
 TEST(EvacuationV2Test, RejectsIntermediateAvailabilityAndActionOrderViolations) {
@@ -591,7 +1052,7 @@ TEST(EvacuationV2Test, RejectsUnboundReadinessAndPolicyBudgets) {
   EXPECT_FALSE(fleetright::PlanEvacuationV2(no_moves).feasible());
 
   auto no_actions = snapshot;
-  no_actions.mutable_model_snapshot()->mutable_policy()->set_maximum_plan_actions(5);
+  no_actions.mutable_model_snapshot()->mutable_policy()->set_maximum_plan_actions(4);
   SealEvacuationSnapshot(&no_actions);
   EXPECT_FALSE(fleetright::PlanEvacuationV2(no_actions).feasible());
 }

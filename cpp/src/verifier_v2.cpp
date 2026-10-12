@@ -418,13 +418,16 @@ bool DependenciesValid(const EvacuationOperation &operation) {
       "the named source Pod UID is evicted through the observed PDB",
       "source UID is absent and desired replicas are stably ready at baseline plus one",
       "source node has no remaining workload Pods"};
-  if (operation.actions_size() != static_cast<int>(stages.size()))
+  const auto expected_size =
+      operation.deactivate_source_node_after_empty() ? stages.size() : stages.size() - 1;
+  if (operation.actions_size() != static_cast<int>(expected_size))
     return false;
   for (std::size_t i = 0; i < static_cast<std::size_t>(operation.actions_size()); ++i) {
     const auto &action = operation.actions(static_cast<int>(i));
     if (action.sequence() != static_cast<std::uint32_t>(i) ||
         action.action_id() != "evacuation-" + std::to_string(i) || action.stage() != stages[i] ||
-        action.expected_postcondition() != postconditions[i] ||
+        action.expected_postcondition() != postconditions[i] || !action.source_node_id().empty() ||
+        !action.source_node_uid().empty() ||
         action.on_failure() != v2::FAILURE_BEHAVIOR_FAIL_CLOSED_KEEP_SURGE ||
         !v2::EvacuationStage_IsValid(static_cast<int>(action.stage())))
       return false;
@@ -502,8 +505,11 @@ bool CheckPlacementOutcomes(const EvacuationSnapshot &snapshot,
           !TopologyAndCapacity(snapshot, workload, overlap, {}))
         return false;
       auto final = RemoveSource(overlap, workload.workload_id(), operation.replica_id());
+      const std::set<std::string> inactive = operation.deactivate_source_node_after_empty()
+                                                 ? std::set<std::string>{operation.source_node_id()}
+                                                 : std::set<std::string>{};
       if (!StateCountsSafe(operation, profile, count + 1, count + 1) ||
-          !TopologyAndCapacity(snapshot, workload, final, {operation.source_node_id()}) ||
+          !TopologyAndCapacity(snapshot, workload, final, inactive) ||
           CountFor(final, workload.workload_id()) != count + 1)
         return false;
     }
@@ -882,25 +888,192 @@ bool SnapshotIdentityValid(const EvacuationSnapshot &snapshot) {
   return true;
 }
 
-std::vector<v2::RuntimeCapability> RequiredCapabilities() {
-  return {v2::RUNTIME_CAPABILITY_ENFORCED_NODE_SET,
-          v2::RUNTIME_CAPABILITY_ENFORCED_RESOURCE_REQUESTS,
-          v2::RUNTIME_CAPABILITY_NETWORK_BANDWIDTH_ADMISSION,
-          v2::RUNTIME_CAPABILITY_POD_UID_EVICTION,
-          v2::RUNTIME_CAPABILITY_PDB_ADMISSION,
-          v2::RUNTIME_CAPABILITY_ATOMIC_MUTATION_FENCING,
-          v2::RUNTIME_CAPABILITY_OWNER_IDENTITY_RECHECK,
-          v2::RUNTIME_CAPABILITY_READINESS_OBSERVATION,
-          v2::RUNTIME_CAPABILITY_HARD_POD_ANTI_AFFINITY};
+std::vector<v2::RuntimeCapability> RequiredCapabilities(bool sequential_batch = false) {
+  std::vector<v2::RuntimeCapability> result = {v2::RUNTIME_CAPABILITY_ENFORCED_NODE_SET,
+                                               v2::RUNTIME_CAPABILITY_ENFORCED_RESOURCE_REQUESTS,
+                                               v2::RUNTIME_CAPABILITY_NETWORK_BANDWIDTH_ADMISSION,
+                                               v2::RUNTIME_CAPABILITY_POD_UID_EVICTION,
+                                               v2::RUNTIME_CAPABILITY_PDB_ADMISSION,
+                                               v2::RUNTIME_CAPABILITY_ATOMIC_MUTATION_FENCING,
+                                               v2::RUNTIME_CAPABILITY_OWNER_IDENTITY_RECHECK,
+                                               v2::RUNTIME_CAPABILITY_READINESS_OBSERVATION,
+                                               v2::RUNTIME_CAPABILITY_HARD_POD_ANTI_AFFINITY};
+  if (sequential_batch)
+    result.push_back(v2::RUNTIME_CAPABILITY_SEQUENTIAL_NODE_DRAIN);
+  return result;
 }
 
 bool CapabilityListValid(const EvacuationPlan &plan) {
-  const auto expected = RequiredCapabilities();
+  const auto expected =
+      RequiredCapabilities(plan.mode() == v2::EVACUATION_PLAN_MODE_SEQUENTIAL_NODE_DRAIN);
   if (plan.required_runtime_capabilities_size() != static_cast<int>(expected.size()))
     return false;
   for (std::size_t i = 0; i < expected.size(); ++i)
     if (plan.required_runtime_capabilities(static_cast<int>(i)) != expected[i])
       return false;
+  return true;
+}
+
+bool SequentialDrainContractValid(const EvacuationSnapshot &snapshot, const EvacuationPlan &plan) {
+  if (plan.operations_size() < 2 || plan.operations_size() > 4 ||
+      plan.profile_bindings_size() != plan.operations_size() || plan.plan_actions_size() != 2)
+    return false;
+  const auto &model = snapshot.model_snapshot();
+  for (const auto &workload : model.workloads())
+    if (workload.failure_tolerance() != v1::FAILURE_TOLERANCE_NONE)
+      return false;
+  const auto &first = plan.operations(0);
+  const auto &cordon = plan.plan_actions(0);
+  const auto &verify = plan.plan_actions(1);
+  if (cordon.sequence() != 0 || cordon.action_id() != "node-drain-cordon" ||
+      cordon.stage() != v2::EVACUATION_STAGE_CORDON_SOURCE_NODE ||
+      cordon.depends_on_sequences_size() != 0 ||
+      cordon.source_node_id() != first.source_node_id() ||
+      cordon.source_node_uid() != first.source_node_uid() ||
+      cordon.expected_postcondition() !=
+          "source Node UID is cordoned before any replacement or Eviction" ||
+      cordon.on_failure() != v2::FAILURE_BEHAVIOR_FAIL_CLOSED_KEEP_SURGE ||
+      verify.sequence() != static_cast<std::uint32_t>(plan.operations_size() + 1) ||
+      verify.action_id() != "node-drain-verify-empty" ||
+      verify.stage() != v2::EVACUATION_STAGE_VERIFY_SOURCE_NODE_EMPTY ||
+      verify.depends_on_sequences_size() != 1 ||
+      verify.depends_on_sequences(0) != static_cast<std::uint32_t>(plan.operations_size()) ||
+      verify.source_node_id() != first.source_node_id() ||
+      verify.source_node_uid() != first.source_node_uid() ||
+      verify.expected_postcondition() !=
+          "source Node UID is cordoned and has no remaining workload Pods" ||
+      verify.on_failure() != v2::FAILURE_BEHAVIOR_FAIL_CLOSED_KEEP_SURGE)
+    return false;
+  std::set<std::string> selected;
+  std::string previous_workload;
+  std::uint32_t action_count = 2;
+  for (int i = 0; i < plan.operations_size(); ++i) {
+    const auto &operation = plan.operations(i);
+    if (operation.sequence() != static_cast<std::uint32_t>(i) ||
+        operation.source_node_id() != first.source_node_id() ||
+        operation.source_node_uid() != first.source_node_uid() ||
+        operation.deactivate_source_node_after_empty() != (i == plan.operations_size() - 1) ||
+        operation.actions_size() != (i == plan.operations_size() - 1 ? 6 : 5) ||
+        !selected.insert(ReplicaKey(operation.workload_id(), operation.replica_id())).second ||
+        (!previous_workload.empty() && previous_workload >= operation.workload_id()) ||
+        operation.depends_on_operation_sequences_size() != (i == 0 ? 0 : 1) ||
+        (i > 0 &&
+         operation.depends_on_operation_sequences(0) != static_cast<std::uint32_t>(i - 1)) ||
+        operation.depends_on_plan_action_sequences_size() != (i == 0 ? 1 : 0) ||
+        (i == 0 && operation.depends_on_plan_action_sequences(0) != 0))
+      return false;
+    previous_workload = operation.workload_id();
+    action_count += static_cast<std::uint32_t>(operation.actions_size());
+  }
+  std::set<std::string> occupants;
+  for (const auto &pod : model.current_placements())
+    if (pod.node_id() == first.source_node_id())
+      occupants.insert(ReplicaKey(pod.workload_id(), pod.replica_id()));
+  return selected == occupants && action_count <= model.policy().maximum_plan_actions();
+}
+
+bool DrainPlacementValid(const EvacuationSnapshot &snapshot, const EvacuationPlan &plan,
+                         const std::vector<ReplicaPlacement> &state,
+                         const std::set<std::string> &inactive) {
+  if (!ResourceStateValid(snapshot, state, inactive))
+    return false;
+  for (const auto &workload : snapshot.model_snapshot().workloads()) {
+    if (!TopologyStateValid(snapshot, workload, state, inactive))
+      return false;
+    const bool selected =
+        std::any_of(plan.operations().begin(), plan.operations().end(), [&](const auto &operation) {
+          return operation.workload_id() == workload.workload_id();
+        });
+    if (!selected)
+      continue;
+    const auto key =
+        workload.topology_key().empty() ? "kubernetes.io/hostname" : workload.topology_key();
+    std::set<std::string> domains;
+    for (const auto &pod : state) {
+      if (pod.workload_id() != workload.workload_id())
+        continue;
+      const auto *node = NodeById(snapshot.model_snapshot(), pod.node_id());
+      if (node == nullptr)
+        return false;
+      const auto domain = LabelValue(*node, key);
+      if (domain.empty() || !domains.insert(domain).second)
+        return false;
+    }
+  }
+  return true;
+}
+
+bool CheckSequentialDrainOutcomes(const EvacuationSnapshot &snapshot, const EvacuationPlan &plan,
+                                  std::size_t *outcomes) {
+  using PlacementState = std::vector<ReplicaPlacement>;
+  std::vector<PlacementState> reachable{
+      PlacementState(snapshot.model_snapshot().current_placements().begin(),
+                     snapshot.model_snapshot().current_placements().end())};
+  for (int index = 0; index < plan.operations_size(); ++index) {
+    const auto &operation = plan.operations(index);
+    const auto *workload = WorkloadById(snapshot.model_snapshot(), operation.workload_id());
+    const auto profile = RecomputeProfileCapacity(snapshot.model_snapshot(), *workload,
+                                                  plan.profile_bindings(index).profile_id());
+    if (!profile)
+      return false;
+    std::vector<PlacementState> completed;
+    for (const auto &state : reachable) {
+      const auto count = CountFor(state, operation.workload_id());
+      if (count != operation.baseline_replicas() ||
+          !StateCountsSafe(operation, *profile, count, count) ||
+          !DrainPlacementValid(snapshot, plan, state, {}))
+        return false;
+      std::string first_id = "__verified_drain_first";
+      while (std::any_of(state.begin(), state.end(), [&](const auto &pod) {
+        return pod.workload_id() == operation.workload_id() && pod.replica_id() == first_id;
+      }))
+        first_id += "_";
+      std::string second_id = first_id + "_second";
+      while (std::any_of(state.begin(), state.end(), [&](const auto &pod) {
+        return pod.workload_id() == operation.workload_id() && pod.replica_id() == second_id;
+      }))
+        second_id += "_";
+      const auto &destinations = operation.destinations().allowed_node_ids();
+      for (const auto &node : destinations) {
+        auto pending = AddPod(state, operation.workload_id(), first_id, node);
+        if (++*outcomes > kMaxProofOutcomes ||
+            !StateCountsSafe(operation, *profile, count, count + 1) ||
+            !StateCountsSafe(operation, *profile, count + 1, count + 1) ||
+            !DrainPlacementValid(snapshot, plan, pending, {}))
+          return false;
+      }
+      // Enumerate all unordered pairs: both pending-first choices above are
+      // covered, and swapping equal-request final replicas changes no invariant.
+      for (int first = 0; first < destinations.size(); ++first) {
+        for (int second = first + 1; second < destinations.size(); ++second) {
+          auto overlap = AddPod(state, operation.workload_id(), first_id, destinations.Get(first));
+          overlap = AddPod(overlap, operation.workload_id(), second_id, destinations.Get(second));
+          auto final = RemoveSource(overlap, operation.workload_id(), operation.replica_id());
+          const std::set<std::string> inactive =
+              index == plan.operations_size() - 1
+                  ? std::set<std::string>{operation.source_node_id()}
+                  : std::set<std::string>{};
+          if (++*outcomes > kMaxProofOutcomes ||
+              !StateCountsSafe(operation, *profile, count, count + 2) ||
+              !StateCountsSafe(operation, *profile, count + 1, count + 1) ||
+              !DrainPlacementValid(snapshot, plan, overlap, {}) ||
+              !DrainPlacementValid(snapshot, plan, final, inactive) ||
+              CountFor(final, operation.workload_id()) != operation.final_desired_replicas() ||
+              (completed.size() + 1) * final.size() > 1'000'000)
+            return false;
+          if (index == plan.operations_size() - 1 &&
+              std::any_of(final.begin(), final.end(), [&](const auto &pod) {
+                return pod.node_id() == operation.source_node_id();
+              }))
+            return false;
+          completed.push_back(std::move(final));
+        }
+      }
+    }
+    if (completed.empty())
+      return false;
+    reachable = std::move(completed);
+  }
   return true;
 }
 
@@ -916,7 +1089,8 @@ v2::VerificationResult VerifyEvacuationV2(const EvacuationSnapshot &snapshot,
   result.set_verifier_build_id(EvacuationVerifierBuildId());
   result.set_execution_admitted(false);
   result.set_accepted(true);
-  for (const auto capability : RequiredCapabilities())
+  const bool sequential_batch = plan.mode() == v2::EVACUATION_PLAN_MODE_SEQUENTIAL_NODE_DRAIN;
+  for (const auto capability : RequiredCapabilities(sequential_batch))
     result.add_required_runtime_capabilities(capability);
 
   const bool snapshot_valid = SnapshotIdentityValid(snapshot);
@@ -935,7 +1109,8 @@ v2::VerificationResult VerifyEvacuationV2(const EvacuationSnapshot &snapshot,
       plan.policy_sha256() == MessageSha256(model.policy()) &&
       plan.machine_catalog_sha256() == model.machine_catalog().catalog_sha256() &&
       plan.optimizer_build_id() == OptimizerBuildId() &&
-      plan.verifier_build_id() == EvacuationVerifierBuildId() && !HasUnknownFieldsDeep(plan);
+      plan.verifier_build_id() == EvacuationVerifierBuildId() && !HasUnknownFieldsDeep(plan) &&
+      v2::EvacuationPlanMode_IsValid(static_cast<int>(plan.mode()));
   AddInvariant(&result, "v2_plan_canonical_binding_and_replay", plan_hash_valid,
                plan_hash_valid
                    ? "schema, snapshot, policy, catalog, build IDs and canonical plan hash match"
@@ -948,164 +1123,204 @@ v2::VerificationResult VerifyEvacuationV2(const EvacuationSnapshot &snapshot,
                    ? "required runtime capabilities are explicit; execution remains disabled"
                    : "runtime capability contract is missing, reordered, or unsupported");
 
-  bool accepted_operation = plan.operations_size() == 1 && plan.profile_bindings_size() == 1 &&
-                            snapshot_valid && plan_hash_valid && capabilities_valid;
+  const bool drain_contract = sequential_batch && SequentialDrainContractValid(snapshot, plan);
+  if (sequential_batch)
+    AddInvariant(&result, "v2_sequential_node_drain_contract", drain_contract,
+                 drain_contract
+                     ? "ordered distinct workloads exactly cover one source Node UID"
+                     : "unsupported batch, incomplete source set, or invalid dependency order");
+  bool accepted_operation =
+      (sequential_batch ? drain_contract
+                        : plan.operations_size() == 1 && plan.profile_bindings_size() == 1 &&
+                              plan.plan_actions_size() == 0) &&
+      snapshot_valid && plan_hash_valid && capabilities_valid;
   std::string operation_detail = "exactly one supported source UID operation is required";
   std::size_t outcomes = 0;
   if (accepted_operation) {
-    const auto &operation = plan.operations(0);
-    const auto *workload = WorkloadById(model, operation.workload_id());
-    const auto *source = PodByKey(snapshot, operation.workload_id(), operation.replica_id());
-    const auto *controller = ControllerByWorkload(snapshot, operation.workload_id());
-    const auto *source_node = NodeById(model, operation.source_node_id());
-    const auto *source_node_identity = NodeIdentityById(snapshot, operation.source_node_id());
-    const auto &binding = plan.profile_bindings(0);
-    const bool source_bound =
-        workload != nullptr && source != nullptr && controller != nullptr &&
-        source_node != nullptr && source_node_identity != nullptr &&
-        source->node_id() == operation.source_node_id() &&
-        source->pod_name() == operation.source_pod_name() &&
-        source->pod_uid() == operation.source_pod_uid() &&
-        operation.source_controller_uid().empty() &&
-        source->owner_kind() == operation.source_owner_kind() &&
-        source->owner_name() == operation.source_owner_name() &&
-        source->owner_uid() == operation.source_owner_uid() &&
-        source->logical_slot_id() == operation.source_logical_slot_id() &&
-        source->logical_slot_id() == source->replica_id() &&
-        controller->owner_kind() == operation.source_owner_kind() &&
-        controller->owner_name() == operation.source_owner_name() &&
-        controller->owner_uid() == operation.source_owner_uid() &&
-        source_node_identity->node_uid() == operation.source_node_uid() && source_node->active() &&
-        source_node->health() == v1::NODE_HEALTH_HEALTHY && source->ready() &&
-        !source->terminating() && controller->pdb_allowed_disruptions() >= 1 &&
-        controller->desired_replicas() == operation.baseline_replicas() &&
-        operation.source_owner_kind() == "FleetRightWorkload";
-    AddInvariant(&result, "v2_source_pod_owner_and_node_uid", source_bound,
-                 source_bound
-                     ? "source Pod UID, owner UID, logical replica and node UID are bound"
-                     : "source identity is absent, stale, or owned by another controller/node");
-    std::size_t source_occupants = 0;
-    for (const auto &pod : model.current_placements())
-      if (pod.node_id() == operation.source_node_id())
-        ++source_occupants;
-    const bool source_emptyable =
-        source_occupants == 1 && operation.deactivate_source_node_after_empty();
-    AddInvariant(&result, "v2_source_node_empty_after_move", source_emptyable,
-                 source_emptyable
-                     ? "source node contains only the named source Pod"
-                     : "source-node deactivation would leave another placement behind");
-
-    std::uint32_t baseline_count = 0;
-    for (const auto &pod : model.current_placements())
-      if (pod.workload_id() == operation.workload_id())
-        ++baseline_count;
-    bool profile_valid = false;
-    std::optional<ProfileCapacity> profile;
-    if (workload != nullptr && binding.workload_id() == operation.workload_id()) {
-      profile = RecomputeProfileCapacity(model, *workload, binding.profile_id());
-      profile_valid = profile.has_value() &&
-                      profile->profile->profile_sha256() == binding.profile_sha256() &&
-                      profile->point_index == binding.safe_point_index();
-    }
-    AddInvariant(&result, "v2_profile_derived_slo", profile_valid,
-                 profile_valid
-                     ? "selected profile digest and joint QPS/concurrency SLO point recomputed"
-                     : "no valid profile-derived SLO bound for this workload");
-
-    bool operation_well_formed =
-        source_bound && source_emptyable && profile_valid && operation.sequence() == 0 &&
-        baseline_count > 0 && operation.baseline_replicas() == baseline_count &&
-        operation.replica_requests().SerializeAsString() ==
-            workload->current_resources().SerializeAsString() &&
-        operation.destinations().mode() == v2::DESTINATION_MODE_CONSTRAINT_NODE_SET &&
-        operation.destinations().exact_destination_node_id().empty() &&
-        operation.destinations().exclude_source_node() &&
-        operation.destinations().require_hard_pod_anti_affinity() &&
-        operation.destinations().allowed_node_ids_size() >= 2 &&
-        operation.destinations().allowed_node_ids_size() <= 8 &&
-        operation.failure_tolerance() == workload->failure_tolerance() &&
-        operation.n_minus_1_failure_domain_key() ==
-            (workload->failure_tolerance() == v1::FAILURE_TOLERANCE_N_MINUS_1
-                 ? (workload->topology_key().empty() ? "zone" : workload->topology_key())
-                 : "") &&
-        operation.topology_key() == workload->topology_key() &&
-        operation.minimum_topology_domains() == workload->min_topology_domains() &&
-        operation.maximum_topology_skew() == workload->max_topology_skew() &&
-        operation.availability_floor_replicas() == workload->availability_floor() &&
-        operation.readiness_stabilization_ms() == workload->readiness_stabilization_ms() &&
-        workload->startup_ms() <=
-            std::numeric_limits<std::uint64_t>::max() - workload->readiness_stabilization_ms() &&
-        operation.readiness_timeout_ms() >=
-            std::max<std::uint64_t>(1, workload->startup_ms() +
-                                           workload->readiness_stabilization_ms()) &&
-        workload->max_moves() >= 1 &&
-        model.policy().maximum_plan_actions() >=
-            static_cast<std::uint32_t>(operation.actions_size()) &&
-        operation.deactivate_source_node_after_empty() &&
-        ExactStages(operation, baseline_count, *profile);
-    std::set<std::string> destination_ids;
-    std::string previous;
-    for (const auto &destination : operation.destinations().allowed_node_ids()) {
-      const auto *node = NodeById(model, destination);
-      const bool taints_allowed =
-          workload != nullptr && node != nullptr && TaintsAllowed(*workload, *node);
-      bool workload_already_present = false;
+    for (int operation_index = 0; operation_index < plan.operations_size(); ++operation_index) {
+      const auto &operation = plan.operations(operation_index);
+      const auto *workload = WorkloadById(model, operation.workload_id());
+      const auto *source = PodByKey(snapshot, operation.workload_id(), operation.replica_id());
+      const auto *controller = ControllerByWorkload(snapshot, operation.workload_id());
+      const auto *source_node = NodeById(model, operation.source_node_id());
+      const auto *source_node_identity = NodeIdentityById(snapshot, operation.source_node_id());
+      const auto &binding = plan.profile_bindings(operation_index);
+      const bool source_bound =
+          workload != nullptr && source != nullptr && controller != nullptr &&
+          source_node != nullptr && source_node_identity != nullptr &&
+          source->node_id() == operation.source_node_id() &&
+          source->pod_name() == operation.source_pod_name() &&
+          source->pod_uid() == operation.source_pod_uid() &&
+          operation.source_controller_uid().empty() &&
+          source->owner_kind() == operation.source_owner_kind() &&
+          source->owner_name() == operation.source_owner_name() &&
+          source->owner_uid() == operation.source_owner_uid() &&
+          source->logical_slot_id() == operation.source_logical_slot_id() &&
+          source->logical_slot_id() == source->replica_id() &&
+          controller->owner_kind() == operation.source_owner_kind() &&
+          controller->owner_name() == operation.source_owner_name() &&
+          controller->owner_uid() == operation.source_owner_uid() &&
+          source_node_identity->node_uid() == operation.source_node_uid() &&
+          source_node->active() && source_node->health() == v1::NODE_HEALTH_HEALTHY &&
+          source->ready() && !source->terminating() && controller->pdb_allowed_disruptions() >= 1 &&
+          controller->desired_replicas() == operation.baseline_replicas() &&
+          operation.source_owner_kind() == "FleetRightWorkload";
+      AddInvariant(&result, "v2_source_pod_owner_and_node_uid", source_bound,
+                   source_bound
+                       ? "source Pod UID, owner UID, logical replica and node UID are bound"
+                       : "source identity is absent, stale, or owned by another controller/node");
+      std::size_t source_occupants = 0;
       for (const auto &pod : model.current_placements())
-        if (pod.workload_id() == operation.workload_id() && pod.node_id() == destination)
-          workload_already_present = true;
-      if (destination.empty() || destination == operation.source_node_id() || node == nullptr ||
-          !node->active() || node->health() != v1::NODE_HEALTH_HEALTHY ||
-          workload_already_present || !taints_allowed ||
-          !destination_ids.insert(destination).second ||
-          (!previous.empty() && previous >= destination))
-        operation_well_formed = false;
-      previous = destination;
-    }
-    std::set<std::string> recovery_ids(operation.recovery_destination_node_ids().begin(),
-                                       operation.recovery_destination_node_ids().end());
-    if (recovery_ids != destination_ids)
-      operation_well_formed = false;
-    if (workload == nullptr || baseline_count + 1 > workload->max_replicas())
-      operation_well_formed = false;
-    AddInvariant(
-        &result, "v2_constraint_contract_and_action_order", operation_well_formed,
-        operation_well_formed
-            ? "destination set, explicit intermediate states and fail-closed dependencies are valid"
-            : "exact destination, malformed limits, unsupported field, or unsafe action sequence");
+        if (pod.node_id() == operation.source_node_id())
+          ++source_occupants;
+      const bool source_emptyable =
+          sequential_batch
+              ? drain_contract
+              : source_occupants == 1 && !operation.deactivate_source_node_after_empty();
+      AddInvariant(
+          &result, "v2_source_node_empty_after_move", source_emptyable,
+          source_emptyable
+              ? (sequential_batch
+                     ? "every source placement is covered; only the final operation deactivates"
+                     : "source node contains only the named source Pod")
+              : "source-node deactivation would leave another placement behind");
 
-    bool baseline_feasible = operation_well_formed && profile_valid;
-    std::vector<ReplicaPlacement> baseline(model.current_placements().begin(),
-                                           model.current_placements().end());
-    if (baseline_feasible)
-      baseline_feasible = ResourceStateValid(snapshot, baseline, {}) &&
-                          TopologyStateValid(snapshot, *workload, baseline, {});
-    bool stages_feasible = baseline_feasible;
-    if (stages_feasible)
-      stages_feasible =
-          CheckPlacementOutcomes(snapshot, operation, *workload, *profile, baseline, &outcomes);
-    AddInvariant(
-        &result, "v2_all_intermediate_and_final_outcomes", stages_feasible,
-        stages_feasible
-            ? "every permitted scheduler outcome fits capacity, topology, availability and profile "
-              "SLO"
-            : "at least one enumerated pending, ready, N+2 overlap, or final outcome is unsafe");
-    const bool n1_feasible =
-        stages_feasible &&
-        NMinusOneRecoverySafe(snapshot, operation, *workload, *profile, baseline, &outcomes);
-    AddInvariant(
-        &result, "v2_n_minus_1_recovery_reserve", n1_feasible,
-        n1_feasible
-            ? "each modeled failure domain preserves serving SLO and every permitted recovery fits"
-            : "failure-domain serving or recovery reserve is insufficient/incomplete");
-    AddInvariant(&result, "v2_bounded_outcome_enumeration", outcomes <= kMaxProofOutcomes,
-                 outcomes <= kMaxProofOutcomes
-                     ? "all outcomes were exhaustively enumerated"
-                     : "verification outcome bound exceeded; no sampling used");
-    accepted_operation = source_bound && source_emptyable && profile_valid &&
-                         operation_well_formed && baseline_feasible && stages_feasible &&
-                         n1_feasible && outcomes <= kMaxProofOutcomes;
-    operation_detail = accepted_operation ? "single operation has a complete conditional proof"
-                                          : "operation failed an independent v2 safety invariant";
+      std::uint32_t baseline_count = 0;
+      for (const auto &pod : model.current_placements())
+        if (pod.workload_id() == operation.workload_id())
+          ++baseline_count;
+      bool profile_valid = false;
+      std::optional<ProfileCapacity> profile;
+      if (workload != nullptr && binding.workload_id() == operation.workload_id()) {
+        profile = RecomputeProfileCapacity(model, *workload, binding.profile_id());
+        profile_valid = profile.has_value() &&
+                        profile->profile->profile_sha256() == binding.profile_sha256() &&
+                        profile->point_index == binding.safe_point_index();
+      }
+      AddInvariant(&result, "v2_profile_derived_slo", profile_valid,
+                   profile_valid
+                       ? "selected profile digest and joint QPS/concurrency SLO point recomputed"
+                       : "no valid profile-derived SLO bound for this workload");
+
+      bool operation_well_formed =
+          source_bound && source_emptyable && profile_valid &&
+          operation.sequence() == static_cast<std::uint32_t>(operation_index) &&
+          (sequential_batch || operation.depends_on_operation_sequences_size() == 0) &&
+          (sequential_batch || operation.depends_on_plan_action_sequences_size() == 0) &&
+          baseline_count > 0 && operation.baseline_replicas() == baseline_count &&
+          (!sequential_batch || baseline_count >= workload->min_replicas()) &&
+          operation.replica_requests().SerializeAsString() ==
+              workload->current_resources().SerializeAsString() &&
+          operation.destinations().mode() == v2::DESTINATION_MODE_CONSTRAINT_NODE_SET &&
+          operation.destinations().exact_destination_node_id().empty() &&
+          operation.destinations().exclude_source_node() &&
+          operation.destinations().require_hard_pod_anti_affinity() &&
+          operation.destinations().allowed_node_ids_size() >= 2 &&
+          operation.destinations().allowed_node_ids_size() <= 8 &&
+          operation.failure_tolerance() == workload->failure_tolerance() &&
+          operation.n_minus_1_failure_domain_key() ==
+              (workload->failure_tolerance() == v1::FAILURE_TOLERANCE_N_MINUS_1
+                   ? (workload->topology_key().empty() ? "zone" : workload->topology_key())
+                   : "") &&
+          operation.topology_key() == workload->topology_key() &&
+          operation.minimum_topology_domains() == workload->min_topology_domains() &&
+          operation.maximum_topology_skew() == workload->max_topology_skew() &&
+          operation.availability_floor_replicas() == workload->availability_floor() &&
+          operation.readiness_stabilization_ms() == workload->readiness_stabilization_ms() &&
+          workload->startup_ms() <=
+              std::numeric_limits<std::uint64_t>::max() - workload->readiness_stabilization_ms() &&
+          operation.readiness_timeout_ms() >=
+              std::max<std::uint64_t>(1, workload->startup_ms() +
+                                             workload->readiness_stabilization_ms()) &&
+          workload->max_moves() >= 1 &&
+          model.policy().maximum_plan_actions() >=
+              static_cast<std::uint32_t>(operation.actions_size()) &&
+          operation.deactivate_source_node_after_empty() ==
+              (sequential_batch && operation_index == plan.operations_size() - 1) &&
+          ExactStages(operation, baseline_count, *profile);
+      std::set<std::string> destination_ids;
+      std::string previous;
+      for (const auto &destination : operation.destinations().allowed_node_ids()) {
+        const auto *node = NodeById(model, destination);
+        const bool taints_allowed =
+            workload != nullptr && node != nullptr && TaintsAllowed(*workload, *node);
+        bool workload_already_present = false;
+        for (const auto &pod : model.current_placements())
+          if (pod.workload_id() == operation.workload_id() && pod.node_id() == destination)
+            workload_already_present = true;
+        if (destination.empty() || destination == operation.source_node_id() || node == nullptr ||
+            !node->active() || node->health() != v1::NODE_HEALTH_HEALTHY ||
+            workload_already_present || !taints_allowed ||
+            !destination_ids.insert(destination).second ||
+            (!previous.empty() && previous >= destination))
+          operation_well_formed = false;
+        previous = destination;
+      }
+      std::set<std::string> recovery_ids(operation.recovery_destination_node_ids().begin(),
+                                         operation.recovery_destination_node_ids().end());
+      if (recovery_ids != destination_ids)
+        operation_well_formed = false;
+      if (workload == nullptr || baseline_count + 1 > workload->max_replicas())
+        operation_well_formed = false;
+      AddInvariant(&result, "v2_constraint_contract_and_action_order", operation_well_formed,
+                   operation_well_formed ? "destination set, explicit intermediate states and "
+                                           "fail-closed dependencies are valid"
+                                         : "exact destination, malformed limits, unsupported "
+                                           "field, or unsafe action sequence");
+
+      bool baseline_feasible = operation_well_formed && profile_valid;
+      std::vector<ReplicaPlacement> baseline(model.current_placements().begin(),
+                                             model.current_placements().end());
+      if (baseline_feasible)
+        baseline_feasible = ResourceStateValid(snapshot, baseline, {}) &&
+                            TopologyStateValid(snapshot, *workload, baseline, {});
+      bool stages_feasible = baseline_feasible;
+      if (stages_feasible && !sequential_batch)
+        stages_feasible =
+            CheckPlacementOutcomes(snapshot, operation, *workload, *profile, baseline, &outcomes);
+      if (!sequential_batch)
+        AddInvariant(&result, "v2_all_intermediate_and_final_outcomes", stages_feasible,
+                     stages_feasible ? "every permitted scheduler outcome fits capacity, topology, "
+                                       "availability and profile "
+                                       "SLO"
+                                     : "at least one enumerated pending, ready, N+2 overlap, or "
+                                       "final outcome is unsafe");
+      const bool n1_feasible =
+          stages_feasible &&
+          NMinusOneRecoverySafe(snapshot, operation, *workload, *profile, baseline, &outcomes);
+      AddInvariant(&result, "v2_n_minus_1_recovery_reserve", n1_feasible,
+                   n1_feasible
+                       ? "each modeled failure domain preserves serving SLO and every permitted "
+                         "recovery fits"
+                       : "failure-domain serving or recovery reserve is insufficient/incomplete");
+      AddInvariant(&result, "v2_bounded_outcome_enumeration", outcomes <= kMaxProofOutcomes,
+                   outcomes <= kMaxProofOutcomes
+                       ? "all outcomes were exhaustively enumerated"
+                       : "verification outcome bound exceeded; no sampling used");
+      accepted_operation = accepted_operation && source_bound && source_emptyable &&
+                           profile_valid && operation_well_formed && baseline_feasible &&
+                           stages_feasible && n1_feasible && outcomes <= kMaxProofOutcomes;
+      operation_detail = accepted_operation ? "single operation has a complete conditional proof"
+                                            : "operation failed an independent v2 safety invariant";
+    }
+    if (sequential_batch) {
+      const bool sequential_outcomes =
+          accepted_operation && CheckSequentialDrainOutcomes(snapshot, plan, &outcomes);
+      AddInvariant(
+          &result, "v2_sequential_destination_outcomes_and_final_empty", sequential_outcomes,
+          sequential_outcomes
+              ? "all prefix, cumulative overlap and final empty-Node outcomes are safe"
+              : "cumulative capacity, topology, hard anti-affinity, or proof bound failed");
+      AddInvariant(&result, "v2_all_intermediate_and_final_outcomes", sequential_outcomes,
+                   sequential_outcomes
+                       ? "every sequential scheduler outcome was independently proved"
+                       : "sequential outcome proof is incomplete or unsafe");
+      AddInvariant(
+          &result, "v2_bounded_sequential_outcome_enumeration", outcomes <= kMaxProofOutcomes,
+          outcomes <= kMaxProofOutcomes ? "outcomes exhaustively enumerated within the bound"
+                                        : "outcome bound exceeded; no sampling used");
+      accepted_operation = accepted_operation && sequential_outcomes;
+    }
   } else {
     AddInvariant(&result, "v2_operation_count", false,
                  "v2 supports exactly one fully bound source Pod UID operation per plan");

@@ -26,7 +26,7 @@ from fleetright.workload_controller import (
     _has_create_authorization,
     _pdb_object,
     _pod_object,
-    _pod_ready,
+    _pod_ready_stable,
     _validate_scheduled_pod,
 )
 
@@ -226,6 +226,19 @@ class PodCreateAdmission:
         self.executor_username = executor_username
 
     def admit(self, request: dict[str, Any]) -> tuple[bool, str]:
+        if request.get("subResource") == "binding":
+            try:
+                return self._admit_binding(request)
+            except (
+                ApiError,
+                RuntimeError,
+                SafetyError,
+                AttributeError,
+                KeyError,
+                TypeError,
+                ValueError,
+            ):
+                return False, "Node binding evidence is unavailable or invalid"
         if request.get("subResource") == "eviction":
             try:
                 return self._admit_eviction(request)
@@ -259,6 +272,8 @@ class PodCreateAdmission:
             )
         ):
             return False, "Pod identity or spec is invalid"
+        if pod_spec.get("nodeName"):
+            return False, "Pod CREATE cannot assign a Node directly"
         is_workload_pod = (
             isinstance(owner_refs, list)
             and any(
@@ -315,6 +330,12 @@ class PodCreateAdmission:
         replica_id = labels.get(REPLICA_ID_LABEL) if isinstance(labels, dict) else None
         if not isinstance(spec, dict) or not isinstance(workload_metadata, dict):
             return False, "FleetRightWorkload identity is invalid"
+        retired_slots = status.get("retiredReplicaSlots", [])
+        if not isinstance(retired_slots, list) or any(
+            not isinstance(record, dict) or record.get("replicaID") == replica_id
+            for record in retired_slots
+        ):
+            return False, "Pod CREATE targets a retired or invalid logical slot"
         if (
             workload_metadata.get("uid") != owner["uid"]
             or spec.get("podCreateProtocol") != "reserved-create-v1"
@@ -478,6 +499,78 @@ class PodCreateAdmission:
             return False, "Pod CREATE reservation claim was not durable"
         return True, ""
 
+    def _admit_binding(self, request: dict[str, Any]) -> tuple[bool, str]:
+        binding = request.get("object")
+        if (
+            request.get("operation") != "CREATE"
+            or request.get("resource") != {"group": "", "version": "v1", "resource": "pods"}
+            or request.get("namespace") != self.namespace
+            or not isinstance(binding, dict)
+            or binding.get("apiVersion") != "v1"
+            or binding.get("kind") != "Binding"
+        ):
+            return False, "Binding request type or namespace is invalid"
+        metadata, target = binding.get("metadata"), binding.get("target")
+        if (
+            not isinstance(metadata, dict)
+            or not isinstance(metadata.get("name"), str)
+            or not metadata["name"]
+            or not isinstance(metadata.get("uid"), str)
+            or not metadata["uid"]
+            or metadata["name"] != request.get("name")
+            or metadata.get("namespace") not in (None, self.namespace)
+            or not isinstance(target, dict)
+            or target.get("kind") != "Node"
+            or target.get("apiVersion") not in (None, "", "v1")
+            or not isinstance(target.get("name"), str)
+            or not target["name"]
+            or target.get("namespace") not in (None, "")
+        ):
+            return False, "Binding Pod or Node identity is invalid"
+        pod = self.api.request(
+            "GET",
+            f"/api/v1/namespaces/{self.namespace}/pods/{quote(metadata['name'], safe='')}",
+        )
+        pod_metadata, pod_spec = pod.get("metadata"), pod.get("spec")
+        if (
+            not isinstance(pod_metadata, dict)
+            or pod_metadata.get("name") != metadata["name"]
+            or pod_metadata.get("namespace") != self.namespace
+            or pod_metadata.get("uid") != metadata["uid"]
+            or pod_metadata.get("deletionTimestamp") is not None
+            or not isinstance(pod_spec, dict)
+            or pod_spec.get("nodeName")
+        ):
+            return False, "Binding Pod is missing, changed, deleting, or already assigned"
+        node = self.api.request("GET", f"/api/v1/nodes/{quote(target['name'], safe='')}")
+        node_metadata, spec = node.get("metadata"), node.get("spec")
+        if (
+            not isinstance(node_metadata, dict)
+            or node_metadata.get("name") != target["name"]
+            or not isinstance(node_metadata.get("uid"), str)
+            or not node_metadata["uid"]
+            or not isinstance(node_metadata.get("resourceVersion"), str)
+            or not node_metadata["resourceVersion"]
+            or node_metadata.get("deletionTimestamp") is not None
+            or target.get("uid") not in (None, "", node_metadata["uid"])
+            or not isinstance(spec, dict)
+            or ("unschedulable" in spec and type(spec["unschedulable"]) is not bool)
+        ):
+            return False, "Binding Node observation is invalid"
+        annotations = node_metadata.get("annotations", {})
+        if not isinstance(annotations, dict):
+            return False, "Binding Node authority is invalid"
+        if spec.get("unschedulable") or any(
+            key in annotations
+            for key in (
+                "fleetright.io/plan-id",
+                "fleetright.io/operation-id",
+                "fleetright.io/fencing-token",
+            )
+        ):
+            return False, "Binding to a cordoned or FleetRight draining Node is denied"
+        return True, ""
+
     def _admit_eviction(self, request: dict[str, Any]) -> tuple[bool, str]:
         eviction = request.get("object")
         resource = request.get("resource")
@@ -580,6 +673,8 @@ class PodCreateAdmission:
             or spec.get("executionProtocol") != "monotonic-scale-up-v1"
             or spec.get("podCreateProtocol") != "reserved-create-v1"
             or spec.get("podCreateAdmissionProtocol") != POD_CREATE_ADMISSION_PROTOCOL
+            or not isinstance(spec.get("placement"), dict)
+            or spec["placement"].get("requirePodAntiAffinity") is not True
             or type(generation) is not int
             or status.get("observedGeneration") != generation
             or status.get("pendingPodCreate") is not None
@@ -633,6 +728,8 @@ class PodCreateAdmission:
             )
             or retirement.get("workloadUID") != workload_uid
             or (retirement.get("planID"), retirement.get("operationID")) != (plan_id, operation_id)
+            or type(retirement.get("readinessStabilizationMs")) is not int
+            or retirement["readinessStabilizationMs"] < 0
             or retirement.get("replicaID") != source_metadata["labels"][REPLICA_ID_LABEL]
             or str(retirement.get("workloadGeneration"))
             != source_metadata["annotations"].get(WORKLOAD_GENERATION_ANNOTATION)
@@ -642,9 +739,8 @@ class PodCreateAdmission:
             or annotations.get("fleetright.io/replacement-node-uid")
             != retirement["replacementNodeUID"]
             or retirement["replacementPodUID"] == source_metadata["uid"]
+            or retirement["replacementReplicaID"] == retirement["replicaID"]
             or retirement["replacementNodeName"] == retirement["sourceNodeName"]
-            or retirement["replacementReplicaID"]
-            != f"{owner['name']}-{execution_request['expectedReplicas']}"
         ):
             return False, "Eviction retirement source or replacement binding is invalid"
         approved = {node["name"]: node["uid"] for node in spec["placement"]["allowedNodes"]}
@@ -698,7 +794,7 @@ class PodCreateAdmission:
             or replacement["spec"].get("nodeName") != retirement["replacementNodeName"]
             or replacement_record not in status.get("authorizedPodCreates", [])
             or not _has_create_authorization(replacement, workload)
-            or not _pod_ready(replacement)
+            or not _pod_ready_stable(replacement, retirement["readinessStabilizationMs"])
         ):
             return False, "Eviction replacement Pod identity or readiness changed"
         _validate_scheduled_pod(source, approved, nodes)

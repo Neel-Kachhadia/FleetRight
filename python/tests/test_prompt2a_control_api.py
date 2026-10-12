@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import base64
 import json
 import multiprocessing
 import os
 import secrets
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -21,6 +23,7 @@ from pathlib import Path
 import fleetright.api as api_module
 import psycopg
 import pytest
+import yaml
 from fastapi.testclient import TestClient
 from fleetright.api import MAX_REQUEST_BYTES, Principal, create_app
 from fleetright.control import (
@@ -48,6 +51,135 @@ from psycopg.types.json import Jsonb
 class Database:
     repository: Repository
     dsn: str = field(repr=False)
+
+
+class _LiveHealthyObserver:
+    def observe(self, _workload_id: str, **_kwargs: object) -> dict[str, object]:
+        return {
+            "ready": True,
+            "fresh_sample": True,
+            "healthy": True,
+            "p99_within_slo": True,
+            "error_rate_within_slo": True,
+            "queue_growth_within_limit": True,
+            "observed_at_ms": time.time_ns() // 1_000_000,
+        }
+
+
+def _run_live_drain_controller_until_two_done(
+    dsn_file: str,
+    kubeconfig: str,
+    plan_id: str,
+    controller_id: str,
+    pending_marker: str,
+    release_marker: str,
+    admitted_marker: str,
+    eviction_log: str,
+    diagnostics_file: str,
+    target_errors_file: str,
+) -> None:
+    repository = Repository(Path(dsn_file).read_text(encoding="utf-8").strip())
+    target = FleetRightWorkloadTarget(kubeconfig=kubeconfig, namespace="fleetright-v2")
+    real_kubectl = target._kubectl
+    eviction_count = 0
+
+    def trace_kubectl(*args: str, stdin: str | None = None):
+        nonlocal eviction_count
+        eviction = next((arg for arg in args if arg.endswith("/eviction")), None)
+        if eviction is None:
+            return real_kubectl(*args, stdin=stdin)
+        eviction_count += 1
+        if eviction_count == 3:
+            Path(pending_marker).write_text("third-eviction-pending", encoding="ascii")
+            deadline = time.monotonic() + 3_600
+            while time.monotonic() < deadline and not Path(release_marker).exists():
+                time.sleep(0.05)
+        with Path(eviction_log).open("a", encoding="utf-8") as output:
+            output.write(json.dumps(eviction) + "\n")
+        try:
+            response = real_kubectl(*args, stdin=stdin)
+        except Exception as error:
+            with Path(target_errors_file).open("a", encoding="utf-8") as output:
+                output.write(
+                    json.dumps(
+                        {
+                            "path": eviction,
+                            "error_type": type(error).__name__,
+                            "reason": str(error),
+                        }
+                    )
+                    + "\n"
+                )
+            raise
+        if eviction_count == 3:
+            Path(admitted_marker).write_text("third-eviction-admitted", encoding="ascii")
+            threading.Event().wait(3_600)
+        return response
+
+    target._kubectl = trace_kubectl  # type: ignore[method-assign]
+    controller = ExecutionController(
+        repository,
+        target,
+        _LiveHealthyObserver(),
+        controller_id,
+        readiness_timeout_seconds=300,
+        poll_seconds=0.1,
+    )
+    deadline = time.monotonic() + 300
+    try:
+        while time.monotonic() < deadline:
+            controller.run_once()
+            with repository.transaction() as conn:
+                execution = conn.execute(
+                    "SELECT status, controller_id, controller_fencing_token "
+                    "FROM plan_executions WHERE plan_id = %s",
+                    (plan_id,),
+                ).fetchone()
+                actions = conn.execute(
+                    "SELECT action_sequence, action_type, execution_state, execution_error, "
+                    "execution_result FROM action_intents WHERE plan_id = %s "
+                    "ORDER BY action_sequence",
+                    (plan_id,),
+                ).fetchall()
+            action_diagnostics = []
+            for action in actions:
+                result = action["execution_result"]
+                progress = result.get("progress", []) if isinstance(result, dict) else []
+                action_diagnostics.append(
+                    {
+                        "sequence": action["action_sequence"],
+                        "type": action["action_type"],
+                        "state": action["execution_state"],
+                        "error": action["execution_error"],
+                        "stages": [
+                            item.get("result", {}).get("stage")
+                            for item in progress
+                            if isinstance(item, dict) and isinstance(item.get("result"), dict)
+                        ][-8:],
+                    }
+                )
+            Path(diagnostics_file).write_text(
+                json.dumps(
+                    {
+                        "execution": {
+                            "status": execution["status"],
+                            "controller_id": execution["controller_id"],
+                            "fencing_token": execution["controller_fencing_token"],
+                        },
+                        "actions": action_diagnostics,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            status = execution["status"]
+            if status in {"FAILED_SAFE", "COMPENSATING", "COMMITTED"}:
+                Path(pending_marker).write_text(f"stopped:{status}", encoding="ascii")
+                return
+            time.sleep(0.1)
+        Path(pending_marker).write_text("timeout", encoding="ascii")
+    except BaseException as error:
+        Path(pending_marker).write_text(f"error:{type(error).__name__}", encoding="ascii")
+        raise
 
 
 def _run_docker_e2e_controller(
@@ -804,13 +936,14 @@ def test_v2_plan_publishes_journaled_replacement_intent(
                     "availabilityFloor": 1,
                     "surgeBudget": 2,
                     "placement": {
+                        "requirePodAntiAffinity": True,
                         "allowedNodes": [
                             {
                                 "name": item["node_id"],
                                 "uid": item["node_uid"],
                             }
                             for item in snapshot["evacuation_v2"]["nodes"]
-                        ]
+                        ],
                     },
                 },
                 "status": {
@@ -908,7 +1041,7 @@ def test_v2_plan_publishes_journaled_replacement_intent(
             },
             json={"snapshot": snapshot},
         )
-        assert created.status_code == 201
+        assert created.status_code == 201, created.text
         plan = created.json()
         assert plan["state"] == "VERIFIED"
         assert plan["verification_accepted"] is True and plan["admission_accepted"] is True
@@ -931,6 +1064,15 @@ def test_v2_plan_publishes_journaled_replacement_intent(
                 "WHERE plan_id = %s ORDER BY action_sequence",
                 (plan["plan_id"],),
             ).fetchall()
+        decoded_plan = api_module.decode_text(
+            "fleetright.v2.EvacuationPlan",
+            "fleetright/v2/evacuation.proto",
+            artifacts["plan.pb"],
+        )
+        plan_summary = api_module._evacuation_plan_summary(decoded_plan)
+        assert plan_summary["mode"] == 0
+        assert plan_summary["evacuations"][0]["sequence"] == 0
+        assert action["payload"]["sequence"] == 0
         api_module._verify_source_retirement_actions(artifacts, plan["plan_id"], 2, journal_actions)
         forged_actions = deepcopy(journal_actions)
         forged_actions[0]["payload"]["source_pod_uid"] = "different-source"
@@ -1005,8 +1147,17 @@ def test_v2_plan_publishes_journaled_replacement_intent(
     os.getenv("FLEETRIGHT_RUN_KIND_E2E") != "1",
     reason="set FLEETRIGHT_RUN_KIND_E2E=1 for live API-to-workload execution",
 )
+@pytest.mark.parametrize(
+    ("takeover_after_eviction_acceptance", "health_regression"),
+    [(False, False), (True, False), (False, True)],
+    ids=["api-evacuation", "takeover-held-response", "health-compensation"],
+)
 def test_live_v2_api_journal_controller_prepares_replacement(
-    clean_database: Database, monkeypatch: pytest.MonkeyPatch
+    clean_database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    takeover_after_eviction_acceptance: bool,
+    health_regression: bool,
 ) -> None:
     from test_evacuation_v2 import _v2_snapshot
 
@@ -1014,19 +1165,22 @@ def test_live_v2_api_journal_controller_prepares_replacement(
         "FLEETRIGHT_LAB_ADMIN_KUBECONFIG",
         "/home/neel/.cache/fleetright/safety-lab.kubeconfig",
     )
-    context = "kind-fleetright-safety-lab"
+    context = os.getenv("FLEETRIGHT_LAB_CONTEXT", "kind-fleetright-safety-lab")
 
     def kubectl(
         *args: str, check: bool = True, **kwargs: object
     ) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
+        result = subprocess.run(
             ["kubectl", f"--kubeconfig={kubeconfig}", f"--context={context}", *args],
             capture_output=True,
-            check=check,
+            check=False,
             text=True,
             timeout=kwargs.pop("timeout", 30),  # type: ignore[arg-type]
             **kwargs,
         )
+        if check and result.returncode:
+            pytest.fail(f"kubectl {' '.join(args)} failed: {result.stderr.strip()}")
+        return result
 
     assert kubectl("config", "current-context").stdout.strip() == context
     nodes = json.loads(kubectl("get", "nodes", "-o", "json").stdout)["items"]
@@ -1044,9 +1198,17 @@ def test_live_v2_api_journal_controller_prepares_replacement(
         node
         for node in ready_nodes
         if not any(key.endswith("/control-plane") for key in node["metadata"].get("labels", {}))
+        and not node.get("spec", {}).get("unschedulable", False)
+        and not any(
+            taint.get("effect") in {"NoSchedule", "NoExecute"}
+            for taint in node.get("spec", {}).get("taints", [])
+        )
     ]
-    assert len(workers) >= 2
-    workload_id = f"p2b-api-{uuid.uuid4().hex[:10]}"
+    assert len(workers) >= 4
+    schedulable_workers = workers[:5]
+    placement_nodes = list(schedulable_workers)
+    # Keep two real destination domains available in the four-worker lab.
+    workload_id = "cpu-api"
     plan_key = f"p2b-api-plan-{uuid.uuid4().hex[:12]}"
     workload = {
         "apiVersion": "fleetright.io/v1alpha1",
@@ -1057,22 +1219,22 @@ def test_live_v2_api_journal_controller_prepares_replacement(
             "executionProtocol": "monotonic-scale-up-v1",
             "podCreateProtocol": "reserved-create-v1",
             "podCreateAdmissionProtocol": "claimed-create-v1",
-            "replicas": 3,
-            "availabilityFloor": 2,
+            "replicas": 2,
+            "availabilityFloor": 1,
             "surgeBudget": 2,
             "networkMbps": 0,
             "disruption": {"maxConcurrentDisruptions": 1},
             "placement": {
                 "allowedNodes": [
                     {"name": node["metadata"]["name"], "uid": node["metadata"]["uid"]}
-                    for node in ready_nodes[:5]
+                    for node in placement_nodes
                 ],
                 "topology": {
                     "key": "kubernetes.io/hostname",
                     "maxSkew": 1,
                     "minDomains": 2,
                 },
-                "requirePodAntiAffinity": False,
+                "requirePodAntiAffinity": True,
             },
             "podTemplate": {
                 "containers": [
@@ -1085,27 +1247,138 @@ def test_live_v2_api_journal_controller_prepares_replacement(
                         "resources": {"requests": {"cpu": "100m", "memory": "64Mi"}},
                     }
                 ],
-                "tolerations": [
-                    {
-                        "key": "node-role.kubernetes.io/control-plane",
-                        "operator": "Exists",
-                        "effect": "NoSchedule",
-                    },
-                    {
-                        "key": "node-role.kubernetes.io/master",
-                        "operator": "Exists",
-                        "effect": "NoSchedule",
-                    },
-                ],
             },
         },
     }
     kubectl("apply", "-f", "-", input=json.dumps(workload))
-    target = FleetRightWorkloadTarget(kubeconfig=kubeconfig, namespace="fleetright-v2")
+    token = kubectl(
+        "create",
+        "token",
+        "fleetright-controller",
+        "-n",
+        "fleetright",
+        "--duration=30m",
+    ).stdout.strip()
+    admin_config = yaml.safe_load(Path(kubeconfig).read_text(encoding="utf-8"))
+    context_entry = next(item for item in admin_config["contexts"] if item["name"] == context)
+    cluster_name = context_entry["context"]["cluster"]
+    cluster = next(
+        item["cluster"] for item in admin_config["clusters"] if item["name"] == cluster_name
+    )
+    certificate = cluster.get("certificate-authority-data")
+    if certificate is None:
+        certificate = base64.b64encode(Path(cluster["certificate-authority"]).read_bytes()).decode(
+            "ascii"
+        )
+    executor_config = tmp_path / "fleetright-executor.kubeconfig"
+    executor_config.write_text(
+        yaml.safe_dump(
+            {
+                "apiVersion": "v1",
+                "kind": "Config",
+                "clusters": [
+                    {
+                        "name": "fleetright-lab",
+                        "cluster": {
+                            "server": cluster["server"],
+                            "certificate-authority-data": certificate,
+                        },
+                    }
+                ],
+                "users": [{"name": "fleetright-controller", "user": {"token": token}}],
+                "contexts": [
+                    {
+                        "name": "fleetright-executor",
+                        "context": {
+                            "cluster": "fleetright-lab",
+                            "user": "fleetright-controller",
+                            "namespace": "fleetright-v2",
+                        },
+                    }
+                ],
+                "current-context": "fleetright-executor",
+            }
+        ),
+        encoding="utf-8",
+    )
+    executor_config.chmod(0o600)
+    target = FleetRightWorkloadTarget(kubeconfig=str(executor_config), namespace="fleetright-v2")
+    target_commands: list[tuple[tuple[str, ...], str]] = []
+    real_target_kubectl = target._kubectl
+    held_source_name: str | None = None
+    eviction_response_ready = threading.Event()
+    release_eviction_response = threading.Event()
+    eviction_attempts: list[tuple[str, ...]] = []
+    controller_thread: threading.Thread | None = None
+    takeover_controller: ExecutionController | None = None
+    controller_errors: list[Exception] = []
+    final_retirement_checks: list[dict[str, object]] = []
+    real_final_retirement_check = target._verify_final_retirement_pods
+
+    def trace_final_retirement_check(
+        current: dict[str, object], payload: dict[str, object], final_replicas: int
+    ) -> bool:
+        result = real_final_retirement_check(current, payload, final_replicas)
+        if not result:
+            pods = target._json(
+                "get",
+                "pods",
+                "-n",
+                "fleetright-v2",
+                "-l",
+                f"fleetright.io/workload-uid={current['uid']}",
+                "-o",
+                "json",
+            ).get("items", [])
+            final_retirement_checks.append(
+                {
+                    "expected_replicas": final_replicas,
+                    "pods": [
+                        {
+                            "name": pod.get("metadata", {}).get("name"),
+                            "uid": pod.get("metadata", {}).get("uid"),
+                            "slot": pod.get("metadata", {}).get("labels", {}).get(REPLICA_ID_LABEL),
+                            "node": pod.get("spec", {}).get("nodeName"),
+                            "phase": pod.get("status", {}).get("phase"),
+                            "ready": any(
+                                condition.get("type") == "Ready"
+                                and condition.get("status") == "True"
+                                for condition in pod.get("status", {}).get("conditions", [])
+                                if isinstance(condition, dict)
+                            ),
+                        }
+                        for pod in pods
+                        if isinstance(pod, dict)
+                    ],
+                }
+            )
+        return result
+
+    target._verify_final_retirement_pods = trace_final_retirement_check  # type: ignore[method-assign]
+
+    def trace_target_kubectl(*args: str, stdin: str | None = None):
+        command = tuple(args)
+        try:
+            result = real_target_kubectl(*args, stdin=stdin)
+        except Exception as error:
+            target_commands.append(
+                (command, f"{type(error).__name__}:{getattr(error, 'reason', str(error))}")
+            )
+            raise
+        if any(arg.endswith("/eviction") for arg in command):
+            eviction_attempts.append(command)
+            if takeover_after_eviction_acceptance and len(eviction_attempts) == 1:
+                eviction_response_ready.set()
+                if not release_eviction_response.wait(60):
+                    raise TimeoutError("accepted Eviction response was not released")
+        target_commands.append((command, "ok"))
+        return result
+
+    target._kubectl = trace_target_kubectl  # type: ignore[method-assign]
     try:
         deadline = time.monotonic() + 120
         observed = target.observe_scale(workload_id)
-        while observed["ready_replicas"] != 3 or observed["available_replicas"] != 3:
+        while observed["ready_replicas"] != 2 or observed["available_replicas"] != 2:
             assert time.monotonic() < deadline, observed
             time.sleep(1)
             observed = target.observe_scale(workload_id)
@@ -1122,17 +1395,17 @@ def test_live_v2_api_journal_controller_prepares_replacement(
             ).stdout
         )["items"]
         pod_by_slot = {pod["metadata"]["labels"][REPLICA_ID_LABEL]: pod for pod in pod_list}
-        assert len(pod_by_slot) == 3
+        assert len(pod_by_slot) == 2
         now_ms = time.time_ns() // 1_000_000
         source, _, _ = _v2_snapshot(now_ms)
         source["snapshot_id"] = f"{workload_id}-snapshot"
-        source["workloads"][0]["workload_id"] = workload_id
         source["workloads"][0]["topology_key"] = "kubernetes.io/hostname"
         source["workloads"][0]["min_topology_domains"] = 2
         source["workloads"][0]["max_topology_skew"] = 1
+        source["workloads"][0]["availability_floor"] = 1
         source["capacity_profiles"][0]["workload_id"] = workload_id
-        source["nodes"] = source["nodes"][:5]
-        model_nodes = [node["metadata"]["name"] for node in ready_nodes[:5]]
+        source["nodes"] = source["nodes"][: len(placement_nodes)]
+        model_nodes = [node["metadata"]["name"] for node in placement_nodes]
         model_by_id = {node["node_id"]: node for node in source["nodes"]}
         for index, node_name in enumerate(model_nodes):
             model = list(model_by_id.values())[index]
@@ -1140,7 +1413,7 @@ def test_live_v2_api_journal_controller_prepares_replacement(
             model["active"] = True
             model["health"] = "NODE_HEALTH_HEALTHY"
             model["labels"] = [("kubernetes.io/hostname", node_name)]
-        ordered_pods = [pod_by_slot[f"{workload_id}-{ordinal}"] for ordinal in range(3)]
+        ordered_pods = [pod_by_slot[f"{workload_id}-{ordinal}"] for ordinal in range(2)]
         source["current_placements"] = [
             {
                 "workload_id": workload_id,
@@ -1190,7 +1463,7 @@ def test_live_v2_api_journal_controller_prepares_replacement(
             "pod_template_sha256": _placement_fingerprint(
                 workload["spec"], workload["spec"]["podTemplate"]
             ),
-            "desired_replicas": 3,
+            "desired_replicas": 2,
             "pdb_allowed_disruptions": pdb["status"]["disruptionsAllowed"],
             "pdb_resource_version": pdb["metadata"]["resourceVersion"],
             "observed_at_ms": now_ms,
@@ -1211,7 +1484,42 @@ def test_live_v2_api_journal_controller_prepares_replacement(
         tokens, raw_tokens = _tokens()
 
         class HealthyObserver:
+            source_pod_name: str | None = None
+            plan_id: str | None = None
+            intent_id: str | None = None
+            regression_sent = False
+
             def observe(self, _workload_id: str, **_kwargs: object) -> dict[str, object]:
+                retirement_verified = False
+                if health_regression and self.plan_id and self.intent_id:
+                    with clean_database.repository.transaction() as conn:
+                        state = conn.execute(
+                            "SELECT e.status, a.execution_state FROM plan_executions e "
+                            "JOIN action_intents a USING (plan_id) "
+                            "WHERE e.plan_id = %s AND a.intent_id = %s",
+                            (self.plan_id, self.intent_id),
+                        ).fetchone()
+                    retirement_verified = state is not None and (
+                        state["status"],
+                        state["execution_state"],
+                    ) == ("VERIFYING", "SUCCEEDED")
+                if (
+                    health_regression
+                    and self.source_pod_name
+                    and retirement_verified
+                    and not self.regression_sent
+                    and target.get_pod(self.source_pod_name) is None
+                ):
+                    self.regression_sent = True
+                    return {
+                        "ready": True,
+                        "fresh_sample": True,
+                        "healthy": False,
+                        "p99_within_slo": False,
+                        "error_rate_within_slo": True,
+                        "queue_growth_within_limit": True,
+                        "observed_at_ms": time.time_ns() // 1_000_000,
+                    }
                 return {
                     "ready": True,
                     "fresh_sample": True,
@@ -1222,15 +1530,18 @@ def test_live_v2_api_journal_controller_prepares_replacement(
                     "observed_at_ms": time.time_ns() // 1_000_000,
                 }
 
+        health_observer = HealthyObserver()
+        monkeypatch.setenv("FLEETRIGHT_READINESS_TIMEOUT_SECONDS", "300")
         app = create_app(
             clean_database.repository,
             tokens=tokens,
             mode="EXECUTE",
             execution_target="kubernetes-workload",
             target_adapter=target,
-            health_observer=HealthyObserver(),
+            health_observer=health_observer,
             start_execution_worker=False,
         )
+        assert app.state.execution_controller.readiness_timeout_seconds == 300
         with TestClient(app) as client:
             optimized = client.post(
                 "/v1/optimize",
@@ -1245,6 +1556,11 @@ def test_live_v2_api_journal_controller_prepares_replacement(
             assert plan["state"] == "VERIFIED", plan
             assert len(plan["candidate_actions"]) == 1, plan["candidate_actions"]
             assert plan["candidate_actions"][0]["action_type"] == "PREPARE_SOURCE_RETIREMENT"
+            health_observer.plan_id = plan["plan_id"]
+            health_observer.intent_id = plan["candidate_actions"][0]["intent_id"]
+            health_observer.source_pod_name = plan["candidate_actions"][0]["payload"][
+                "source_pod_name"
+            ]
             operator = f"Bearer {raw_tokens['operator']}"
             approved = client.post(
                 f"/v1/plans/{plan['plan_id']}/approve",
@@ -1252,15 +1568,111 @@ def test_live_v2_api_journal_controller_prepares_replacement(
                 json={},
             )
             assert approved.status_code == 200, approved.text
+            if takeover_after_eviction_acceptance:
+                held_source_name = plan["candidate_actions"][0]["payload"]["source_pod_name"]
+                kubectl(
+                    "patch",
+                    "pod",
+                    held_source_name,
+                    "-n",
+                    "fleetright-v2",
+                    "--type=merge",
+                    "-p",
+                    json.dumps({"metadata": {"finalizers": ["fleetright.io/prompt2b-test-hold"]}}),
+                )
             accepted = client.post(
                 f"/v1/plans/{plan['plan_id']}/execute",
                 headers={"Authorization": operator, "Idempotency-Key": f"execute-{plan_key}"},
                 json={},
             )
             assert accepted.status_code == 202, accepted.text
-            deadline = time.monotonic() + 180
+            if takeover_after_eviction_acceptance:
+
+                def run_old_controller() -> None:
+                    try:
+                        deadline = time.monotonic() + 180
+                        while not eviction_response_ready.is_set() and time.monotonic() < deadline:
+                            app.state.execution_controller.run_once()
+                            eviction_response_ready.wait(0.25)
+                    except Exception as error:
+                        controller_errors.append(error)
+
+                controller_thread = threading.Thread(target=run_old_controller, daemon=True)
+                controller_thread.start()
+                assert eviction_response_ready.wait(180), (
+                    "Kubernetes did not accept Eviction; "
+                    f"controller_errors={controller_errors}, "
+                    f"target_commands={target_commands[-12:]}"
+                )
+                source_in_progress = target.get_pod(held_source_name)
+                assert source_in_progress is not None
+                assert source_in_progress["metadata"].get("deletionTimestamp") is not None
+                assert len(eviction_attempts) == 1
+                with clean_database.repository.transaction() as conn:
+                    conn.execute(
+                        "UPDATE plan_executions SET controller_lease_expires_at = "
+                        "clock_timestamp() WHERE plan_id = %s",
+                        (plan["plan_id"],),
+                    )
+                takeover_controller = ExecutionController(
+                    clean_database.repository,
+                    target,
+                    health_observer,
+                    f"kind-eviction-takeover-{uuid.uuid4().hex[:8]}",
+                    readiness_timeout_seconds=300,
+                )
+                takeover_controller.run_once()
+                held_detail = client.get(
+                    f"/v1/plans/{plan['plan_id']}",
+                    headers={"Authorization": f"Bearer {raw_tokens['viewer']}"},
+                ).json()
+                held_action = held_detail["candidate_actions"][0]
+                held_stages = [
+                    item.get("result", {}).get("stage")
+                    for item in held_action["execution_result"].get("progress", [])
+                    if isinstance(item, dict) and isinstance(item.get("result"), dict)
+                ]
+                assert held_detail["execution"]["status"] == "EXECUTING"
+                assert held_action["execution_state"] == "RUNNING"
+                assert "EVICTION_IN_PROGRESS" in held_stages
+                assert len(eviction_attempts) == 1
+
+                release_eviction_response.set()
+                controller_thread.join(timeout=30)
+                assert not controller_thread.is_alive(), (
+                    "old controller did not release its response"
+                )
+                assert len(controller_errors) == 1
+                assert isinstance(controller_errors[0], ControlError), controller_errors[0]
+                assert len(eviction_attempts) == 1
+                stale_detail = client.get(
+                    f"/v1/plans/{plan['plan_id']}",
+                    headers={"Authorization": f"Bearer {raw_tokens['viewer']}"},
+                ).json()
+                stale_progress = stale_detail["candidate_actions"][0]["execution_result"].get(
+                    "progress", []
+                )
+                assert not any(
+                    isinstance(item, dict)
+                    and isinstance(item.get("result"), dict)
+                    and item["result"].get("stage") == "EVICTION_ACCEPTED"
+                    for item in stale_progress
+                )
+                kubectl(
+                    "patch",
+                    "pod",
+                    held_source_name,
+                    "-n",
+                    "fleetright-v2",
+                    "--type=merge",
+                    "-p",
+                    json.dumps({"metadata": {"finalizers": []}}),
+                    check=False,
+                )
+            expected_status = "COMPENSATED" if health_regression else "COMMITTED"
+            deadline = time.monotonic() + 300
             while time.monotonic() < deadline:
-                app.state.execution_controller.run_once()
+                (takeover_controller or app.state.execution_controller).run_once()
                 detail = client.get(
                     f"/v1/plans/{plan['plan_id']}",
                     headers={"Authorization": f"Bearer {raw_tokens['viewer']}"},
@@ -1268,18 +1680,200 @@ def test_live_v2_api_journal_controller_prepares_replacement(
                 action = detail["candidate_actions"][0]
                 progress = action.get("execution_result", {}).get("progress", [])
                 latest = progress[-1].get("result", {}) if progress else {}
-                if latest.get("stage") == "READY_FOR_SAFE_EVICTION":
+                if detail["execution"]["status"] == expected_status:
                     break
-                assert detail["execution"]["status"] not in {"FAILED_SAFE", "COMPENSATING"}, detail
+                if detail["execution"]["status"] == "FAILED_SAFE" or (
+                    detail["execution"]["status"] == "COMPENSATING" and not health_regression
+                ):
+                    progress_stages = [
+                        item["result"].get("stage")
+                        for item in progress[-10:]
+                        if isinstance(item, dict) and isinstance(item.get("result"), dict)
+                    ]
+                    pytest.fail(
+                        f"execution stopped: {detail['execution']}, "
+                        f"error={action.get('execution_error')}, latest={latest}, "
+                        f"stages={progress_stages}, "
+                        f"started_at={action.get('execution_started_at')}, "
+                        f"timeout={app.state.execution_controller.readiness_timeout_seconds}, "
+                        f"final_checks={final_retirement_checks[-5:]}, "
+                        f"commands={target_commands[-20:]}"
+                    )
                 time.sleep(0.5)
-            assert latest.get("stage") == "READY_FOR_SAFE_EVICTION", detail
-            source_pod = target.get_pod(plan["candidate_actions"][0]["payload"]["source_pod_name"])
-            assert source_pod is not None
-            assert source_pod["metadata"].get("deletionTimestamp") is None
-            replacement_uid = latest.get("replacement_pod_uid")
+            if detail["execution"]["status"] != expected_status:
+                stages = [
+                    item["result"].get("stage")
+                    for item in progress
+                    if isinstance(item, dict) and isinstance(item.get("result"), dict)
+                ]
+                eviction_commands = [
+                    item
+                    for item in target_commands
+                    if len(item[0]) > 2
+                    and item[0][0] == "create"
+                    and item[0][1] == "--raw"
+                    and item[0][2].endswith("/eviction")
+                ]
+                current = target.observe_scale(workload_id)
+                target_state = {
+                    key: current.get(key)
+                    for key in (
+                        "uid",
+                        "generation",
+                        "observed_generation",
+                        "replicas",
+                        "observed_replicas",
+                        "ready_replicas",
+                        "available_replicas",
+                        "reconciled",
+                        "fencing_token",
+                        "execution_request",
+                        "execution",
+                        "pending_pod_create",
+                        "pod_create_history_uncertain",
+                        "unverified_pod_creates",
+                        "retired_replica_slots",
+                        "authorized_pod_creates",
+                    )
+                }
+                pytest.fail(
+                    f"retirement did not complete: plan={detail.get('state')}, "
+                    f"execution={detail.get('execution', {}).get('status')}, "
+                    f"action={action.get('execution_state')}, "
+                    f"error={action.get('execution_error')}, "
+                    f"stages={stages[-5:]}, latest={latest.get('stage')}:{latest.get('reason')}, "
+                    f"started_at={action.get('execution_started_at')}, "
+                    f"timeout={app.state.execution_controller.readiness_timeout_seconds}, "
+                    f"final_checks={final_retirement_checks[-5:]}, "
+                    f"eviction_commands={eviction_commands}, "
+                    f"target={target_state}, commands={target_commands[-15:]}"
+                )
+            assert detail["execution"]["status"] == expected_status, detail
+            if not health_regression:
+                assert action.get("execution_state") == "SUCCEEDED"
+            stages = [
+                item["result"].get("stage")
+                for item in progress
+                if isinstance(item, dict) and isinstance(item.get("result"), dict)
+            ]
+            assert "READY_FOR_SAFE_EVICTION" in stages
+            assert "EVICTION_INTENT" in stages
+            if takeover_after_eviction_acceptance:
+                assert "EVICTION_IN_PROGRESS" in stages
+                assert "EVICTION_ACCEPTED" not in stages
+            else:
+                assert "EVICTION_ACCEPTED" in stages
+            source_payload = plan["candidate_actions"][0]["payload"]
+            completion = action["execution_result"]["result"]
+            assert completion["stage"] == "RETIREMENT_COMPLETE"
+            final_observation = completion["observation"]
+            assert final_observation["ready_replicas"] == source_payload["final_desired_replicas"]
+            assert (
+                final_observation["available_replicas"] == source_payload["final_desired_replicas"]
+            )
+            assert target.get_pod(source_payload["source_pod_name"]) is None
+            replacement_uid = completion.get("replacement_pod_uid")
             assert isinstance(replacement_uid, str) and replacement_uid
-            assert clean_database.repository.get_plan(plan["plan_id"])["state"] == "APPROVED"
+            replacement = target.get_pod(completion["replacement_pod_name"])
+            assert replacement is not None
+            assert replacement["metadata"]["uid"] == replacement_uid
+            assert replacement["spec"]["nodeName"] in source_payload["destination_node_ids"]
+            assert replacement["spec"]["nodeName"] != source_payload["source_node_id"]
+            assert {
+                "topologyKey": "kubernetes.io/hostname",
+                "labelSelector": {"matchLabels": {"fleetright.io/workload-uid": observed["uid"]}},
+            } in replacement["spec"].get("affinity", {}).get("podAntiAffinity", {}).get(
+                "requiredDuringSchedulingIgnoredDuringExecution", []
+            )
+            if takeover_after_eviction_acceptance:
+                assert len(eviction_attempts) == 1
+                assert detail["execution"]["controller_id"] == takeover_controller.controller_id
+            assert health_observer.regression_sent is health_regression
+            if health_regression:
+                compensation_actions = [
+                    item
+                    for item in detail["candidate_actions"]
+                    if item["compensates_intent_id"] == action["intent_id"]
+                ]
+                assert len(compensation_actions) == 1
+                compensation = compensation_actions[0]
+                assert compensation["action_type"] == "SET_REPLICA_COUNT"
+                assert compensation["execution_state"] == "SUCCEEDED"
+                assert compensation["payload"]["proposed_replicas"] == 4
+                assert compensation["execution_result"]["target_observation"]["ready_replicas"] == 4
+                recovered = target.observe_scale(workload_id)
+                assert recovered["replicas"] == recovered["observed_replicas"] == 4
+                assert recovered["ready_replicas"] == recovered["available_replicas"] == 4
+                assert recovered["reconciled"] is True
+                recovered_pods = kubectl(
+                    "get",
+                    "pods",
+                    "-n",
+                    "fleetright-v2",
+                    "-l",
+                    f"fleetright.io/workload-uid={recovered['uid']}",
+                    "-o",
+                    "json",
+                )
+                live_pods = json.loads(recovered_pods.stdout)["items"]
+                live_nodes = {pod["spec"]["nodeName"] for pod in live_pods}
+                approved_nodes = {item["name"]: item["uid"] for item in recovered["approved_nodes"]}
+                assert len(live_pods) == len(live_nodes) == 4
+                assert live_nodes <= approved_nodes.keys()
+                compensation_creates = [
+                    item
+                    for item in recovered["authorized_pod_creates"]
+                    if item["planID"] == plan["plan_id"]
+                    and item["operationID"] == compensation["intent_id"]
+                ]
+                compensation_destinations = {
+                    item["name"] for item in compensation["payload"]["destination_nodes"]
+                }
+                assert len(compensation_creates) == 1
+                compensation_pod = next(
+                    pod
+                    for pod in live_pods
+                    if pod["metadata"]["uid"] == compensation_creates[0]["podUID"]
+                )
+                assert compensation_pod["spec"]["nodeName"] in compensation_destinations
+                assert all(
+                    {
+                        "topologyKey": "kubernetes.io/hostname",
+                        "labelSelector": {
+                            "matchLabels": {"fleetright.io/workload-uid": recovered["uid"]}
+                        },
+                    }
+                    in pod["spec"]
+                    .get("affinity", {})
+                    .get("podAntiAffinity", {})
+                    .get("requiredDuringSchedulingIgnoredDuringExecution", [])
+                    for pod in live_pods
+                )
+                actual_node_uids = {
+                    item["metadata"]["name"]: item["metadata"]["uid"]
+                    for item in json.loads(kubectl("get", "nodes", "-o", "json").stdout)["items"]
+                }
+                assert all(approved_nodes[name] == actual_node_uids[name] for name in live_nodes)
+                assert health_observer.observe(workload_id)["healthy"] is True
+                assert detail["state"] == "COMPENSATED"
+            assert clean_database.repository.get_plan(plan["plan_id"])["state"] == expected_status
     finally:
+        release_eviction_response.set()
+        if controller_thread is not None:
+            controller_thread.join(timeout=5)
+        if held_source_name is not None:
+            kubectl(
+                "patch",
+                "pod",
+                held_source_name,
+                "-n",
+                "fleetright-v2",
+                "--type=merge",
+                "-p",
+                json.dumps({"metadata": {"finalizers": []}}),
+                check=False,
+                timeout=10,
+            )
         kubectl(
             "delete",
             "fleetrightworkload",
@@ -1291,6 +1885,1102 @@ def test_live_v2_api_journal_controller_prepares_replacement(
             check=False,
             timeout=60,
         )
+
+
+@pytest.mark.skipif(
+    os.getenv("FLEETRIGHT_RUN_KIND_E2E") != "1",
+    reason="set FLEETRIGHT_RUN_KIND_E2E=1 for live API-to-workload execution",
+)
+def test_live_v2_authenticated_node_drain_partial_crash_recovery(
+    clean_database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from test_evacuation_v2 import _v2_snapshot
+
+    kubeconfig = os.getenv(
+        "FLEETRIGHT_LAB_ADMIN_KUBECONFIG", "/tmp/fleetright-prompt2b-lab.kubeconfig"
+    )
+    context = os.getenv("FLEETRIGHT_LAB_CONTEXT", "kind-fleetright-prompt2b-lab")
+    namespace = "fleetright-v2"
+
+    def kubectl(
+        *args: str, check: bool = True, **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        result = subprocess.run(
+            ["kubectl", f"--kubeconfig={kubeconfig}", f"--context={context}", *args],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=kwargs.pop("timeout", 30),  # type: ignore[arg-type]
+            **kwargs,
+        )
+        if check and result.returncode:
+            pytest.fail(f"kubectl {' '.join(args)} failed: {result.stderr.strip()}")
+        return result
+
+    assert kubectl("config", "current-context").stdout.strip() == context
+    namespace_object = json.loads(kubectl("get", "namespace", namespace, "-o", "json").stdout)
+    assert namespace_object["metadata"]["uid"] == "df488d28-0a9a-4b1c-ba5d-ff4632be9b29"
+    labels = namespace_object["metadata"].get("labels", {})
+    assert labels.get("fleetright.io/pod-create-admission") == "enabled"
+    assert labels.get("pod-security.kubernetes.io/enforce") == "restricted"
+
+    nodes = json.loads(kubectl("get", "nodes", "-o", "json").stdout)["items"]
+    ready_workers = [
+        node
+        for node in nodes
+        if any(
+            item.get("type") == "Ready" and item.get("status") == "True"
+            for item in node.get("status", {}).get("conditions", [])
+        )
+        and not any(key.endswith("/control-plane") for key in node["metadata"].get("labels", {}))
+        and not node.get("spec", {}).get("unschedulable", False)
+        and not any(
+            taint.get("effect") in {"NoSchedule", "NoExecute"}
+            for taint in node.get("spec", {}).get("taints", [])
+        )
+    ]
+    ready_workers.sort(key=lambda node: node["metadata"]["name"])
+    worker_names = [node["metadata"]["name"] for node in ready_workers]
+    assert len(ready_workers) == 4
+    existing_pods = json.loads(kubectl("get", "pods", "-A", "-o", "json").stdout)["items"]
+
+    def can_be_drained(node_name: str) -> bool:
+        for pod in existing_pods:
+            if pod.get("spec", {}).get("nodeName") != node_name:
+                continue
+            metadata = pod.get("metadata", {})
+            if metadata.get("annotations", {}).get("kubernetes.io/config.mirror"):
+                continue
+            if any(
+                owner.get("kind") == "DaemonSet" and owner.get("controller") is True
+                for owner in metadata.get("ownerReferences", [])
+            ):
+                continue
+            return False
+        return True
+
+    safe_initial_nodes = [
+        node for node in ready_workers if can_be_drained(node["metadata"]["name"])
+    ]
+    assert len(safe_initial_nodes) >= 2
+    initial_nodes = safe_initial_nodes[:2]
+    initial_node_names = {node["metadata"]["name"] for node in initial_nodes}
+    test_taint = "fleetright.io/p2b-drain-test"
+    tainted_nodes = [
+        node["metadata"]["name"]
+        for node in ready_workers
+        if node["metadata"]["name"] not in initial_node_names
+    ]
+    assert all(
+        not any(taint.get("key") == test_taint for taint in node.get("spec", {}).get("taints", []))
+        for node in ready_workers
+    )
+    workload_ids = [f"p2b-drain-{uuid.uuid4().hex[:8]}-{index}" for index in range(4)]
+    test_workloads: dict[str, str] = {}
+    source_node_id: str | None = None
+    source_node_uid: str | None = None
+    cordon_operation_id: str | None = None
+    process: multiprocessing.Process | None = None
+    plan_id: str | None = None
+    marker = tmp_path / "third-eviction-pending"
+    release_marker = tmp_path / "release-third-eviction"
+    admitted_marker = tmp_path / "third-eviction-admitted"
+    held_finalizer = "fleetright.io/p2b-drain-test"
+    eviction_log = tmp_path / "evictions.jsonl"
+    dsn_file = tmp_path / "test-database.dsn"
+    diagnostics_file = tmp_path / "drain-diagnostics.json"
+    target_errors_file = tmp_path / "target-errors.jsonl"
+    dsn_file.write_text(clean_database.dsn, encoding="utf-8")
+    dsn_file.chmod(0o600)
+
+    try:
+        for node_name in tainted_nodes:
+            kubectl("taint", "node", node_name, f"{test_taint}=true:NoSchedule")
+        for workload_id in workload_ids:
+            workload = {
+                "apiVersion": "fleetright.io/v1alpha1",
+                "kind": "FleetRightWorkload",
+                "metadata": {"name": workload_id, "namespace": namespace},
+                "spec": {
+                    "workloadID": workload_id,
+                    "executionProtocol": "monotonic-scale-up-v1",
+                    "podCreateProtocol": "reserved-create-v1",
+                    "podCreateAdmissionProtocol": "claimed-create-v1",
+                    "replicas": 2,
+                    "availabilityFloor": 1,
+                    "surgeBudget": 2,
+                    "networkMbps": 0,
+                    "disruption": {"maxConcurrentDisruptions": 1},
+                    "placement": {
+                        "allowedNodes": [
+                            {"name": node["metadata"]["name"], "uid": node["metadata"]["uid"]}
+                            for node in ready_workers
+                        ],
+                        "topology": {
+                            "key": "kubernetes.io/hostname",
+                            "maxSkew": 1,
+                            "minDomains": 2,
+                        },
+                        "requirePodAntiAffinity": True,
+                    },
+                    "podTemplate": {
+                        "containers": [
+                            {
+                                "name": "app",
+                                "image": "fleetright-workload:local",
+                                "imagePullPolicy": "IfNotPresent",
+                                "ports": [{"containerPort": 8080, "protocol": "TCP"}],
+                                "readinessProbe": {"httpGet": {"path": "/ready", "port": 8080}},
+                                "resources": {"requests": {"cpu": "100m", "memory": "64Mi"}},
+                            }
+                        ],
+                    },
+                },
+            }
+            kubectl("apply", "-f", "-", input=json.dumps(workload))
+            created = json.loads(
+                kubectl(
+                    "get", "fleetrightworkload", workload_id, "-n", namespace, "-o", "json"
+                ).stdout
+            )
+            test_workloads[workload_id] = created["metadata"]["uid"]
+
+        deadline = time.monotonic() + 180
+        workload_objects: dict[str, dict[str, object]] = {}
+        live_pods: dict[str, list[dict[str, object]]] = {}
+        while time.monotonic() < deadline:
+            ready = True
+            for workload_id in workload_ids:
+                workload_object = json.loads(
+                    kubectl(
+                        "get",
+                        "fleetrightworkload",
+                        workload_id,
+                        "-n",
+                        namespace,
+                        "-o",
+                        "json",
+                    ).stdout
+                )
+                uid = workload_object["metadata"]["uid"]
+                pods = json.loads(
+                    kubectl(
+                        "get",
+                        "pods",
+                        "-n",
+                        namespace,
+                        "-l",
+                        f"fleetright.io/workload-uid={uid}",
+                        "-o",
+                        "json",
+                    ).stdout
+                )["items"]
+                ready_pods = [
+                    pod
+                    for pod in pods
+                    if any(
+                        item.get("type") == "Ready" and item.get("status") == "True"
+                        for item in pod.get("status", {}).get("conditions", [])
+                    )
+                    and pod.get("metadata", {}).get("deletionTimestamp") is None
+                ]
+                if len(ready_pods) != 2 or {pod["spec"]["nodeName"] for pod in ready_pods} != {
+                    node["metadata"]["name"] for node in initial_nodes
+                }:
+                    ready = False
+                    break
+                workload_objects[workload_id] = workload_object
+                live_pods[workload_id] = ready_pods
+            if ready:
+                break
+            time.sleep(1)
+        else:
+            pytest.fail(f"four initial FleetRightWorkloads did not become Ready: {workload_ids}")
+
+        for node_name in tainted_nodes:
+            kubectl("taint", "node", node_name, f"{test_taint}-")
+        refreshed_nodes = json.loads(kubectl("get", "nodes", "-o", "json").stdout)["items"]
+        nodes_by_name = {node["metadata"]["name"]: node for node in refreshed_nodes}
+        ready_workers = [nodes_by_name[name] for name in worker_names]
+
+        now_ms = time.time_ns() // 1_000_000
+        source, _, _ = _v2_snapshot(now_ms)
+        source["snapshot_id"] = f"node-drain-{uuid.uuid4().hex}"
+        model_workloads: list[dict[str, object]] = []
+        model_profiles: list[dict[str, object]] = []
+        inventory_controllers: list[dict[str, object]] = []
+        inventory_pods: list[dict[str, object]] = []
+        placements: list[dict[str, str]] = []
+        model_nodes = source["nodes"][: len(ready_workers)]
+        source["nodes"] = model_nodes
+        for model_node, node in zip(model_nodes, ready_workers, strict=True):
+            node_name = node["metadata"]["name"]
+            model_node.update(
+                node_id=node_name,
+                active=True,
+                health="NODE_HEALTH_HEALTHY",
+                labels=[("kubernetes.io/hostname", node_name)],
+            )
+        for workload_id in workload_ids:
+            workload_object = workload_objects[workload_id]
+            uid = workload_object["metadata"]["uid"]
+            workload_spec = workload_object["spec"]
+            model_workload = deepcopy(source["workloads"][0])
+            model_workload.update(
+                workload_id=workload_id,
+                current_resources={
+                    "cpu_millicores": 100,
+                    "memory_mib": 64,
+                    "network_mbps": 0,
+                },
+                topology_key="kubernetes.io/hostname",
+                min_topology_domains=2,
+                max_topology_skew=1,
+                availability_floor=1,
+            )
+            model_workloads.append(model_workload)
+            profile = deepcopy(source["capacity_profiles"][0])
+            profile.update(
+                workload_id=workload_id,
+                profile_id=f"{workload_id}-profile",
+                allocation=deepcopy(model_workload["current_resources"]),
+            )
+            model_profiles.append(profile)
+            pdb = json.loads(
+                kubectl("get", "pdb", workload_id, "-n", namespace, "-o", "json").stdout
+            )
+            inventory_controllers.append(
+                {
+                    "workload_id": workload_id,
+                    "namespace": namespace,
+                    "owner_kind": "FleetRightWorkload",
+                    "owner_name": workload_id,
+                    "owner_uid": uid,
+                    "owner_resource_version": workload_object["metadata"]["resourceVersion"],
+                    "owner_generation": workload_object["metadata"]["generation"],
+                    "controller_type": "fleetright-workload-controller/v1",
+                    "execution_protocol": "monotonic-scale-up-v1",
+                    "pod_template_sha256": _placement_fingerprint(
+                        workload_spec, workload_spec["podTemplate"]
+                    ),
+                    "desired_replicas": 2,
+                    "pdb_allowed_disruptions": pdb["status"]["disruptionsAllowed"],
+                    "pdb_resource_version": pdb["metadata"]["resourceVersion"],
+                    "observed_at_ms": now_ms,
+                }
+            )
+            for pod in live_pods[workload_id]:
+                replica_id = pod["metadata"]["labels"][REPLICA_ID_LABEL]
+                node_id = pod["spec"]["nodeName"]
+                placements.append(
+                    {"workload_id": workload_id, "replica_id": replica_id, "node_id": node_id}
+                )
+                inventory_pods.append(
+                    {
+                        **placements[-1],
+                        "pod_name": pod["metadata"]["name"],
+                        "pod_uid": pod["metadata"]["uid"],
+                        "owner_kind": "FleetRightWorkload",
+                        "owner_name": workload_id,
+                        "owner_uid": uid,
+                        "logical_slot_id": replica_id,
+                        "ready": True,
+                        "terminating": False,
+                    }
+                )
+        source["workloads"] = model_workloads
+        source["capacity_profiles"] = model_profiles
+        source["current_placements"] = placements
+        source["evacuation_v2"] = {
+            **source["evacuation_v2"],
+            "cluster_uid": json.loads(
+                kubectl("get", "namespace", "kube-system", "-o", "json").stdout
+            )["metadata"]["uid"],
+            "namespace": namespace,
+            "inventory_observed_at_ms": now_ms,
+            "controllers": inventory_controllers,
+            "pods": inventory_pods,
+            "nodes": [
+                {
+                    "node_id": node["metadata"]["name"],
+                    "node_uid": node["metadata"]["uid"],
+                    "resource_version": node["metadata"]["resourceVersion"],
+                }
+                for node in ready_workers
+            ],
+        }
+        monkeypatch.setenv("FLEETRIGHT_KUBERNETES_WORKLOADS", ",".join(workload_ids))
+
+        token = kubectl(
+            "create",
+            "token",
+            "fleetright-controller",
+            "-n",
+            "fleetright",
+            "--duration=30m",
+        ).stdout.strip()
+        admin_config = yaml.safe_load(Path(kubeconfig).read_text(encoding="utf-8"))
+        context_entry = next(item for item in admin_config["contexts"] if item["name"] == context)
+        cluster_name = context_entry["context"]["cluster"]
+        cluster = next(
+            item["cluster"] for item in admin_config["clusters"] if item["name"] == cluster_name
+        )
+        certificate = cluster.get("certificate-authority-data")
+        if certificate is None:
+            certificate = base64.b64encode(
+                Path(cluster["certificate-authority"]).read_bytes()
+            ).decode("ascii")
+        executor_config = tmp_path / "fleetright-drain-executor.kubeconfig"
+        executor_config.write_text(
+            yaml.safe_dump(
+                {
+                    "apiVersion": "v1",
+                    "kind": "Config",
+                    "clusters": [
+                        {
+                            "name": "fleetright-lab",
+                            "cluster": {
+                                "server": cluster["server"],
+                                "certificate-authority-data": certificate,
+                            },
+                        }
+                    ],
+                    "users": [{"name": "fleetright-controller", "user": {"token": token}}],
+                    "contexts": [
+                        {
+                            "name": "fleetright-executor",
+                            "context": {
+                                "cluster": "fleetright-lab",
+                                "user": "fleetright-controller",
+                                "namespace": namespace,
+                            },
+                        }
+                    ],
+                    "current-context": "fleetright-executor",
+                }
+            ),
+            encoding="utf-8",
+        )
+        executor_config.chmod(0o600)
+        target = FleetRightWorkloadTarget(kubeconfig=str(executor_config), namespace=namespace)
+        tokens, raw_tokens = _tokens()
+        monkeypatch.setenv("FLEETRIGHT_READINESS_TIMEOUT_SECONDS", "300")
+        app = create_app(
+            clean_database.repository,
+            tokens=tokens,
+            mode="EXECUTE",
+            execution_target="kubernetes-workload",
+            target_adapter=target,
+            health_observer=_LiveHealthyObserver(),
+            start_execution_worker=False,
+        )
+        eviction_log.touch(mode=0o600, exist_ok=True)
+        with TestClient(app) as client:
+            optimized = client.post(
+                "/v1/optimize",
+                headers={
+                    "Authorization": f"Bearer {raw_tokens['recommender']}",
+                    "Idempotency-Key": f"drain-plan-{uuid.uuid4().hex}",
+                },
+                json={"snapshot": {**source, "plan_schema_version": 2}},
+            )
+            assert optimized.status_code == 201, optimized.text
+            plan = optimized.json()
+            plan_id = plan["plan_id"]
+            cordon_operation_id = next(
+                action["payload"]["operation_id"]
+                for action in plan["candidate_actions"]
+                if action["action_type"] == "CORDON_NODE"
+            )
+            assert plan["verification_accepted"] is True and plan["admission_accepted"] is True
+            assert len(plan["candidate_actions"]) == 6
+            action_types = [action["action_type"] for action in plan["candidate_actions"]]
+            assert action_types.count("CORDON_NODE") == 1
+            assert action_types.count("PREPARE_SOURCE_RETIREMENT") == 4
+            assert action_types.count("VERIFY_NODE_DRAIN") == 1
+            with clean_database.repository.transaction() as conn:
+                persisted_order = conn.execute(
+                    "SELECT intent_id, action_type FROM action_intents WHERE plan_id = %s "
+                    "ORDER BY action_sequence",
+                    (plan_id,),
+                ).fetchall()
+            assert [action["action_type"] for action in persisted_order] == [
+                "CORDON_NODE",
+                "PREPARE_SOURCE_RETIREMENT",
+                "PREPARE_SOURCE_RETIREMENT",
+                "PREPARE_SOURCE_RETIREMENT",
+                "PREPARE_SOURCE_RETIREMENT",
+                "VERIFY_NODE_DRAIN",
+            ]
+            retirement_actions = [
+                action
+                for action in plan["candidate_actions"]
+                if action["action_type"] == "PREPARE_SOURCE_RETIREMENT"
+            ]
+            retirements_by_id = {action["intent_id"]: action for action in retirement_actions}
+            retirement_order = [
+                action["intent_id"]
+                for action in persisted_order
+                if action["action_type"] == "PREPARE_SOURCE_RETIREMENT"
+            ]
+            assert set(retirement_order) == set(retirements_by_id)
+            retirement_actions = [retirements_by_id[intent_id] for intent_id in retirement_order]
+            source_node_ids = {
+                action["payload"]["source_node_id"]
+                for action in plan["candidate_actions"]
+                if action["action_type"] == "PREPARE_SOURCE_RETIREMENT"
+            }
+            assert len(source_node_ids) == 1
+            source_node_id = next(iter(source_node_ids))
+            source_node = next(
+                node for node in ready_workers if node["metadata"]["name"] == source_node_id
+            )
+            source_node_uid = source_node["metadata"]["uid"]
+            assert source_node_id in {node["metadata"]["name"] for node in safe_initial_nodes}
+
+            operator = f"Bearer {raw_tokens['operator']}"
+            approved = client.post(
+                f"/v1/plans/{plan_id}/approve",
+                headers={"Authorization": operator, "Idempotency-Key": f"drain-approve-{plan_id}"},
+                json={},
+            )
+            assert approved.status_code == 200, approved.text
+            late_action = retirement_actions[2]
+            held_source = target.get_pod(late_action["payload"]["source_pod_name"])
+            assert held_source is not None
+            held_metadata = held_source["metadata"]
+            assert held_metadata["uid"] == late_action["payload"]["source_pod_uid"]
+            assert (
+                held_metadata["labels"]["fleetright.io/workload-uid"]
+                == late_action["payload"]["source_owner_uid"]
+            )
+            held_finalizers = list(held_metadata.get("finalizers", []))
+            assert held_finalizer not in held_finalizers
+            hold_patch = [
+                {"op": "test", "path": "/metadata/uid", "value": held_metadata["uid"]},
+                {
+                    "op": "test",
+                    "path": "/metadata/resourceVersion",
+                    "value": held_metadata["resourceVersion"],
+                },
+                {
+                    "op": "test",
+                    "path": "/metadata/labels/fleetright.io~1workload-uid",
+                    "value": late_action["payload"]["source_owner_uid"],
+                },
+                {
+                    "op": "add",
+                    "path": "/metadata/finalizers",
+                    "value": [*held_finalizers, held_finalizer],
+                },
+            ]
+            kubectl(
+                "patch",
+                "pod",
+                late_action["payload"]["source_pod_name"],
+                "-n",
+                namespace,
+                "--type=json",
+                "-p",
+                json.dumps(hold_patch),
+            )
+            started = client.post(
+                f"/v1/plans/{plan_id}/execute",
+                headers={"Authorization": operator, "Idempotency-Key": f"drain-execute-{plan_id}"},
+                json={},
+            )
+            assert started.status_code == 202, started.text
+            dsn_file.write_text(clean_database.dsn, encoding="utf-8")
+            with clean_database.repository.transaction() as conn:
+                conn.execute(
+                    "UPDATE plan_executions SET controller_lease_expires_at = clock_timestamp() "
+                    "WHERE plan_id = %s",
+                    (plan_id,),
+                )
+            context_mp = multiprocessing.get_context("spawn")
+            old_controller_id = f"drain-before-crash-{uuid.uuid4().hex[:8]}"
+            process = context_mp.Process(
+                target=_run_live_drain_controller_until_two_done,
+                args=(
+                    str(dsn_file),
+                    str(executor_config),
+                    plan_id,
+                    old_controller_id,
+                    str(marker),
+                    str(release_marker),
+                    str(admitted_marker),
+                    str(eviction_log),
+                    str(diagnostics_file),
+                    str(target_errors_file),
+                ),
+                daemon=True,
+            )
+            process.start()
+            deadline = time.monotonic() + 360
+            while time.monotonic() < deadline and process.is_alive() and not marker.exists():
+                time.sleep(0.2)
+            marker_value = marker.read_text(encoding="ascii") if marker.exists() else "missing"
+            journal_diagnostics = (
+                diagnostics_file.read_text(encoding="utf-8")
+                if diagnostics_file.exists()
+                else "missing"
+            )
+            target_errors = (
+                target_errors_file.read_text(encoding="utf-8")
+                if target_errors_file.exists()
+                else "none"
+            )
+            assert marker_value == "third-eviction-pending", (
+                f"marker={marker_value}, journal="
+                f"{journal_diagnostics}, target_errors={target_errors}"
+            )
+            before_takeover_evictions = [
+                json.loads(line) for line in eviction_log.read_text(encoding="utf-8").splitlines()
+            ]
+            assert len(before_takeover_evictions) == 2
+            with clean_database.repository.transaction() as conn:
+                states = conn.execute(
+                    "SELECT action_type, execution_state, payload, execution_result "
+                    "FROM action_intents WHERE plan_id = %s "
+                    "ORDER BY action_sequence",
+                    (plan_id,),
+                ).fetchall()
+                retirements_before = [
+                    row for row in states if row["action_type"] == "PREPARE_SOURCE_RETIREMENT"
+                ]
+                completed_before = sum(
+                    row["action_type"] == "PREPARE_SOURCE_RETIREMENT"
+                    and row["execution_state"] == "SUCCEEDED"
+                    for row in states
+                )
+                assert completed_before == 2
+                uncertain = [
+                    row
+                    for row in retirements_before
+                    if row["execution_state"] in {"RUNNING", "OUTCOME_UNKNOWN"}
+                ]
+                assert len(uncertain) == 1
+                progress = uncertain[0]["execution_result"].get("progress", [])
+                assert any(
+                    item.get("result", {}).get("stage") == "EVICTION_INTENT"
+                    for item in progress
+                    if isinstance(item, dict) and isinstance(item.get("result"), dict)
+                )
+                in_flight_source = target.get_pod(uncertain[0]["payload"]["source_pod_name"])
+                assert in_flight_source is not None
+                assert (
+                    in_flight_source["metadata"].get("uid")
+                    == uncertain[0]["payload"]["source_pod_uid"]
+                )
+                assert in_flight_source["metadata"].get("deletionTimestamp") is None
+                assert held_finalizer in in_flight_source["metadata"].get("finalizers", [])
+                assert (
+                    uncertain[0]["payload"]["operation_id"]
+                    == late_action["payload"]["operation_id"]
+                )
+
+            old_detail = client.get(
+                f"/v1/plans/{plan_id}",
+                headers={"Authorization": f"Bearer {raw_tokens['viewer']}"},
+            ).json()
+            old_execution = old_detail["execution"]
+            assert old_execution["controller_id"] == old_controller_id
+            old_fencing_token = old_execution["controller_fencing_token"]
+            release_marker.write_text("release", encoding="ascii")
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline and not admitted_marker.exists():
+                time.sleep(0.1)
+            assert admitted_marker.exists()
+            admitted_source = target.get_pod(uncertain[0]["payload"]["source_pod_name"])
+            assert admitted_source is not None
+            assert (
+                admitted_source["metadata"].get("uid") == uncertain[0]["payload"]["source_pod_uid"]
+            )
+            assert admitted_source["metadata"].get("deletionTimestamp") is not None
+            assert held_finalizer in admitted_source["metadata"].get("finalizers", [])
+
+            with clean_database.repository.transaction() as conn:
+                conn.execute(
+                    "UPDATE plan_executions SET controller_lease_expires_at = clock_timestamp() "
+                    "WHERE plan_id = %s",
+                    (plan_id,),
+                )
+
+            real_kubectl = target._kubectl
+
+            def trace_takeover_kubectl(*args: str, stdin: str | None = None):
+                eviction = next((arg for arg in args if arg.endswith("/eviction")), None)
+                if eviction is not None:
+                    with eviction_log.open("a", encoding="utf-8") as output:
+                        output.write(json.dumps(eviction) + "\n")
+                return real_kubectl(*args, stdin=stdin)
+
+            target._kubectl = trace_takeover_kubectl  # type: ignore[method-assign]
+            takeover = ExecutionController(
+                clean_database.repository,
+                target,
+                _LiveHealthyObserver(),
+                f"drain-after-crash-{uuid.uuid4().hex[:8]}",
+                readiness_timeout_seconds=300,
+                poll_seconds=0.1,
+            )
+            takeover.run_once()
+            assert len(eviction_log.read_text(encoding="utf-8").splitlines()) == 3
+            detail = client.get(
+                f"/v1/plans/{plan_id}",
+                headers={"Authorization": f"Bearer {raw_tokens['viewer']}"},
+            ).json()
+            assert detail["execution"]["status"] == "EXECUTING", detail
+            assert detail["execution"]["controller_id"] == takeover.controller_id
+            takeover_fencing_token = detail["execution"]["controller_fencing_token"]
+            assert takeover_fencing_token > old_fencing_token
+            current_source_state = target.observe_scale(uncertain[0]["payload"]["workload_id"])
+            assert current_source_state["fencing_token"] == takeover_fencing_token
+            assert current_source_state["execution_fence"]["generation"] == takeover_fencing_token
+            late_source = target.get_pod(uncertain[0]["payload"]["source_pod_name"])
+            assert late_source is not None
+            assert late_source["metadata"].get("uid") == uncertain[0]["payload"]["source_pod_uid"]
+            assert late_source["metadata"].get("deletionTimestamp") is not None
+            process.terminate()
+            process.join(timeout=10)
+            assert process.exitcode is not None and process.exitcode < 0
+            process = None
+
+            release_source = target.get_pod(uncertain[0]["payload"]["source_pod_name"])
+            assert release_source is not None
+            release_metadata = release_source["metadata"]
+            remaining_finalizers = [
+                item for item in release_metadata.get("finalizers", []) if item != held_finalizer
+            ]
+            release_patch = [
+                {
+                    "op": "test",
+                    "path": "/metadata/uid",
+                    "value": uncertain[0]["payload"]["source_pod_uid"],
+                },
+                {
+                    "op": "test",
+                    "path": "/metadata/resourceVersion",
+                    "value": release_metadata["resourceVersion"],
+                },
+            ]
+            if remaining_finalizers:
+                release_patch.append(
+                    {"op": "replace", "path": "/metadata/finalizers", "value": remaining_finalizers}
+                )
+            else:
+                release_patch.append({"op": "remove", "path": "/metadata/finalizers"})
+            kubectl(
+                "patch",
+                "pod",
+                uncertain[0]["payload"]["source_pod_name"],
+                "-n",
+                namespace,
+                "--type=json",
+                "-p",
+                json.dumps(release_patch),
+            )
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline:
+                if target.get_pod(uncertain[0]["payload"]["source_pod_name"]) is None:
+                    break
+                time.sleep(0.1)
+            else:
+                pytest.fail(
+                    "accepted source Eviction did not finish after releasing the test finalizer"
+                )
+            assert len(eviction_log.read_text(encoding="utf-8").splitlines()) == 3
+            deadline = time.monotonic() + 360
+            while time.monotonic() < deadline:
+                takeover.run_once()
+                detail = client.get(
+                    f"/v1/plans/{plan_id}",
+                    headers={"Authorization": f"Bearer {raw_tokens['viewer']}"},
+                ).json()
+                status = detail["execution"]["status"]
+                if status == "COMMITTED":
+                    break
+                assert status not in {"FAILED_SAFE", "COMPENSATING"}, detail
+                time.sleep(0.5)
+            assert detail["execution"]["status"] == "COMMITTED", detail
+            assert all(
+                action["execution_state"] == "SUCCEEDED" for action in detail["candidate_actions"]
+            )
+            eviction_paths = [
+                json.loads(line) for line in eviction_log.read_text(encoding="utf-8").splitlines()
+            ]
+            assert len(eviction_paths) == 4
+            expected_sources = {
+                action["payload"]["source_pod_name"]
+                for action in detail["candidate_actions"]
+                if action["action_type"] == "PREPARE_SOURCE_RETIREMENT"
+            }
+            actual_sources = {
+                path.split("/pods/", 1)[1].removesuffix("/eviction") for path in eviction_paths
+            }
+            assert len(actual_sources) == 4
+            assert actual_sources == expected_sources
+            for action in detail["candidate_actions"]:
+                if action["action_type"] != "PREPARE_SOURCE_RETIREMENT":
+                    continue
+                progress = action["execution_result"].get("progress", [])
+                stages = [
+                    item.get("result", {}).get("stage")
+                    for item in progress
+                    if isinstance(item, dict) and isinstance(item.get("result"), dict)
+                ]
+                assert stages.index("READY_FOR_SAFE_EVICTION") < stages.index("EVICTION_INTENT")
+                assert stages.count("EVICTION_INTENT") == 1
+                result = action["execution_result"]["result"]
+                assert result["stage"] == "RETIREMENT_COMPLETE"
+                assert target.get_pod(action["payload"]["source_pod_name"]) is None
+                replacement = target.get_pod(result["replacement_pod_name"])
+                assert replacement is not None
+                assert replacement["metadata"]["uid"] == result["replacement_pod_uid"]
+                final = target.observe_scale(action["workload_id"])
+                payload = action["payload"]
+                desired = payload["final_desired_replicas"]
+                assert desired == payload["baseline_replicas"] + 1
+                assert final["replicas"] == final["observed_replicas"] == desired
+                assert final["ready_replicas"] == desired
+                assert final["available_replicas"] >= max(
+                    final["availability_floor"], payload["profile_required_replicas"]
+                )
+                assert final["reconciled"] is True
+                assert final["fencing_token"] == detail["execution"]["controller_fencing_token"]
+                assert (
+                    final["execution_fence"]["generation"]
+                    == detail["execution"]["controller_fencing_token"]
+                )
+                assert final["execution_fence"]["planID"] == plan_id
+                assert final["execution_fence"]["operationID"] == payload["operation_id"]
+                pods = target._json(
+                    "get",
+                    "pods",
+                    "-n",
+                    namespace,
+                    "-l",
+                    f"fleetright.io/workload-uid={final['uid']}",
+                    "-o",
+                    "json",
+                )["items"]
+                assert len(pods) == desired
+                hard_anti_affinity = {
+                    "topologyKey": payload["topology_key"],
+                    "labelSelector": {"matchLabels": {"fleetright.io/workload-uid": final["uid"]}},
+                }
+                assert all(
+                    hard_anti_affinity
+                    in pod.get("spec", {})
+                    .get("affinity", {})
+                    .get("podAntiAffinity", {})
+                    .get("requiredDuringSchedulingIgnoredDuringExecution", [])
+                    for pod in pods
+                )
+                pod_nodes = {pod["spec"]["nodeName"] for pod in pods}
+                assert len(pod_nodes) == desired
+                assert all(pod["spec"]["nodeName"] != source_node_id for pod in pods)
+                approved_destinations = {
+                    node["name"]: node["uid"] for node in payload["destination_nodes"]
+                }
+                assert result["replacement_node_id"] in approved_destinations
+                assert (
+                    approved_destinations[result["replacement_node_id"]]
+                    == result["replacement_node_uid"]
+                )
+                allowed_nodes = {node["name"]: node["uid"] for node in final["approved_nodes"]}
+                assert pod_nodes <= allowed_nodes.keys()
+                current_nodes = {
+                    node["metadata"]["name"]: node["metadata"]["uid"]
+                    for node in json.loads(kubectl("get", "nodes", "-o", "json").stdout)["items"]
+                }
+                assert all(allowed_nodes[name] == current_nodes[name] for name in pod_nodes)
+                assert (
+                    current_nodes[result["replacement_node_id"]] == result["replacement_node_uid"]
+                )
+            final_node = json.loads(kubectl("get", "node", source_node_id, "-o", "json").stdout)
+            assert final_node["metadata"]["uid"] == source_node_uid
+            assert final_node["spec"].get("unschedulable") is True
+            remaining_names = [
+                pod["metadata"]["name"]
+                for pod in json.loads(kubectl("get", "pods", "-A", "-o", "json").stdout)["items"]
+                if pod.get("spec", {}).get("nodeName") == source_node_id
+                and pod.get("metadata", {}).get("namespace") == namespace
+                and pod.get("metadata", {}).get("labels", {}).get("fleetright.io/workload")
+                in workload_ids
+            ]
+            assert remaining_names == []
+    finally:
+        if process is not None and process.is_alive():
+            process.terminate()
+            process.join(timeout=10)
+        cleanup_complete = True
+        proxy_process: subprocess.Popen[bytes] | None = None
+        proxy_url: str | None = None
+        if test_workloads:
+            with socket.socket() as reserved_port:
+                reserved_port.bind(("127.0.0.1", 0))
+                proxy_port = reserved_port.getsockname()[1]
+            try:
+                proxy_process = subprocess.Popen(
+                    [
+                        "kubectl",
+                        f"--kubeconfig={kubeconfig}",
+                        f"--context={context}",
+                        "proxy",
+                        "--address=127.0.0.1",
+                        f"--port={proxy_port}",
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                proxy_url = f"http://127.0.0.1:{proxy_port}"
+                proxy_ready = False
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    if proxy_process.poll() is not None:
+                        break
+                    try:
+                        with urllib.request.urlopen(f"{proxy_url}/healthz", timeout=1):
+                            proxy_ready = True
+                            break
+                    except OSError:
+                        time.sleep(0.05)
+                if not proxy_ready:
+                    proxy_url = None
+            except OSError:
+                proxy_url = None
+            if proxy_url is None:
+                cleanup_complete = False
+        try:
+            for workload_id, workload_uid in test_workloads.items():
+                current = kubectl(
+                    "get",
+                    "fleetrightworkload",
+                    workload_id,
+                    "-n",
+                    namespace,
+                    "-o",
+                    "json",
+                    check=False,
+                )
+                if current.returncode == 0:
+                    current_workload = json.loads(current.stdout)
+                    if current_workload.get("metadata", {}).get("uid") != workload_uid:
+                        cleanup_complete = False
+                    else:
+                        workload_cleanup_safe = True
+                        owned_pods = kubectl(
+                            "get",
+                            "pods",
+                            "-n",
+                            namespace,
+                            "-l",
+                            f"fleetright.io/workload-uid={workload_uid}",
+                            "-o",
+                            "json",
+                            check=False,
+                        )
+                        if owned_pods.returncode != 0:
+                            cleanup_complete = False
+                            workload_cleanup_safe = False
+                        else:
+                            for pod in json.loads(owned_pods.stdout).get("items", []):
+                                metadata = pod.get("metadata", {})
+                                finalizers = metadata.get("finalizers", [])
+                                if held_finalizer not in finalizers:
+                                    continue
+                                if (
+                                    metadata.get("labels", {}).get("fleetright.io/workload-uid")
+                                    != workload_uid
+                                ):
+                                    cleanup_complete = False
+                                    workload_cleanup_safe = False
+                                    continue
+                                remaining = [item for item in finalizers if item != held_finalizer]
+                                release = [
+                                    {
+                                        "op": "test",
+                                        "path": "/metadata/uid",
+                                        "value": metadata["uid"],
+                                    },
+                                    {
+                                        "op": "test",
+                                        "path": "/metadata/resourceVersion",
+                                        "value": metadata["resourceVersion"],
+                                    },
+                                ]
+                                if remaining:
+                                    release.append(
+                                        {
+                                            "op": "replace",
+                                            "path": "/metadata/finalizers",
+                                            "value": remaining,
+                                        }
+                                    )
+                                else:
+                                    release.append({"op": "remove", "path": "/metadata/finalizers"})
+                                result = kubectl(
+                                    "patch",
+                                    "pod",
+                                    metadata["name"],
+                                    "-n",
+                                    namespace,
+                                    "--type=json",
+                                    "-p",
+                                    json.dumps(release),
+                                    check=False,
+                                )
+                                if result.returncode != 0:
+                                    cleanup_complete = False
+                                    workload_cleanup_safe = False
+                        if proxy_url is not None and workload_cleanup_safe:
+                            delete = urllib.request.Request(
+                                f"{proxy_url}/apis/fleetright.io/v1alpha1/namespaces/"
+                                f"{namespace}/fleetrightworkloads/{workload_id}",
+                                data=json.dumps(
+                                    {
+                                        "apiVersion": "v1",
+                                        "kind": "DeleteOptions",
+                                        "preconditions": {"uid": workload_uid},
+                                    }
+                                ).encode(),
+                                headers={"Content-Type": "application/json"},
+                                method="DELETE",
+                            )
+                            try:
+                                with urllib.request.urlopen(delete, timeout=30):
+                                    pass
+                            except OSError:
+                                cleanup_complete = False
+                elif "NotFound" not in current.stderr:
+                    cleanup_complete = False
+                deadline = time.monotonic() + 60
+                while time.monotonic() < deadline:
+                    pods = kubectl(
+                        "get",
+                        "pods",
+                        "-n",
+                        namespace,
+                        "-l",
+                        f"fleetright.io/workload-uid={workload_uid}",
+                        "-o",
+                        "json",
+                        check=False,
+                    )
+                    if pods.returncode != 0:
+                        cleanup_complete = False
+                        break
+                    if not json.loads(pods.stdout).get("items"):
+                        break
+                    time.sleep(0.5)
+                else:
+                    cleanup_complete = False
+        finally:
+            if proxy_process is not None:
+                proxy_process.terminate()
+                try:
+                    proxy_process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proxy_process.kill()
+                    proxy_process.wait(timeout=10)
+        for node_name in tainted_nodes:
+            kubectl("taint", "node", node_name, f"{test_taint}-", check=False)
+        if (
+            cleanup_complete
+            and source_node_id is not None
+            and source_node_uid is not None
+            and plan_id is not None
+            and cordon_operation_id is not None
+        ):
+            current_node = kubectl("get", "node", source_node_id, "-o", "json", check=False)
+            if current_node.returncode == 0:
+                current = json.loads(current_node.stdout)
+                metadata = current.get("metadata", {})
+                annotations = metadata.get("annotations", {})
+                token = annotations.get("fleetright.io/fencing-token")
+                if (
+                    metadata.get("uid") == source_node_uid
+                    and isinstance(metadata.get("resourceVersion"), str)
+                    and annotations.get("fleetright.io/plan-id") == plan_id
+                    and annotations.get("fleetright.io/operation-id") == cordon_operation_id
+                    and isinstance(token, str)
+                    and token.isdecimal()
+                    and current.get("spec", {}).get("unschedulable") is True
+                ):
+                    patch = [
+                        {"op": "test", "path": "/metadata/uid", "value": source_node_uid},
+                        {
+                            "op": "test",
+                            "path": "/metadata/resourceVersion",
+                            "value": metadata["resourceVersion"],
+                        },
+                        {
+                            "op": "test",
+                            "path": "/metadata/annotations/fleetright.io~1plan-id",
+                            "value": plan_id,
+                        },
+                        {
+                            "op": "test",
+                            "path": "/metadata/annotations/fleetright.io~1operation-id",
+                            "value": cordon_operation_id,
+                        },
+                        {
+                            "op": "test",
+                            "path": "/metadata/annotations/fleetright.io~1fencing-token",
+                            "value": token,
+                        },
+                        {
+                            "op": "test",
+                            "path": "/spec/unschedulable",
+                            "value": True,
+                        },
+                        {
+                            "op": "remove",
+                            "path": "/metadata/annotations/fleetright.io~1plan-id",
+                        },
+                        {
+                            "op": "remove",
+                            "path": "/metadata/annotations/fleetright.io~1operation-id",
+                        },
+                        {
+                            "op": "remove",
+                            "path": "/metadata/annotations/fleetright.io~1fencing-token",
+                        },
+                        {"op": "replace", "path": "/spec/unschedulable", "value": False},
+                    ]
+                    uncordoned = kubectl(
+                        "patch",
+                        "node",
+                        source_node_id,
+                        "--type=json",
+                        "-p",
+                        json.dumps(patch),
+                        check=False,
+                    )
+                    cleanup_complete &= uncordoned.returncode == 0
+                    if uncordoned.returncode == 0:
+                        after = kubectl("get", "node", source_node_id, "-o", "json", check=False)
+                        if after.returncode == 0:
+                            value = json.loads(after.stdout)
+                            cleanup_complete &= (
+                                value.get("metadata", {}).get("uid") == source_node_uid
+                                and value.get("spec", {}).get("unschedulable") is not True
+                                and not any(
+                                    key in value.get("metadata", {}).get("annotations", {})
+                                    for key in (
+                                        "fleetright.io/plan-id",
+                                        "fleetright.io/operation-id",
+                                        "fleetright.io/fencing-token",
+                                    )
+                                )
+                            )
+                        else:
+                            cleanup_complete = False
+        if not cleanup_complete:
+            pytest.fail("test FleetRightWorkloads or Pods did not finish UID-scoped cleanup")
 
 
 @pytest.mark.parametrize("unsupported_action", ["MOVE_REPLICA", "DEACTIVATE_NODE"])

@@ -12,6 +12,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -27,10 +28,14 @@ from .workload_controller import (
     WORKLOAD_GENERATION_ANNOTATION,
     WORKLOAD_UID_LABEL,
     SafetyError,
+    _pod_ready_stable,
     _write_retired_slot_tombstone,
 )
 
 _DNS_LABEL = re.compile(r"[a-z0-9](?:[-a-z0-9]*[a-z0-9])?\Z")
+_DNS_SUBDOMAIN = re.compile(
+    r"[a-z0-9](?:[-a-z0-9]*[a-z0-9])?(?:\.[a-z0-9](?:[-a-z0-9]*[a-z0-9])?)*\Z"
+)
 _CONTAINER_ID = re.compile(r"[0-9a-f]{12,64}\Z")
 _WORKLOAD_SERVICES = {
     "cpu-api": "cpu-service",
@@ -81,6 +86,12 @@ _WORKLOAD_EXECUTION_RULES = {
         "(has(self.executionRequest.minimumReadyReplicas) && "
         "self.executionRequest.minimumReadyReplicas >= self.availabilityFloor && "
         "self.executionRequest.minimumReadyReplicas <= self.executionRequest.targetReplicas)"
+    ),
+    (
+        "!has(self.executionRequest) || self.executionRequest.purpose != "
+        "'staged-replacement-v1' || "
+        "(has(self.placement.requirePodAntiAffinity) && "
+        "self.placement.requirePodAntiAffinity)"
     ),
     (
         "self.replicas <= oldSelf.replicas || (self.executionProtocol == "
@@ -239,6 +250,12 @@ def _checked_name(value: object, label: str) -> str:
     return value
 
 
+def _checked_pod_name(value: object) -> str:
+    if not isinstance(value, str) or len(value) > 253 or not _DNS_SUBDOMAIN.fullmatch(value):
+        raise TargetPreconditionFailed("invalid source Pod name")
+    return value
+
+
 def _run(command: list[str], *, timeout: float = 10, stdin: str | None = None) -> CommandResult:
     try:
         result = subprocess.run(
@@ -255,7 +272,10 @@ def _run(command: list[str], *, timeout: float = 10, stdin: str | None = None) -
         raise OutcomeUnknown("target request timed out; observe before retry") from error
     if result.returncode:
         message = result.stderr.lower()
-        if "disruption budget" in message:
+        if (
+            "disruption budget" in message
+            or "eviction managed pdb evidence is stale or blocks the effective floor" in message
+        ):
             raise ActionBlocked("PDB_BLOCKED")
         if "too many requests" in message or "toomanyrequests" in message:
             raise TargetUnavailable("Kubernetes API throttled the request")
@@ -556,6 +576,266 @@ class FleetRightWorkloadTarget(KubernetesTarget):
     supports_workload_execution = True
     source_retirement_preparation_enabled = True
 
+    def _observe_source_node(self, plan_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        name = _checked_name(payload.get("source_node_id"), "source Node name")
+        if (
+            not isinstance(plan_id, str)
+            or not plan_id
+            or not isinstance(payload.get("operation_id"), str)
+            or not payload["operation_id"]
+            or not isinstance(payload.get("source_node_uid"), str)
+            or not payload["source_node_uid"]
+        ):
+            raise TargetPreconditionFailed("Node drain identity is incomplete")
+        node = self._json("get", "node", name, "-o", "json")
+        metadata, spec = node.get("metadata"), node.get("spec")
+        if not isinstance(metadata, dict) or not isinstance(spec, dict):
+            raise TargetError("Node observation is incomplete")
+        if metadata.get("name") != name or metadata.get("uid") != payload["source_node_uid"]:
+            raise ActionBlocked("DRAIN_NODE_UID_CHANGED")
+        version = metadata.get("resourceVersion")
+        annotations = metadata.get("annotations", {})
+        if not isinstance(version, str) or not version or not isinstance(annotations, dict):
+            raise TargetError("Node observation is incomplete")
+        token = annotations.get("fleetright.io/fencing-token", "0")
+        if not isinstance(token, str) or not token.isdecimal():
+            raise ActionBlocked("DRAIN_NODE_FENCE_INVALID")
+        owner = (
+            annotations.get("fleetright.io/plan-id"),
+            annotations.get("fleetright.io/operation-id"),
+        )
+        if owner != (None, None) and owner != (plan_id, payload["operation_id"]):
+            raise ActionBlocked("DRAIN_NODE_OPERATION_CONFLICT")
+        if int(token) and owner == (None, None):
+            raise ActionBlocked("DRAIN_NODE_FENCE_INVALID")
+        return {
+            "source_node_id": name,
+            "source_node_uid": metadata["uid"],
+            "resource_version": version,
+            "fencing_token": int(token),
+            "plan_id": owner[0],
+            "operation_id": owner[1],
+            "unschedulable": spec.get("unschedulable") is True,
+            "annotations": annotations,
+            "annotations_present": "annotations" in metadata,
+        }
+
+    def cordon_source_node(
+        self, plan_id: str, payload: dict[str, Any], fencing_token: int
+    ) -> dict[str, Any]:
+        if type(fencing_token) is not int or fencing_token <= 0:
+            raise TargetPreconditionFailed("Node drain fencing token must be positive")
+        current = self._observe_source_node(plan_id, payload)
+        if current["fencing_token"] > fencing_token:
+            raise TargetPreconditionFailed("a newer controller fenced this Node drain")
+        if current["fencing_token"] == fencing_token and current["unschedulable"]:
+            return {**current, "stage": "NODE_CORDONED", "already_applied": True}
+        annotations = {
+            **current["annotations"],
+            "fleetright.io/plan-id": plan_id,
+            "fleetright.io/operation-id": payload["operation_id"],
+            "fleetright.io/fencing-token": str(fencing_token),
+        }
+        patch = [
+            {"op": "test", "path": "/metadata/uid", "value": current["source_node_uid"]},
+            {
+                "op": "test",
+                "path": "/metadata/resourceVersion",
+                "value": current["resource_version"],
+            },
+            {
+                "op": "replace" if current["annotations_present"] else "add",
+                "path": "/metadata/annotations",
+                "value": annotations,
+            },
+            {"op": "add", "path": "/spec/unschedulable", "value": True},
+        ]
+        self._json(
+            "patch", "node", current["source_node_id"], "--type=json", "-p", json.dumps(patch)
+        )
+        observed = self._observe_source_node(plan_id, payload)
+        if not observed["unschedulable"] or observed["fencing_token"] != fencing_token:
+            raise TargetPreconditionFailed("Node drain authority changed after cordon")
+        return {**observed, "stage": "NODE_CORDONED", "already_applied": False}
+
+    def observe_source_node_drain(
+        self, plan_id: str, payload: dict[str, Any], fencing_token: int
+    ) -> dict[str, Any]:
+        if type(fencing_token) is not int or fencing_token <= 0:
+            raise TargetPreconditionFailed("Node drain fencing token must be positive")
+        node_payload = {
+            **payload,
+            "operation_id": payload.get("cordon_operation_id", payload.get("operation_id")),
+        }
+        current = self._observe_source_node(plan_id, node_payload)
+        if (
+            not current["unschedulable"]
+            or current["plan_id"] != plan_id
+            or current["fencing_token"] != fencing_token
+        ):
+            raise TargetPreconditionFailed("Node drain authority is not held by this controller")
+        sources = payload.get("source_pods")
+        if not isinstance(sources, list) or not sources:
+            raise TargetPreconditionFailed("Node drain selected Pod inventory is empty")
+        selected: dict[str, tuple[str, str]] = {}
+        for source in sources:
+            if not isinstance(source, dict):
+                raise TargetPreconditionFailed("Node drain selected Pod identity is invalid")
+            name = _checked_pod_name(source.get("pod_name"))
+            workload = _checked_name(source.get("workload_id"), "workload name")
+            uid = source.get("pod_uid")
+            if not isinstance(uid, str) or not uid or uid in selected:
+                raise TargetPreconditionFailed("Node drain selected Pod identity is invalid")
+            selected[uid] = (name, workload)
+        inventory = self._json("get", "pods", "--all-namespaces", "-o", "json")
+        items, metadata = inventory.get("items"), inventory.get("metadata", {})
+        if (
+            not isinstance(items, list)
+            or not isinstance(metadata, dict)
+            or metadata.get("continue")
+        ):
+            raise TargetError("Node drain Pod inventory is incomplete")
+        daemonset_inventory = self._json("get", "daemonsets", "--all-namespaces", "-o", "json")
+        daemonsets, daemonset_metadata = (
+            daemonset_inventory.get("items"),
+            daemonset_inventory.get("metadata", {}),
+        )
+        if (
+            not isinstance(daemonsets, list)
+            or not isinstance(daemonset_metadata, dict)
+            or daemonset_metadata.get("continue")
+        ):
+            raise TargetError("Node drain DaemonSet inventory is incomplete")
+        daemonset_by_owner: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for daemonset in daemonsets:
+            if not isinstance(daemonset, dict):
+                raise TargetError("Node drain DaemonSet inventory is invalid")
+            ds_metadata = daemonset.get("metadata")
+            if not isinstance(ds_metadata, dict):
+                raise TargetError("Node drain DaemonSet inventory is invalid")
+            if all(
+                isinstance(ds_metadata.get(key), str) and ds_metadata[key]
+                for key in ("name", "namespace", "uid")
+            ):
+                daemonset_by_owner[
+                    (ds_metadata["namespace"], ds_metadata["name"], ds_metadata["uid"])
+                ] = daemonset
+        remaining, exempt = [], []
+        for pod in items:
+            if not isinstance(pod, dict):
+                raise TargetError("Node drain Pod inventory is invalid")
+            meta, spec = pod.get("metadata"), pod.get("spec")
+            if not isinstance(meta, dict) or not isinstance(spec, dict):
+                raise TargetError("Node drain Pod inventory is invalid")
+            if meta.get("uid") in selected:
+                expected_name, _ = selected[meta["uid"]]
+                if meta.get("name") != expected_name or meta.get("namespace") != self.namespace:
+                    raise ActionBlocked("DRAIN_SELECTED_POD_IDENTITY_CHANGED")
+                remaining.append(meta["uid"])
+                continue
+            annotations, owners = meta.get("annotations", {}), meta.get("ownerReferences", [])
+            labels = meta.get("labels", {})
+            status = pod.get("status", {})
+            if (
+                not isinstance(annotations, dict)
+                or not isinstance(labels, dict)
+                or not isinstance(owners, list)
+                or not isinstance(status, dict)
+            ):
+                raise TargetError("Node drain Pod classification is invalid")
+            node_name = spec.get("nodeName", "")
+            if not isinstance(node_name, str):
+                raise TargetError("Node drain Pod placement is invalid")
+            phase = status.get("phase")
+            if phase in {"Succeeded", "Failed"}:
+                continue
+            classification = None
+            if annotations.get("kubernetes.io/config.mirror"):
+                if node_name == current["source_node_id"] and any(
+                    isinstance(owner, dict)
+                    and owner.get("apiVersion") == "v1"
+                    and owner.get("kind") == "Node"
+                    and owner.get("name") == current["source_node_id"]
+                    and owner.get("uid") == current["source_node_uid"]
+                    for owner in owners
+                ):
+                    classification = "STATIC_MIRROR"
+            else:
+                for owner in owners:
+                    if not isinstance(owner, dict) or (
+                        owner.get("apiVersion") != "apps/v1"
+                        or owner.get("kind") != "DaemonSet"
+                        or owner.get("controller") is not True
+                    ):
+                        continue
+                    daemonset = daemonset_by_owner.get(
+                        (meta.get("namespace"), owner.get("name"), owner.get("uid"))
+                    )
+                    ds_spec = daemonset.get("spec") if isinstance(daemonset, dict) else None
+                    selector = ds_spec.get("selector") if isinstance(ds_spec, dict) else None
+                    match_labels = (
+                        selector.get("matchLabels") if isinstance(selector, dict) else None
+                    )
+                    expressions = (
+                        selector.get("matchExpressions", []) if isinstance(selector, dict) else None
+                    )
+                    selector_matches = isinstance(match_labels, dict) and all(
+                        isinstance(key, str) and isinstance(value, str) and labels.get(key) == value
+                        for key, value in match_labels.items()
+                    )
+                    if selector_matches and isinstance(expressions, list):
+                        for requirement in expressions:
+                            if not isinstance(requirement, dict):
+                                selector_matches = False
+                                break
+                            key, operator, values = (
+                                requirement.get("key"),
+                                requirement.get("operator"),
+                                requirement.get("values", []),
+                            )
+                            value_present = key in labels if isinstance(key, str) else False
+                            value = labels.get(key) if value_present else None
+                            if operator == "In":
+                                selector_matches &= value_present and value in values
+                            elif operator == "NotIn":
+                                selector_matches &= not value_present or value not in values
+                            elif operator == "Exists":
+                                selector_matches &= value_present
+                            elif operator == "DoesNotExist":
+                                selector_matches &= not value_present
+                            else:
+                                selector_matches = False
+                                break
+                    if selector_matches:
+                        classification = "DAEMONSET"
+                        break
+            if not node_name:
+                if classification is None:
+                    raise ActionBlocked("DRAIN_UNBOUND_POD_MAY_BIND_TO_SOURCE_NODE")
+                continue
+            if node_name != current["source_node_id"]:
+                continue
+            if classification is None:
+                raise ActionBlocked("DRAIN_UNSUPPORTED_POD_ON_SOURCE_NODE")
+            exempt.append(
+                {
+                    "namespace": meta.get("namespace"),
+                    "pod_name": meta.get("name"),
+                    "pod_uid": meta.get("uid"),
+                    "classification": classification,
+                }
+            )
+        after = self._observe_source_node(plan_id, node_payload)
+        if not after["unschedulable"] or after["fencing_token"] != fencing_token:
+            raise TargetPreconditionFailed("Node drain authority changed during inventory")
+        return {
+            **after,
+            "stage": "NODE_DRAIN_WAITING" if remaining else "NODE_DRAIN_COMPLETE",
+            "remaining_source_pod_uids": remaining,
+            "exempt_pods": exempt,
+            "inventory_pod_count": len(items),
+        }
+
     @staticmethod
     def _check_retired_source(
         current: dict[str, Any],
@@ -627,12 +907,12 @@ class FleetRightWorkloadTarget(KubernetesTarget):
             or type(healthy) is not int
             or type(allowed) is not int
             or type(expected) is not int
-            or desired < minimum_ready
-            or healthy < minimum_ready
             or expected < desired_replicas
             or status.get("disruptedPods")
         ):
             return "PDB_STATUS_PENDING"
+        if desired < minimum_ready or healthy < desired:
+            return "PDB_BLOCKED"
         if source_ready and (allowed < 1 or healthy <= desired):
             return "PDB_BLOCKED"
         return None
@@ -653,6 +933,8 @@ class FleetRightWorkloadTarget(KubernetesTarget):
             raise ActionBlocked("UNSUPPORTED_POD_CREATE_PROTOCOL")
         if current["pod_create_admission_protocol"] != "claimed-create-v1":
             raise ActionBlocked("UNSUPPORTED_POD_CREATE_ADMISSION_PROTOCOL")
+        if current["require_hard_pod_anti_affinity"] is not True:
+            raise ActionBlocked("UNSUPPORTED_REPLACEMENT_PLACEMENT_CONTRACT")
         if current["pod_create_history_uncertain"] or current["unverified_pod_creates"]:
             raise ActionBlocked("POD_CREATE_HISTORY_UNCERTAIN")
         slot_id = payload.get("source_logical_slot_id")
@@ -674,16 +956,15 @@ class FleetRightWorkloadTarget(KubernetesTarget):
             raise ActionBlocked("RETIRED_SLOT_HISTORY_PRESENT")
         pending = current["pending_pod_create"]
         if pending is not None:
-            baseline = payload.get("baseline_replicas")
             if (
-                type(baseline) is int
+                pending.get("workloadUID") == current["uid"]
                 and pending.get("planID") == plan_id
                 and pending.get("operationID") == payload.get("operation_id")
-                and pending.get("replicaID") == f"{workload_id}-{baseline}"
+                and pending.get("replicaID") != slot_id
             ):
                 return {
                     "stage": "REPLACEMENT_CREATE_PENDING",
-                    "replica_id": f"{workload_id}-{baseline}",
+                    "replica_id": pending["replicaID"],
                 }
             raise ActionBlocked("POD_CREATE_OUTCOME_UNKNOWN")
         if not plan_id or not payload.get("operation_id"):
@@ -707,6 +988,7 @@ class FleetRightWorkloadTarget(KubernetesTarget):
             or type(payload.get("profile_required_replicas")) is not int
             or not isinstance(destinations, list)
             or type(payload.get("readiness_stabilization_ms")) is not int
+            or payload["readiness_stabilization_ms"] < 0
         ):
             raise TargetPreconditionFailed("verified replacement bounds are incomplete")
         if (
@@ -795,17 +1077,20 @@ class FleetRightWorkloadTarget(KubernetesTarget):
             or current["execution"].get("phase") != "APPLIED"
         ):
             return {"stage": "REPLACEMENT_REQUESTED", "surge_replicas": current["replicas"]}
-        slot = f"{workload_id}-{baseline}"
         records = [
             record
             for record in current["authorized_pod_creates"]
             if record.get("planID") == plan_id
             and record.get("operationID") == payload["operation_id"]
-            and record.get("replicaID") == slot
         ]
         if len(records) != 1:
-            return {"stage": "REPLACEMENT_REQUESTED", "replica_id": slot}
+            if len(records) > 1:
+                raise ActionBlocked("REPLACEMENT_SLOT_DUPLICATED")
+            return {"stage": "REPLACEMENT_REQUESTED"}
         replacement = records[0]
+        slot = replacement["replicaID"]
+        if slot == slot_id:
+            raise ActionBlocked("REPLACEMENT_SLOT_DUPLICATED")
         try:
             pod = self._json(
                 "get", "pod", replacement["podName"], "-n", self.namespace, "-o", "json"
@@ -906,6 +1191,7 @@ class FleetRightWorkloadTarget(KubernetesTarget):
             "replacement_workload_generation": replacement["workloadGeneration"],
             "replacement_create_id": replacement["createID"],
             "ready_since": ready_since,
+            "readiness_stabilization_ms": payload["readiness_stabilization_ms"],
         }
         if existing_retirement and any(
             existing_retirement[0].get(key) != value
@@ -933,18 +1219,24 @@ class FleetRightWorkloadTarget(KubernetesTarget):
         fresh_request, fresh_execution = fresh["execution_request"], fresh["execution"]
         if (
             fresh["uid"] != current["uid"]
-            or not isinstance(fresh_request, dict)
-            or fresh_request.get("planID") != plan_id
-            or fresh_request.get("operationID") != payload["operation_id"]
-            or not isinstance(fresh_execution, dict)
-            or fresh_execution.get("phase") != "APPLIED"
+            or fresh_request != request
             or fresh["pending_pod_create"] is not None
             or fresh["pod_create_history_uncertain"]
             or fresh["unverified_pod_creates"]
-            or fresh["ready_replicas"] < surge
-            or fresh["available_replicas"] < required_ready
         ):
             raise ActionBlocked("RETIREMENT_INTENT_PRECONDITION_CHANGED")
+        execution_matches = isinstance(fresh_execution, dict) and all(
+            fresh_execution.get(key) == request.get(key)
+            for key in ("planID", "operationID", "generation", "targetReplicas", "purpose")
+        )
+        if not execution_matches:
+            raise ActionBlocked("RETIREMENT_INTENT_PRECONDITION_CHANGED")
+        if isinstance(fresh_execution, dict) and fresh_execution.get("phase") == "RECONCILING":
+            return {"stage": "REPLACEMENT_REQUESTED", "surge_replicas": surge}
+        if not isinstance(fresh_execution, dict) or fresh_execution.get("phase") != "APPLIED":
+            raise ActionBlocked("RETIREMENT_INTENT_PRECONDITION_CHANGED")
+        if fresh["ready_replicas"] < surge or fresh["available_replicas"] < required_ready:
+            return {"stage": "REPLACEMENT_CAPACITY_PENDING", "surge_replicas": surge}
         source = self.get_pod(payload["source_pod_name"])
         if source is None:
             raise ActionBlocked("SOURCE_POD_NOT_FOUND")
@@ -984,10 +1276,33 @@ class FleetRightWorkloadTarget(KubernetesTarget):
             workload_generation=fresh["generation"],
             source_pod_resource_version=source_metadata.get("resourceVersion"),
         )
-        nodes = self._json("get", "nodes", "-o", "json").get("items")
-        if not isinstance(nodes, list):
+        approved_nodes = fresh["approved_nodes"]
+        if not isinstance(approved_nodes, list) or not approved_nodes:
             raise ActionBlocked("RETIREMENT_NODE_INVENTORY_UNAVAILABLE")
+        nodes = []
+        for approved in approved_nodes:
+            if (
+                not isinstance(approved, dict)
+                or not isinstance(approved.get("name"), str)
+                or not isinstance(approved.get("uid"), str)
+            ):
+                raise ActionBlocked("RETIREMENT_NODE_INVENTORY_UNAVAILABLE")
+            try:
+                node = self._json(
+                    "get", "node", _checked_name(approved["name"], "Node name"), "-o", "json"
+                )
+            except TargetNotFound as error:
+                raise ActionBlocked("RETIREMENT_NODE_UID_CHANGED") from error
+            metadata = node.get("metadata", {}) if isinstance(node, dict) else {}
+            if (
+                not isinstance(metadata, dict)
+                or metadata.get("name") != approved["name"]
+                or metadata.get("uid") != approved["uid"]
+            ):
+                raise ActionBlocked("RETIREMENT_NODE_UID_CHANGED")
+            nodes.append(node)
         try:
+            self._require_fencing_schema()
             _write_retired_slot_tombstone(
                 self,
                 workload,
@@ -1010,6 +1325,7 @@ class FleetRightWorkloadTarget(KubernetesTarget):
         prepared: dict[str, Any],
         *,
         fencing_token: int,
+        before_dispatch: Callable[[], bool],
     ) -> dict[str, Any]:
         """Send one UID- and resourceVersion-preconditioned policy/v1 Eviction."""
         current = self.observe_scale(workload_id)
@@ -1028,6 +1344,8 @@ class FleetRightWorkloadTarget(KubernetesTarget):
             or prepared.get("replacement_node_uid") is None
             or type(fencing_token) is not int
             or current["fencing_token"] != fencing_token
+            or type(payload.get("readiness_stabilization_ms")) is not int
+            or payload["readiness_stabilization_ms"] < 0
             or not isinstance(request, dict)
             or request.get("planID") != plan_id
             or request.get("operationID") != payload.get("operation_id")
@@ -1041,6 +1359,7 @@ class FleetRightWorkloadTarget(KubernetesTarget):
             or current["pending_pod_create"] is not None
             or current["pod_create_history_uncertain"]
             or current["unverified_pod_creates"]
+            or current["require_hard_pod_anti_affinity"] is not True
         ):
             raise ActionBlocked("RETIREMENT_AUTHORITY_OR_IDENTITY_CHANGED")
         tombstones = [
@@ -1064,6 +1383,7 @@ class FleetRightWorkloadTarget(KubernetesTarget):
                 "replacementNodeUID": prepared["replacement_node_uid"],
                 "replacementCreateID": prepared["replacement_create_id"],
                 "replacementWorkloadGeneration": prepared["replacement_workload_generation"],
+                "readinessStabilizationMs": payload["readiness_stabilization_ms"],
             }.items()
         ):
             raise ActionBlocked("RETIREMENT_TOMBSTONE_IDENTITY_CHANGED")
@@ -1092,20 +1412,15 @@ class FleetRightWorkloadTarget(KubernetesTarget):
             raise ActionBlocked("REPLACEMENT_POD_DISAPPEARED")
         replacement_metadata = replacement.get("metadata", {})
         replacement_spec = replacement.get("spec", {})
-        replacement_ready = any(
-            isinstance(condition, dict)
-            and condition.get("type") == "Ready"
-            and condition.get("status") == "True"
-            for condition in replacement.get("status", {}).get("conditions", [])
-        )
         if (
             not isinstance(replacement_metadata, dict)
             or replacement_metadata.get("uid") != prepared.get("replacement_pod_uid")
             or not isinstance(replacement_spec, dict)
             or replacement_spec.get("nodeName") != prepared.get("replacement_node_id")
-            or not replacement_ready
         ):
             raise ActionBlocked("REPLACEMENT_READINESS_OR_IDENTITY_CHANGED")
+        if not _pod_ready_stable(replacement, payload["readiness_stabilization_ms"]):
+            return {**prepared, "stage": "REPLACEMENT_WARMING"}
         self._verify_node_uid(payload["source_node_id"], payload["source_node_uid"])
         self._verify_node_uid(prepared["replacement_node_id"], prepared["replacement_node_uid"])
         ready_condition = next(
@@ -1155,6 +1470,8 @@ class FleetRightWorkloadTarget(KubernetesTarget):
                 }
             },
         }
+        if not before_dispatch():
+            return {**prepared, "stage": "READY_FOR_SAFE_EVICTION"}
         try:
             response = self._kubectl(
                 "create",
@@ -1221,17 +1538,49 @@ class FleetRightWorkloadTarget(KubernetesTarget):
                 raise ActionBlocked("SOURCE_POD_UID_CHANGED")
             if metadata.get("deletionTimestamp") is not None:
                 return {**prepared, "stage": "EVICTION_IN_PROGRESS"}
+            if prepared.get("stage") in {
+                "EVICTION_INTENT",
+                "EVICTION_ACCEPTED",
+                "EVICTION_IN_PROGRESS",
+                "EVICTION_OUTCOME_UNKNOWN",
+                "EVICTION_SOURCE_REMOVED",
+                "RETIREMENT_WAITING_FINAL_HEALTH",
+            }:
+                # An admitted request can still delete this exact Pod after takeover.
+                return {**prepared, "stage": "EVICTION_OUTCOME_UNKNOWN"}
+            if prepared.get("stage") not in {
+                "READY_FOR_SAFE_EVICTION",
+                "PDB_BLOCKED",
+                "PDB_STATUS_PENDING",
+            }:
+                return {**prepared, "stage": "EVICTION_OUTCOME_UNKNOWN"}
             return {
                 **prepared,
                 "stage": "EVICTION_RETRY_SAFE",
                 "source_pod_resource_version": metadata.get("resourceVersion"),
                 "fencing_token": fencing_token,
             }
+        if (
+            current["pending_pod_create"] is not None
+            or current["pod_create_history_uncertain"]
+            or current["unverified_pod_creates"] != 0
+        ):
+            return {
+                **prepared,
+                "stage": "RETIREMENT_WAITING_FINAL_HEALTH",
+                "source_removed_observed": True,
+                "observation": current,
+            }
         final_replicas = payload["final_desired_replicas"]
         required_ready = max(current["availability_floor"], payload["profile_required_replicas"])
         replacement = self.get_pod(prepared["replacement_pod_name"])
         if replacement is None:
-            return {**prepared, "stage": "RETIREMENT_WAITING_FINAL_HEALTH"}
+            return {
+                **prepared,
+                "stage": "RETIREMENT_WAITING_FINAL_HEALTH",
+                "source_removed_observed": True,
+                "observation": current,
+            }
         metadata = replacement.get("metadata", {})
         spec = replacement.get("spec", {})
         if (
@@ -1246,7 +1595,12 @@ class FleetRightWorkloadTarget(KubernetesTarget):
                 for condition in replacement.get("status", {}).get("conditions", [])
             )
         ):
-            return {**prepared, "stage": "RETIREMENT_WAITING_FINAL_HEALTH"}
+            return {
+                **prepared,
+                "stage": "RETIREMENT_WAITING_FINAL_HEALTH",
+                "source_removed_observed": True,
+                "observation": current,
+            }
         self._verify_node_uid(prepared["replacement_node_id"], prepared["replacement_node_uid"])
         if (
             current["replicas"] != final_replicas
@@ -1262,12 +1616,14 @@ class FleetRightWorkloadTarget(KubernetesTarget):
                 **prepared,
                 "stage": "RETIREMENT_WAITING_FINAL_HEALTH",
                 "observation": current,
+                "source_removed_observed": True,
             }
         if not self._verify_final_retirement_pods(current, payload, final_replicas):
             return {
                 **prepared,
                 "stage": "RETIREMENT_WAITING_FINAL_HEALTH",
                 "observation": current,
+                "source_removed_observed": True,
             }
         return {
             **prepared,
@@ -1447,10 +1803,13 @@ class FleetRightWorkloadTarget(KubernetesTarget):
             or request.get("expectedReplicas") != original
             or request.get("destinationNodes") != destinations
             or type(request.get("generation")) is not int
-            or observed.get("fencing_token") != request.get("generation")
+            or observed.get("pending_pod_create") is not None
+            or observed.get("pod_create_history_uncertain") is True
+            or observed.get("unverified_pod_creates") != 0
             or not isinstance(fence, dict)
             or (fence.get("planID"), fence.get("operationID")) != (plan_id, intent_id)
-            or fence.get("generation") != request.get("generation")
+            or observed.get("fencing_token") != fence.get("generation")
+            or fence.get("generation", 0) < request.get("generation")
             or fence.get("expectedGeneration") != precondition.get("generation")
             or fence.get("expectedReplicas") != original
             or fence.get("fencedGeneration") != observed.get("generation")
@@ -1833,6 +2192,11 @@ class FleetRightWorkloadTarget(KubernetesTarget):
             if isinstance(retired_slot_properties, dict)
             else {}
         )
+        readiness_stabilization = (
+            retired_slot_schema_properties.get("readinessStabilizationMs", {})
+            if isinstance(retired_slot_schema_properties, dict)
+            else {}
+        )
         installed_rules = {
             rule.get("rule")
             for rule in rules
@@ -1938,6 +2302,9 @@ class FleetRightWorkloadTarget(KubernetesTarget):
                 "replacementWorkloadGeneration",
             }
             <= set(retired_slot_schema_properties)
+            and isinstance(readiness_stabilization, dict)
+            and readiness_stabilization.get("type") == "integer"
+            and readiness_stabilization.get("minimum") == 0
         ):
             raise TargetPreconditionFailed("FleetRightWorkload execution CRD is not installed")
 
@@ -2183,6 +2550,9 @@ class FleetRightWorkloadTarget(KubernetesTarget):
             "retired_replica_slots": retired_slots,
             "approved_nodes": approved_nodes,
             "placement_topology": placement.get("topology"),
+            "require_hard_pod_anti_affinity": (
+                isinstance(placement, dict) and placement.get("requirePodAntiAffinity") is True
+            ),
             "surge_budget": spec.get("surgeBudget", 0),
             "pod_create_admission_protocol": spec.get("podCreateAdmissionProtocol"),
         }
@@ -2219,6 +2589,11 @@ class FleetRightWorkloadTarget(KubernetesTarget):
         ):
             raise TargetPreconditionFailed("invalid workload execution fence")
         current = self.observe_scale(workload_id)
+        if target_replicas > current["replicas"] and (
+            current["pod_create_protocol"] != "reserved-create-v1"
+            or current["pod_create_admission_protocol"] != "claimed-create-v1"
+        ):
+            raise ActionBlocked("UNSUPPORTED_POD_CREATE_PROTOCOL")
         if purpose == "staged-replacement-v1":
             minimum_ready_replicas = max(current["availability_floor"], minimum_ready_replicas)
             if minimum_ready_replicas > target_replicas:
@@ -2402,6 +2777,11 @@ class FleetRightWorkloadTarget(KubernetesTarget):
         ):
             raise TargetPreconditionFailed("invalid durable workload authorization")
         current = self.observe_scale(workload_id)
+        if target_replicas > current["replicas"] and (
+            current["pod_create_protocol"] != "reserved-create-v1"
+            or current["pod_create_admission_protocol"] != "claimed-create-v1"
+        ):
+            raise ActionBlocked("UNSUPPORTED_POD_CREATE_PROTOCOL")
         if current["pod_create_history_uncertain"] or current["unverified_pod_creates"]:
             raise ActionBlocked("POD_CREATE_HISTORY_UNCERTAIN")
         self._check_retired_source(
@@ -2445,7 +2825,8 @@ class FleetRightWorkloadTarget(KubernetesTarget):
             ):
                 raise ActionBlocked("DESTINATION_NODE_OUTSIDE_WORKLOAD_PLACEMENT")
         if purpose == "staged-replacement-v1" and (
-            current["surge_budget"] < 1
+            current["require_hard_pod_anti_affinity"] is not True
+            or current["surge_budget"] < 1
             or (
                 same
                 and (

@@ -1,5 +1,93 @@
 # V2 Execution Progress
 
+## 2026-10-12 completion continuation
+
+**Authorized start:** 07:12:28 UTC from branch `phase4/safe-execution-reconciliation`
+at `06f43e60f66c1dd1caaae8a5fc2426ca5dfacae0`. The user superseded the
+expired six-hour timebox with a completion objective and no artificial deadline.
+All pre-existing changes and review artifacts remain preserved. Prompt 3 has
+not started.
+
+The first live PDB-permitted run reproduced the pre-eviction workload status
+CAS race: target refused the stale resourceVersion and did not dispatch an
+Eviction. The production reconciler already retains the `EXECUTING` plan lock
+and retries on a later fresh observation only for that exact pre-dispatch CAS
+conflict. A deterministic target test now injects an unrelated controller
+status write, proves no tombstone is committed on the stale CAS, and verifies
+the next fresh prepare preserves the controller record and commits the exact
+source UID tombstone. The journal retry regression passes.
+
+The first authenticated API/PostgreSQL/Kind attempt then exposed an invalid
+live fixture: it offered the tainted control-plane Node as an allowed
+destination. The real controller could not schedule the extra final replica,
+and the test correctly failed without reporting completion. The fixture now
+uses only Ready, schedulable workers and two starting replicas, leaving two
+real destination domains in the four-worker lab. The rerun passed (**1 passed
+in 85.80s**) through API plan creation, independent verification, approval,
+PostgreSQL execution journal, replacement UID/readiness, durable source
+tombstone, policy/v1 Eviction, observed source absence, health verification,
+and committed final observation. This establishes the single-operation live
+API path; it does not qualify batch drain, a separate-process crash takeover,
+or compensation.
+
+The first live run reached and accepted the policy/v1 Eviction and observed
+source removal, but its later recovery check exposed a 2/1/0/0 hostname
+distribution after an extra scale-up. The direct-target fixture had used one
+destination and disabled the V2 topology/anti-affinity constraints. It now
+uses the verified destination set excluding the source, `minDomains: 2`,
+`maxSkew: 1`, and required Pod anti-affinity. With those V2 constraints, the
+corrected live permitted case passed (**1 passed in 142.23s**) including
+replacement readiness/UID, retirement tombstone, policy/v1 source Eviction,
+observed source removal, controller restart, stale pre-admission fence
+rejection, lost Eviction response reconciliation, final topology, and recovery
+identity. The matching real PDB-blocked case passed (**1 passed in 61.04s**)
+with no source deletion or retirement tombstone. These are live direct-target
+E2Es; they do not qualify the authenticated API/PostgreSQL mutation path.
+Temporary workloads, roles, bindings, and Pods were cleaned from the test
+namespace after both runs.
+
+Focused evidence so far: target and tombstone-CAS tests **87 passed**; Pod
+admission tests **74 passed**; PostgreSQL pre-eviction journal retry **1
+passed**; changed-file Ruff, Python compilation, and `git diff --check` passed.
+The existing five-node `kind-fleetright-prompt2b-lab` is healthy (5/5 Ready),
+and its `fleetright-v2` namespace is clean between test runs. Real single-Pod
+replacement and PDB-permitted/blocked Eviction now pass in the direct-target
+fixture; broader mandatory integration remains incomplete.
+
+A live authenticated API/PostgreSQL/Kind delayed-response takeover test passed
+(**1 passed in 85.29s**). Kubernetes accepted one Eviction and set the exact
+source Pod's deletion timestamp before the old controller response was held.
+After PostgreSQL lease expiry, a new controller instance observed
+`EVICTION_IN_PROGRESS` without a second Eviction. Releasing the old response
+did not let the stale controller journal `EVICTION_ACCEPTED`; after removing
+the test finalizer, the new controller observed source absence and committed.
+This qualifies the delayed accepted Eviction effect for the supported
+single-Pod path; it is not an OS-process-kill test.
+
+Sol High found and helped fix a second-takeover hole for completed retirements:
+recovery now re-observes the exact live workload UID and current target fence
+before transferring authority. Three focused PostgreSQL journal cases pass,
+including a target-fence crash followed by a different controller taking over
+after the pending lease expires. The bounded C++ multi-operation drain planner
+and independent verifier have focused coverage (**24 EvacuationV2Test tests**)
+and build, but production Python admission/journaling/reconciliation, Node
+cordon and final Node-empty verification are still being integrated.
+
+The four-Pod live drain and partial-drain recovery, live
+API-to-PostgreSQL compensation, Docker final results, full regression suites,
+and final safety review remain unqualified. Keep any path lacking those proofs
+disabled.
+
+## New authorized continuation — 2026-10-11
+
+**Timebox:** 16:29:59 UTC start; 22:29:59 UTC hard stop, authorized by the
+user for a new six-hour run. **Resume HEAD:**
+`06f43e60f66c1dd1caaae8a5fc2426ca5dfacae0` on
+`phase4/safe-execution-reconciliation`. The starting worktree already had ten
+modified tracked files and three untracked prior-session review/Graphify
+artifacts. No commit, tag, or push was made at resume. Qualification remains
+incomplete until this continuation records verified results below.
+
 ## 2026-10-11 Prompt 2B — replacement and eviction safety checkpoint (incomplete)
 
 **Execution window:** began approximately 11:21 UTC; six-hour hard stop is

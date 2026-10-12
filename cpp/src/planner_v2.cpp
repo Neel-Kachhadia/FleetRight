@@ -400,11 +400,11 @@ bool CandidateStateSafe(const EvacuationSnapshot &snapshot, const WorkloadSpec &
         return false;
       }
       auto final = WithoutSource(overlap, workload.workload_id(), source_replica);
-      if (!ResourceStateSafe(snapshot, final, {source_node})) {
+      if (!ResourceStateSafe(snapshot, final, {})) {
         *rejection_reason = "insufficient resource capacity for a permitted final placement";
         return false;
       }
-      if (!TopologyStateSafe(snapshot, workload, final, {source_node})) {
+      if (!TopologyStateSafe(snapshot, workload, final, {})) {
         *rejection_reason = "topology requirements fail for a permitted final placement";
         return false;
       }
@@ -780,7 +780,8 @@ bool CompleteCandidate(const EvacuationSnapshot &snapshot, const WorkloadSpec &w
                        const v2::ControllerIdentity &controller,
                        const std::vector<std::string> &destinations,
                        const std::vector<std::string> &recovery_nodes,
-                       std::string *rejection_reason, v2::EvacuationPlan *plan) {
+                       std::string *rejection_reason, v2::EvacuationPlan *plan,
+                       bool sequential_batch = false) {
   const auto &model = snapshot.model_snapshot();
   std::vector<ReplicaPlacement> baseline(model.current_placements().begin(),
                                          model.current_placements().end());
@@ -791,6 +792,12 @@ bool CompleteCandidate(const EvacuationSnapshot &snapshot, const WorkloadSpec &w
     *rejection_reason = "replica, move, or observed PDB disruption budget is insufficient";
     return false;
   }
+  if (sequential_batch &&
+      count < std::max({profile.required_replicas, workload.availability_floor(),
+                        workload.min_replicas()})) {
+    *rejection_reason = "sequential drain baseline is below the profile-derived availability floor";
+    return false;
+  }
   if (destinations.size() < 2) {
     *rejection_reason = "fewer than two enforceable scheduler destinations";
     return false;
@@ -799,14 +806,16 @@ bool CompleteCandidate(const EvacuationSnapshot &snapshot, const WorkloadSpec &w
     *rejection_reason = "scheduler outcome set exceeds the v2 bound of eight destinations";
     return false;
   }
-  if (model.policy().maximum_plan_actions() < 6) {
-    *rejection_reason = "six evacuation stages exceed the configured action budget";
+  if (model.policy().maximum_plan_actions() < 5) {
+    *rejection_reason = "five retirement stages exceed the configured action budget";
     return false;
   }
-  if (!CandidateStateSafe(snapshot, workload, profile, baseline, source.replica_id(),
+  if (!sequential_batch &&
+      !CandidateStateSafe(snapshot, workload, profile, baseline, source.replica_id(),
                           source.node_id(), destinations, rejection_reason))
     return false;
-  if (!PlannerNMinusOneRecoverySafe(snapshot, workload, profile, baseline, source.replica_id(),
+  if (!sequential_batch &&
+      !PlannerNMinusOneRecoverySafe(snapshot, workload, profile, baseline, source.replica_id(),
                                     source.node_id(), destinations, recovery_nodes)) {
     *rejection_reason = "N-1 availability or recovery reserve is insufficient";
     return false;
@@ -820,13 +829,18 @@ bool CompleteCandidate(const EvacuationSnapshot &snapshot, const WorkloadSpec &w
   for (const auto &pod : baseline)
     if (pod.node_id() == source.node_id())
       ++source_occupants;
-  if (source_occupants != 1) {
+  if (!sequential_batch && source_occupants != 1) {
     *rejection_reason = "source node cannot be emptied by this single-Pod operation";
     return false;
   }
 
+  const auto sequence = static_cast<std::uint32_t>(plan->operations_size());
   auto *operation = plan->add_operations();
-  operation->set_sequence(0);
+  operation->set_sequence(sequence);
+  if (sequential_batch && sequence > 0)
+    operation->add_depends_on_operation_sequences(sequence - 1);
+  if (sequential_batch && sequence == 0)
+    operation->add_depends_on_plan_action_sequences(0);
   operation->set_workload_id(workload.workload_id());
   operation->set_replica_id(source.replica_id());
   operation->set_source_pod_name(source.pod_name());
@@ -876,7 +890,7 @@ bool CompleteCandidate(const EvacuationSnapshot &snapshot, const WorkloadSpec &w
   operation->set_n_minus_1_recovery_target_replicas(count + 1);
   for (const auto &node : recovery_nodes)
     operation->add_recovery_destination_node_ids(node);
-  operation->set_deactivate_source_node_after_empty(true);
+  operation->set_deactivate_source_node_after_empty(false);
   operation->set_on_failure(v2::FAILURE_BEHAVIOR_FAIL_CLOSED_KEEP_SURGE);
 
   auto add_state = [&](v2::IntermediateStateKind kind, std::uint32_t ready, std::uint32_t live,
@@ -906,9 +920,212 @@ bool CompleteCandidate(const EvacuationSnapshot &snapshot, const WorkloadSpec &w
             "the named source Pod UID is evicted through the observed PDB", 2);
   AddAction(operation, 4, v2::EVACUATION_STAGE_WAIT_SOURCE_ABSENT,
             "source UID is absent and desired replicas are stably ready at baseline plus one", 3);
-  AddAction(operation, 5, v2::EVACUATION_STAGE_DEACTIVATE_SOURCE_NODE,
-            "source node has no remaining workload Pods", 4);
   return true;
+}
+
+bool DrainStateSafe(const EvacuationSnapshot &snapshot, const v2::EvacuationPlan &plan,
+                    const std::vector<ReplicaPlacement> &pods,
+                    const std::set<std::string> &inactive) {
+  if (!ResourceStateSafe(snapshot, pods, inactive))
+    return false;
+  for (const auto &workload : snapshot.model_snapshot().workloads()) {
+    if (!TopologyStateSafe(snapshot, workload, pods, inactive))
+      return false;
+    const bool selected =
+        std::any_of(plan.operations().begin(), plan.operations().end(), [&](const auto &operation) {
+          return operation.workload_id() == workload.workload_id();
+        });
+    if (!selected)
+      continue;
+    // The runtime's hard anti-affinity uses the placement topology key, with
+    // hostname as its default. Distinct Nodes alone do not prove distinct domains.
+    const auto key =
+        workload.topology_key().empty() ? "kubernetes.io/hostname" : workload.topology_key();
+    std::set<std::string> occupied_domains;
+    for (const auto &pod : pods) {
+      if (pod.workload_id() != workload.workload_id())
+        continue;
+      const auto *node = NodeById(snapshot.model_snapshot(), pod.node_id());
+      const auto domain = node == nullptr ? "" : LabelValue(*node, key);
+      if (domain.empty() || !occupied_domains.insert(domain).second)
+        return false;
+    }
+  }
+  return true;
+}
+
+bool DrainOutcomesSafe(const EvacuationSnapshot &snapshot, const v2::EvacuationPlan &plan,
+                       std::string *reason) {
+  using PlacementState = std::vector<ReplicaPlacement>;
+  std::vector<PlacementState> frontier{
+      PlacementState(snapshot.model_snapshot().current_placements().begin(),
+                     snapshot.model_snapshot().current_placements().end())};
+  std::size_t outcomes = 0;
+  for (const auto &operation : plan.operations()) {
+    std::vector<PlacementState> next;
+    for (const auto &baseline : frontier) {
+      if (!DrainStateSafe(snapshot, plan, baseline, {})) {
+        *reason = "sequential drain baseline violates capacity, topology, or hard anti-affinity";
+        return false;
+      }
+      std::string first = "__v2_drain_first";
+      while (std::any_of(baseline.begin(), baseline.end(), [&](const auto &pod) {
+        return pod.workload_id() == operation.workload_id() && pod.replica_id() == first;
+      }))
+        first += "_";
+      std::string second = first + "_second";
+      while (std::any_of(baseline.begin(), baseline.end(), [&](const auto &pod) {
+        return pod.workload_id() == operation.workload_id() && pod.replica_id() == second;
+      }))
+        second += "_";
+      const auto &destinations = operation.destinations().allowed_node_ids();
+      for (const auto &node : destinations) {
+        if (++outcomes > 250'000 ||
+            !DrainStateSafe(snapshot, plan,
+                            AppendReplica(baseline, operation.workload_id(), first, node), {})) {
+          *reason = "sequential drain pending outcome is unsafe or exceeds the proof bound";
+          return false;
+        }
+      }
+      // Both orders of the pending first replacement were checked above. The
+      // two final replicas have identical requests, so unordered pairs cover
+      // every distinct resource/topology outcome without sampling.
+      for (int i = 0; i < destinations.size(); ++i) {
+        for (int j = i + 1; j < destinations.size(); ++j) {
+          auto overlap =
+              AppendReplica(baseline, operation.workload_id(), first, destinations.Get(i));
+          overlap = AppendReplica(overlap, operation.workload_id(), second, destinations.Get(j));
+          auto final = WithoutSource(overlap, operation.workload_id(), operation.replica_id());
+          const std::set<std::string> inactive =
+              operation.deactivate_source_node_after_empty()
+                  ? std::set<std::string>{operation.source_node_id()}
+                  : std::set<std::string>{};
+          if (++outcomes > 250'000 || !DrainStateSafe(snapshot, plan, overlap, {}) ||
+              !DrainStateSafe(snapshot, plan, final, inactive) ||
+              CountWorkload(final, operation.workload_id()) != operation.final_desired_replicas()) {
+            *reason = "sequential drain cumulative overlap or final outcome is unsafe";
+            return false;
+          }
+          if ((next.size() + 1) * final.size() > 1'000'000) {
+            *reason = "sequential drain placement frontier exceeds the memory bound";
+            return false;
+          }
+          next.push_back(std::move(final));
+        }
+      }
+    }
+    if (next.empty())
+      return false;
+    frontier = std::move(next);
+  }
+  return true;
+}
+
+bool TrySequentialDrain(const EvacuationSnapshot &snapshot, v2::EvacuationPlan *plan,
+                        std::string *reason) {
+  const auto &model = snapshot.model_snapshot();
+  if (std::any_of(model.workloads().begin(), model.workloads().end(), [](const auto &workload) {
+        return workload.failure_tolerance() != v1::FAILURE_TOLERANCE_NONE;
+      })) {
+    return false;
+  }
+  std::map<std::string, std::vector<const PodIdentity *>> sources;
+  for (const auto &pod : snapshot.pods())
+    sources[pod.node_id()].push_back(&pod);
+  const auto workloads = WorkloadIndex(model);
+  for (auto &[node_id, pods] : sources) {
+    if (pods.size() < 2 || pods.size() > 4)
+      continue;
+    std::sort(pods.begin(), pods.end(), [](const auto *left, const auto *right) {
+      return left->workload_id() < right->workload_id();
+    });
+    std::set<std::string> selected;
+    if (std::any_of(pods.begin(), pods.end(),
+                    [&](const auto *pod) { return !selected.insert(pod->workload_id()).second; }))
+      continue;
+    auto candidate = *plan;
+    candidate.set_mode(v2::EVACUATION_PLAN_MODE_SEQUENTIAL_NODE_DRAIN);
+    bool valid = model.policy().maximum_plan_actions() >= 5 * pods.size() + 3;
+    for (const auto *source : pods) {
+      if (!valid)
+        break;
+      const auto &workload = *workloads.at(source->workload_id());
+      const auto profile = SelectProfile(model, workload);
+      const auto controller = std::find_if(
+          snapshot.controllers().begin(), snapshot.controllers().end(),
+          [&](const auto &item) { return item.workload_id() == workload.workload_id(); });
+      const auto affinity_key = workload.topology_key().empty()
+                                    ? "kubernetes.io/hostname"
+                                    : workload.topology_key();
+      std::set<std::string> occupied_domains;
+      for (const auto &placement : model.current_placements()) {
+        if (placement.workload_id() != workload.workload_id())
+          continue;
+        const auto *node = NodeById(model, placement.node_id());
+        const auto domain = node == nullptr ? "" : LabelValue(*node, affinity_key);
+        if (domain.empty() || !occupied_domains.insert(domain).second) {
+          valid = false;
+          break;
+        }
+      }
+      if (!valid)
+        break;
+      std::vector<std::string> destinations;
+      for (const auto &node : model.nodes()) {
+        const bool occupied = std::any_of(model.current_placements().begin(),
+                                          model.current_placements().end(), [&](const auto &pod) {
+                                            return pod.workload_id() == workload.workload_id() &&
+                                                   pod.node_id() == node.node_id();
+                                          });
+        const auto domain = LabelValue(node, affinity_key);
+        if (node.node_id() != node_id && node.active() &&
+            node.health() == v1::NODE_HEALTH_HEALTHY && TaintsAllowed(node, workload) && !occupied &&
+            !domain.empty() && !occupied_domains.contains(domain))
+          destinations.push_back(node.node_id());
+      }
+      std::sort(destinations.begin(), destinations.end());
+      valid = profile && controller != snapshot.controllers().end() &&
+              CompleteCandidate(snapshot, workload, *profile, *source, *controller, destinations,
+                                destinations, reason, &candidate, true);
+      if (valid) {
+        auto *binding = candidate.add_profile_bindings();
+        binding->set_workload_id(workload.workload_id());
+        binding->set_profile_id(profile->profile->profile_id());
+        binding->set_profile_sha256(profile->profile->profile_sha256());
+        binding->set_safe_point_index(profile->point_index);
+      }
+    }
+    if (!valid)
+      continue;
+    auto *last = candidate.mutable_operations(candidate.operations_size() - 1);
+    last->set_deactivate_source_node_after_empty(true);
+    AddAction(last, 5, v2::EVACUATION_STAGE_DEACTIVATE_SOURCE_NODE,
+              "source node has no remaining workload Pods", 4);
+    auto *cordon = candidate.add_plan_actions();
+    cordon->set_sequence(0);
+    cordon->set_action_id("node-drain-cordon");
+    cordon->set_stage(v2::EVACUATION_STAGE_CORDON_SOURCE_NODE);
+    cordon->set_source_node_id(last->source_node_id());
+    cordon->set_source_node_uid(last->source_node_uid());
+    cordon->set_expected_postcondition(
+        "source Node UID is cordoned before any replacement or Eviction");
+    cordon->set_on_failure(v2::FAILURE_BEHAVIOR_FAIL_CLOSED_KEEP_SURGE);
+    auto *verify = candidate.add_plan_actions();
+    verify->set_sequence(static_cast<std::uint32_t>(candidate.operations_size() + 1));
+    verify->set_action_id("node-drain-verify-empty");
+    verify->set_stage(v2::EVACUATION_STAGE_VERIFY_SOURCE_NODE_EMPTY);
+    verify->set_source_node_id(last->source_node_id());
+    verify->set_source_node_uid(last->source_node_uid());
+    verify->add_depends_on_sequences(static_cast<std::uint32_t>(candidate.operations_size()));
+    verify->set_expected_postcondition(
+        "source Node UID is cordoned and has no remaining workload Pods");
+    verify->set_on_failure(v2::FAILURE_BEHAVIOR_FAIL_CLOSED_KEEP_SURGE);
+    if (!DrainOutcomesSafe(snapshot, candidate, reason))
+      continue;
+    *plan = std::move(candidate);
+    return true;
+  }
+  return false;
 }
 
 } // namespace
@@ -1037,6 +1254,23 @@ v2::EvacuationPlan PlanEvacuationV2(const EvacuationSnapshot &snapshot) {
       plan.set_plan_id(EvacuationPlanSha256(plan));
       return plan;
     }
+  }
+  if (TrySequentialDrain(snapshot, &plan, &rejection_reason)) {
+    for (const auto capability :
+         {v2::RUNTIME_CAPABILITY_ENFORCED_NODE_SET,
+          v2::RUNTIME_CAPABILITY_ENFORCED_RESOURCE_REQUESTS,
+          v2::RUNTIME_CAPABILITY_NETWORK_BANDWIDTH_ADMISSION,
+          v2::RUNTIME_CAPABILITY_POD_UID_EVICTION, v2::RUNTIME_CAPABILITY_PDB_ADMISSION,
+          v2::RUNTIME_CAPABILITY_ATOMIC_MUTATION_FENCING,
+          v2::RUNTIME_CAPABILITY_OWNER_IDENTITY_RECHECK,
+          v2::RUNTIME_CAPABILITY_READINESS_OBSERVATION,
+          v2::RUNTIME_CAPABILITY_HARD_POD_ANTI_AFFINITY,
+          v2::RUNTIME_CAPABILITY_SEQUENTIAL_NODE_DRAIN})
+      plan.add_required_runtime_capabilities(capability);
+    plan.set_feasible(true);
+    plan.clear_infeasible_reason();
+    plan.set_plan_id(EvacuationPlanSha256(plan));
+    return plan;
   }
   if (plan.infeasible_reason().starts_with("NO FEASIBLE PLAN: invalid"))
     plan.set_infeasible_reason(NoPlanReason(rejection_reason));

@@ -176,6 +176,8 @@ spec:
                   message: execution request target must equal desired replicas
                 - rule: "!has(self.executionRequest) || self.executionRequest.purpose != 'staged-replacement-v1' || (has(self.executionRequest.minimumReadyReplicas) && self.executionRequest.minimumReadyReplicas >= self.availabilityFloor && self.executionRequest.minimumReadyReplicas <= self.executionRequest.targetReplicas)"
                   message: staged replacement must persist its approved ready replica floor
+                - rule: "!has(self.executionRequest) || self.executionRequest.purpose != 'staged-replacement-v1' || (has(self.placement.requirePodAntiAffinity) && self.placement.requirePodAntiAffinity)"
+                  message: staged replacement requires the verifier's hard Pod anti-affinity constraint
                 - rule: "self.replicas <= oldSelf.replicas || (self.executionProtocol == 'monotonic-scale-up-v1' && has(self.executionRequest) && self.executionRequest.expectedReplicas == oldSelf.replicas && self.executionRequest.targetReplicas == self.replicas && (!has(oldSelf.executionRequest) || self.executionRequest.generation > oldSelf.executionRequest.generation))"
                   message: replica growth requires a new durable execution request
                 - rule: self.availabilityFloor <= self.replicas
@@ -726,6 +728,10 @@ spec:
                         type: integer
                         format: int64
                         minimum: 1
+                      readinessStabilizationMs:
+                        type: integer
+                        format: int64
+                        minimum: 0
                 execution:
                   type: object
                   required: [planID, operationID, generation, targetReplicas, phase]

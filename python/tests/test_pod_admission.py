@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 from copy import deepcopy
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -125,6 +126,18 @@ def test_only_one_exact_pod_create_can_claim_a_durable_reservation() -> None:
     assert api.status_patches == 1
 
 
+def test_pod_create_cannot_reuse_a_retired_logical_slot() -> None:
+    workload = _workload()
+    workload["status"]["retiredReplicaSlots"] = [{"replicaID": "api-0"}]
+    pod = _pod_object(workload, 0, workload["status"]["pendingPodCreate"])
+    api = AdmissionAPI(workload)
+
+    assert PodCreateAdmission(api, "fleetright-v2", "fleetright-workload-controller").admit(
+        _request(pod)
+    ) == (False, "Pod CREATE targets a retired or invalid logical slot")
+    assert api.status_patches == 0
+
+
 def test_admission_rejects_forged_placement_stale_identity_and_old_writer() -> None:
     workload = _workload()
     intent = workload["status"]["pendingPodCreate"]
@@ -156,6 +169,21 @@ def test_admission_rejects_forged_placement_stale_identity_and_old_writer() -> N
     extra_label = deepcopy(pod)
     extra_label["metadata"]["labels"]["attacker.example/route"] = "elsewhere"
     assert admission.admit(_request(extra_label))[0] is False
+
+
+def test_admission_rejects_direct_node_assignment_for_every_pod_create() -> None:
+    pod = {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {"name": "native-pod"},
+        "spec": {"nodeName": "worker-a"},
+    }
+    request = _request(pod)
+    request["userInfo"]["username"] = "system:serviceaccount:fleetright-v2:other"
+
+    assert PodCreateAdmission(AdmissionAPI(_workload()), "fleetright-v2", "controller").admit(
+        request
+    ) == (False, "Pod CREATE cannot assign a Node directly")
 
 
 def test_known_api_server_defaults_are_accepted_without_allowing_custom_values() -> None:
@@ -458,13 +486,20 @@ class EvictionAPI(AdmissionAPI):
             {"name": "worker-a", "uid": "node-a-uid"},
             {"name": "worker-b", "uid": "node-b-uid"},
         ]
+        workload["spec"]["placement"]["requirePodAntiAffinity"] = True
         source_intent = workload["status"].pop("pendingPodCreate")
         self.source = _pod_object(workload, 0, source_intent)
         self.source["metadata"].update(uid="source-uid", resourceVersion="3")
         self.source["spec"]["nodeName"] = "worker-a"
         self.source["status"] = {
             "phase": "Running",
-            "conditions": [{"type": "Ready", "status": "True"}],
+            "conditions": [
+                {
+                    "type": "Ready",
+                    "status": "True",
+                    "lastTransitionTime": "2000-01-01T00:00:00Z",
+                }
+            ],
         }
         workload["metadata"].update(generation=2, resourceVersion="9")
         workload["spec"].update(
@@ -534,6 +569,7 @@ class EvictionAPI(AdmissionAPI):
                     "replacementNodeUID": "node-b-uid",
                     "replacementCreateID": "replacement-create-id",
                     "replacementWorkloadGeneration": 2,
+                    "readinessStabilizationMs": 0,
                 }
             ],
         )
@@ -619,6 +655,20 @@ def test_eviction_requires_current_authority_bound_ready_replacement_and_fresh_p
     assert api.status_patches == 0
 
 
+def test_eviction_admission_requires_replacement_readiness_to_remain_stable() -> None:
+    api = EvictionAPI()
+    api.workload["status"]["retiredReplicaSlots"][0]["readinessStabilizationMs"] = 60_000
+    api.replacement["status"]["conditions"][0]["lastTransitionTime"] = (
+        datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    )
+    admission = PodCreateAdmission(api, "fleetright-v2", "fleetright-workload-controller")
+
+    allowed, message = admission.admit(_eviction_request(api))
+
+    assert allowed is False
+    assert "readiness" in message
+
+
 @pytest.mark.parametrize(
     ("target", "path", "value"),
     [
@@ -660,6 +710,7 @@ def test_eviction_requires_current_authority_bound_ready_replacement_and_fresh_p
             "wrong-create-id",
         ),
         ("workload", ("status", "retiredReplicaSlots", 0, "replacementWorkloadGeneration"), 1),
+        ("workload", ("status", "retiredReplicaSlots", 0, "readinessStabilizationMs"), None),
         ("workload", ("spec", "executionRequest", "minimumReadyReplicas"), 2),
         ("source", ("metadata", "uid"), "recreated-source-uid"),
         ("source", ("spec", "nodeName"), "worker-b"),
@@ -719,6 +770,18 @@ def test_unready_source_eviction_still_preserves_the_effective_pdb_floor() -> No
     assert admission.admit(_eviction_request(api))[0] is False
 
 
+def test_eviction_requires_the_verified_hard_anti_affinity_contract() -> None:
+    api = EvictionAPI()
+    api.workload["spec"]["placement"]["requirePodAntiAffinity"] = False
+    admission = PodCreateAdmission(api, "fleetright-v2", "fleetright-workload-controller")
+
+    allowed, message = admission.admit(_eviction_request(api))
+
+    assert allowed is False
+    assert message == "Eviction has no current workload execution authority"
+    assert api.status_patches == 0
+
+
 def test_eviction_rejects_a_fence_change_during_evidence_reads() -> None:
     api = EvictionAPI()
     api.change_during_read = True
@@ -752,6 +815,161 @@ def test_eviction_admission_cannot_revoke_a_request_already_allowed() -> None:
     assert api.source is None
 
 
+def _binding_admission(monkeypatch: pytest.MonkeyPatch):
+    node = {
+        "metadata": {"name": "worker-b", "uid": "node-b-uid", "resourceVersion": "21"},
+        "spec": {},
+    }
+    pod = {
+        "metadata": {
+            "name": "api-pending",
+            "namespace": "fleetright-v2",
+            "uid": "pod-uid",
+            "resourceVersion": "11",
+        },
+        "spec": {},
+    }
+    request = {
+        "uid": "binding-admission-1",
+        "operation": "CREATE",
+        "resource": {"group": "", "version": "v1", "resource": "pods"},
+        "subResource": "binding",
+        "namespace": "fleetright-v2",
+        "name": "api-pending",
+        "object": {
+            "apiVersion": "v1",
+            "kind": "Binding",
+            "metadata": {
+                "name": "api-pending",
+                "namespace": "fleetright-v2",
+                "uid": "pod-uid",
+            },
+            "target": {"kind": "Node", "name": "worker-b"},
+        },
+    }
+    api = AdmissionAPI(_workload())
+    api.pod = pod
+
+    def get_evidence(method: str, path: str):
+        assert method == "GET"
+        if path == "/api/v1/nodes/worker-b":
+            return deepcopy(node)
+        assert path == "/api/v1/namespaces/fleetright-v2/pods/api-pending"
+        return deepcopy(pod)
+
+    monkeypatch.setattr(api, "request", get_evidence)
+    admission = PodCreateAdmission(api, "fleetright-v2", "fleetright-workload-controller")
+    return admission, node, request, api
+
+
+@pytest.mark.parametrize(
+    "annotations",
+    [
+        {"fleetright.io/plan-id": "plan-1", "fleetright.io/operation-id": "drain-1"},
+        {"fleetright.io/plan-id": "plan-1"},
+        {"fleetright.io/fencing-token": "3"},
+    ],
+)
+def test_binding_to_fleetright_draining_node_is_denied(monkeypatch, annotations):
+    admission, node, request, api = _binding_admission(monkeypatch)
+    node["metadata"]["annotations"] = annotations
+    assert admission.admit(request)[0] is False
+    assert api.status_patches == 0
+
+
+def test_binding_to_other_schedulable_destination_is_allowed(monkeypatch):
+    admission, node, request, api = _binding_admission(monkeypatch)
+    node["metadata"]["annotations"] = {"other-controller.example/keep": "yes"}
+    assert admission.admit(request) == (True, "")
+    assert api.status_patches == 0
+
+
+def test_binding_allowed_before_cordon_cannot_be_retroactively_revoked(monkeypatch):
+    admission, node, request, _ = _binding_admission(monkeypatch)
+    accepted = admission.admit(request)
+    node["spec"]["unschedulable"] = True
+    assert accepted == (True, "")
+    assert admission.admit(request)[0] is False
+
+
+def test_binding_uid_precondition_rejects_a_recreated_pod(monkeypatch):
+    admission, _, request, api = _binding_admission(monkeypatch)
+    api.pod["metadata"]["uid"] = "replacement-pod-uid"
+
+    assert admission.admit(request) == (
+        False,
+        "Binding Pod is missing, changed, deleting, or already assigned",
+    )
+
+
+def test_binding_for_a_missing_pod_fails_closed(monkeypatch):
+    admission, _, request, api = _binding_admission(monkeypatch)
+    get_evidence = api.request
+
+    def missing_pod(method, path):
+        if path.endswith("/pods/api-pending"):
+            raise ApiError(404, "missing")
+        return get_evidence(method, path)
+
+    monkeypatch.setattr(api, "request", missing_pod)
+
+    assert admission.admit(request) == (
+        False,
+        "Node binding evidence is unavailable or invalid",
+    )
+
+
+def test_binding_requires_live_unbound_pod(monkeypatch):
+    admission, _, request, api = _binding_admission(monkeypatch)
+    api.pod["metadata"]["deletionTimestamp"] = "2026-10-12T00:00:00Z"
+
+    assert admission.admit(request)[0] is False
+
+
+@pytest.mark.parametrize(
+    ("object_name", "path", "value"),
+    [
+        ("node", ("metadata", "name"), "different-node"),
+        ("node", ("metadata", "uid"), None),
+        ("node", ("metadata", "resourceVersion"), ""),
+        ("node", ("metadata", "annotations"), []),
+        ("node", ("metadata", "deletionTimestamp"), "2026-10-12T00:00:00Z"),
+        ("node", ("spec",), None),
+        ("node", ("spec", "unschedulable"), "false"),
+        ("request", ("object", "target", "uid"), "old-node-uid"),
+        ("request", ("object", "target", "kind"), "Pod"),
+        ("request", ("object", "target", "apiVersion"), "apps/v1"),
+        ("request", ("object", "metadata", "name"), "different-pod"),
+        ("request", ("object", "metadata", "uid"), None),
+        ("request", ("namespace",), "other-namespace"),
+    ],
+)
+def test_binding_invalid_identity_or_node_evidence_fails_closed(
+    monkeypatch, object_name, path, value
+):
+    admission, node, request, _ = _binding_admission(monkeypatch)
+    item = {"node": node, "request": request}[object_name]
+    for key in path[:-1]:
+        item = item[key]
+    item[path[-1]] = value
+    allowed, message = admission.admit(request)
+    assert allowed is False
+    assert message
+
+
+@pytest.mark.parametrize(
+    "error", [ApiError(404, "missing"), ApiError(403, "denied"), RuntimeError("timeout")]
+)
+def test_binding_missing_or_unavailable_node_fails_closed(monkeypatch, error):
+    admission, _, request, api = _binding_admission(monkeypatch)
+
+    def unavailable_node(method, path):
+        raise error
+
+    monkeypatch.setattr(api, "request", unavailable_node)
+    assert admission.admit(request) == (False, "Node binding evidence is unavailable or invalid")
+
+
 def test_eviction_webhook_and_rbac_keep_direct_pod_delete_denied() -> None:
     root = Path(__file__).resolve().parents[2]
     configuration = yaml.safe_load(
@@ -763,6 +981,12 @@ def test_eviction_webhook_and_rbac_keep_direct_pod_delete_denied() -> None:
         rule["apiGroups"] == [""]
         and rule["operations"] == ["CREATE"]
         and "pods/eviction" in rule["resources"]
+        for rule in webhook["rules"]
+    )
+    assert any(
+        rule["apiGroups"] == [""]
+        and rule["operations"] == ["CREATE"]
+        and "pods/binding" in rule["resources"]
         for rule in webhook["rules"]
     )
     roles = list(yaml.safe_load_all((root / "deploy/kubernetes/rbac.yaml").read_text()))

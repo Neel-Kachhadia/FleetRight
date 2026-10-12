@@ -65,6 +65,7 @@ def test_takeover_does_not_resolve_unknown_destructive_action_with_scale_fence(
     prepare = Mock(return_value=12)
     monkeypatch.setattr(Repository, "prepare_execution_takeover", prepare)
     monkeypatch.setattr(Repository, "incomplete_actions", Mock(return_value=[action]))
+    monkeypatch.setattr(Repository, "completed_retirement_actions", Mock(return_value=[]))
     scale_receipt = Mock(
         return_value={
             "state": "COMPLETE",

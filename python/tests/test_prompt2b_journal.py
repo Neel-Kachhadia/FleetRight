@@ -5,6 +5,7 @@ import time
 import uuid
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from dataclasses import dataclass, field
 
 import psycopg
@@ -20,6 +21,7 @@ from fleetright.control import (
 )
 from fleetright.execution import (
     ActionBlocked,
+    FleetRightWorkloadTarget,
     OutcomeUnknown,
     TargetNotFound,
     TargetPreconditionFailed,
@@ -248,6 +250,13 @@ class FakeFleetRightWorkloadTarget:
             "execution_fence": self.execution_fence,
             "execution": self.execution,
             "reconciled": self.reconciled,
+            "pod_create_protocol": "reserved-create-v1",
+            "pod_create_admission_protocol": "claimed-create-v1",
+            "pending_pod_create": None,
+            "pod_create_history_uncertain": False,
+            "unverified_pod_creates": 0,
+            "retired_replica_slots": [],
+            "authorized_pod_creates": [],
         }
 
     def fence_scale(
@@ -259,6 +268,7 @@ class FakeFleetRightWorkloadTarget:
         plan_id: str,
         operation_id: str,
         target_replicas: int,
+        **_retirement_args: object,
     ) -> dict[str, object]:
         current = self.observe_scale(_workload_id)
         if self.fencing_token > token:
@@ -546,6 +556,192 @@ def _prepare_controller(
     return controller, target, health
 
 
+@pytest.mark.parametrize("action_state", ["RUNNING", "FAILED"])
+def test_failed_safe_keeps_lock_when_a_workload_create_is_pending(
+    clean_database: Database, action_state: str
+) -> None:
+    class PendingCreateTarget(FakeScaleTarget):
+        supports_workload_execution = True
+
+        def observe_scale(self, workload_id: str) -> dict[str, object]:
+            return {
+                **super().observe_scale(workload_id),
+                "fencing_token": 14,
+                "execution_fence": {"generation": 14},
+                "pending_pod_create": {"operationID": "scale"},
+                "pod_create_history_uncertain": False,
+                "unverified_pod_creates": 0,
+            }
+
+    repo = clean_database.repository
+    controller, _, _ = _prepare_controller(
+        repo, "pending-create-failsafe", 8, 9, ["workload:cpu-api"]
+    )
+    with repo.transaction() as conn:
+        execution = conn.execute(
+            "SELECT controller_fencing_token FROM plan_executions "
+            "WHERE plan_id = 'pending-create-failsafe'"
+        ).fetchone()
+        token = execution["controller_fencing_token"]
+        Repository.transition_action(
+            conn,
+            "pending-create-failsafe",
+            "scale",
+            "NOT_STARTED",
+            "RUNNING",
+            "controller-a",
+            token,
+            pre_observation={"uid": "deployment-uid", "generation": 1, "replicas": 8},
+        )
+    target = PendingCreateTarget(8)
+    controller.target = target
+    if action_state == "FAILED":
+        with repo.transaction() as conn:
+            Repository.transition_action(
+                conn,
+                "pending-create-failsafe",
+                "scale",
+                "RUNNING",
+                "FAILED",
+                "controller-a",
+                token,
+                target_observation=target.observe_scale("cpu-api"),
+                error="test-failure",
+            )
+    receipt = {
+        "token": 14,
+        "generation": target.generation,
+        "observation": target.observe_scale("cpu-api"),
+    }
+    controller._takeover_fence_receipt = lambda *_args, **_kwargs: receipt  # type: ignore[method-assign]
+    controller._takeover_fence_matches = lambda *_args, **_kwargs: True  # type: ignore[method-assign]
+
+    controller._fail_safe("pending-create-failsafe", token, "test-failure")
+
+    with repo.transaction() as conn:
+        action = conn.execute(
+            "SELECT execution_state FROM action_intents WHERE plan_id = 'pending-create-failsafe'"
+        ).fetchone()
+        execution = conn.execute(
+            "SELECT status FROM plan_executions WHERE plan_id = 'pending-create-failsafe'"
+        ).fetchone()
+        lease = conn.execute(
+            "SELECT 1 FROM plan_leases WHERE plan_id = 'pending-create-failsafe'"
+        ).fetchone()
+    assert action["execution_state"] == action_state
+    assert execution["status"] == "EXECUTING"
+    assert lease is not None
+
+
+def test_failed_safe_keeps_lock_when_workload_name_is_recreated_with_new_uid(
+    clean_database: Database,
+) -> None:
+    repo = clean_database.repository
+    controller, _, _ = _prepare_controller(
+        repo, "recreated-workload-failsafe", 8, 9, ["workload:cpu-api"]
+    )
+    with repo.transaction() as conn:
+        execution = conn.execute(
+            "SELECT controller_fencing_token FROM plan_executions "
+            "WHERE plan_id = 'recreated-workload-failsafe'"
+        ).fetchone()
+        token = execution["controller_fencing_token"]
+        Repository.transition_action(
+            conn,
+            "recreated-workload-failsafe",
+            "scale",
+            "NOT_STARTED",
+            "RUNNING",
+            "controller-a",
+            token,
+            pre_observation={"uid": "deployment-uid", "generation": 1, "replicas": 8},
+        )
+        Repository.transition_action(
+            conn,
+            "recreated-workload-failsafe",
+            "scale",
+            "RUNNING",
+            "FAILED",
+            "controller-a",
+            token,
+            target_observation={"uid": "deployment-uid", "generation": 1, "replicas": 8},
+            error="test-failure",
+        )
+
+    target = FakeFleetRightWorkloadTarget(8)
+    target.uid = "replacement-workload-uid"
+    controller.target = target
+    controller._fail_safe("recreated-workload-failsafe", token, "test-failure")
+
+    with repo.transaction() as conn:
+        action = conn.execute(
+            "SELECT execution_state FROM action_intents "
+            "WHERE plan_id = 'recreated-workload-failsafe'"
+        ).fetchone()
+        execution = conn.execute(
+            "SELECT status FROM plan_executions WHERE plan_id = 'recreated-workload-failsafe'"
+        ).fetchone()
+        lease = conn.execute(
+            "SELECT 1 FROM plan_leases WHERE plan_id = 'recreated-workload-failsafe'"
+        ).fetchone()
+    assert action["execution_state"] == "FAILED"
+    assert execution["status"] == "EXECUTING"
+    assert lease is not None
+
+
+def test_takeover_keeps_workload_action_locked_when_owner_disappears(
+    clean_database: Database,
+) -> None:
+    class DeletedWorkloadTarget(FakeScaleTarget):
+        supports_workload_execution = True
+
+        def observe_scale(self, _workload_id: str) -> dict[str, object]:
+            raise TargetNotFound("FleetRightWorkload is absent")
+
+    repo = clean_database.repository
+    _controller_a, _, _ = _prepare_controller(
+        repo, "deleted-workload-takeover", 8, 9, ["workload:cpu-api"]
+    )
+    with repo.transaction() as conn:
+        execution = conn.execute(
+            "SELECT controller_fencing_token FROM plan_executions "
+            "WHERE plan_id = 'deleted-workload-takeover'"
+        ).fetchone()
+        token = execution["controller_fencing_token"]
+        Repository.transition_action(
+            conn,
+            "deleted-workload-takeover",
+            "scale",
+            "NOT_STARTED",
+            "RUNNING",
+            "controller-a",
+            token,
+            pre_observation={"uid": "deployment-uid", "generation": 1, "replicas": 8},
+        )
+        conn.execute(
+            "UPDATE plan_executions SET controller_lease_expires_at = clock_timestamp() "
+            "WHERE plan_id = 'deleted-workload-takeover'"
+        )
+    target = DeletedWorkloadTarget(8)
+    controller_b = ExecutionController(repo, target, FakeHealth(), "controller-b")
+
+    controller_b.run_once()
+
+    with repo.transaction() as conn:
+        action = conn.execute(
+            "SELECT execution_state FROM action_intents WHERE plan_id = 'deleted-workload-takeover'"
+        ).fetchone()
+        execution = conn.execute(
+            "SELECT status FROM plan_executions WHERE plan_id = 'deleted-workload-takeover'"
+        ).fetchone()
+        lease = conn.execute(
+            "SELECT 1 FROM plan_leases WHERE plan_id = 'deleted-workload-takeover'"
+        ).fetchone()
+    assert action["execution_state"] == "RUNNING"
+    assert execution["status"] == "EXECUTING"
+    assert lease is not None
+
+
 def test_journal_transitions_match_plan_schema() -> None:
     assert transition_allowed("APPROVED", "EXECUTING")
     assert transition_allowed("EXECUTING", "VERIFYING")
@@ -813,6 +1009,102 @@ def test_takeover_fences_unknown_targets_before_final_claim(clean_database: Data
         with pytest.raises(LeaseConflict):
             Repository.assert_execution_controller(conn, "takeover", "controller-a", old_token)
         assert Repository.runnable_actions(conn, "takeover", "controller-b", pending_token) == []
+
+
+def test_takeover_recovers_running_node_drain_verification(clean_database: Database) -> None:
+    repo = clean_database.repository
+    payload = {
+        "operation_id": "verify-operation",
+        "cordon_operation_id": "cordon-operation",
+        "source_node_id": "worker-1",
+        "source_node_uid": "worker-uid",
+        "source_pods": [{"workload_id": "api", "pod_name": "api-0", "pod_uid": "pod-uid"}],
+    }
+    observation = {
+        "stage": "NODE_DRAIN_WAITING",
+        "source_node_id": "worker-1",
+        "source_node_uid": "worker-uid",
+        "plan_id": "verify-takeover",
+        "operation_id": "cordon-operation",
+        "unschedulable": True,
+        "remaining_source_pod_uids": ["pod-uid"],
+        "exempt_pods": [],
+        "inventory_pod_count": 1,
+    }
+    with repo.transaction() as conn:
+        _insert_plan(conn, "verify-takeover")
+        conn.execute(
+            "INSERT INTO action_intents (plan_id, intent_id, action_sequence, action_type, "
+            "payload, status) VALUES ('verify-takeover', 'verify-node', 0, "
+            "'VERIFY_NODE_DRAIN', %s, 'APPROVED')",
+            (Jsonb(payload),),
+        )
+    claim = _claim(repo, "verify-takeover")
+    old_token = claim["execution"]["controller_fencing_token"]
+    with repo.transaction() as conn:
+        Repository.transition_action(
+            conn,
+            "verify-takeover",
+            "verify-node",
+            "NOT_STARTED",
+            "RUNNING",
+            "controller-a",
+            old_token,
+            pre_observation={"source_node_uid": "worker-uid"},
+            result={"stage": "NODE_DRAIN_VERIFY_INTENT"},
+        )
+        conn.execute(
+            "UPDATE plan_executions SET controller_lease_expires_at = clock_timestamp() "
+            "WHERE plan_id = 'verify-takeover'"
+        )
+
+    class Target:
+        supports_workload_execution = True
+
+        def __init__(self) -> None:
+            self.cordons: list[int] = []
+            self.observations: list[int] = []
+
+        def cordon_source_node(self, _plan_id: str, _payload: dict[str, object], token: int):
+            self.cordons.append(token)
+            return {**observation, "stage": "NODE_CORDONED", "fencing_token": token}
+
+        def observe_source_node_drain(self, _plan_id: str, _payload: dict[str, object], token: int):
+            self.observations.append(token)
+            return observation
+
+    target = Target()
+    controller = ExecutionController(repo, target, object(), "controller-b")
+    with repo.transaction() as conn:
+        execution = next(
+            row
+            for row in Repository.runnable_executions(conn)
+            if row["plan_id"] == "verify-takeover"
+        )
+    token = controller._claim(execution)
+    assert token is not None and token > old_token
+    assert target.cordons == [token] and target.observations == [token]
+    with repo.transaction() as conn:
+        receipt = Repository.execution_fence_receipt(conn, "verify-takeover", "verify-node", token)
+        assert receipt is not None
+        assert receipt["state"] == "COMPLETE"
+        assert receipt["observation"] == {
+            **observation,
+            "stage": "NODE_CORDONED",
+            "fencing_token": token,
+        }
+        assert Repository.assert_execution_controller(
+            conn, "verify-takeover", "controller-b", token
+        )
+
+    controller._reconcile("verify-takeover", token, None)
+    assert target.observations == [token, token]
+    with repo.transaction() as conn:
+        action = Repository.incomplete_actions(conn, "verify-takeover")[0]
+        assert action["execution_state"] == "RUNNING"
+        assert action["execution_result"]["progress"][-1]["result"]["stage"] == (
+            "NODE_DRAIN_WAITING"
+        )
 
 
 def test_workload_takeover_recovers_preapply_crash(clean_database: Database) -> None:
@@ -1526,9 +1818,25 @@ class RetirementGateTarget(FakeScaleTarget):
         raise self.failure
 
 
-def _prepare_retirement_action(repo: Repository, plan_id: str) -> None:
+def _prepare_retirement_action(
+    repo: Repository, plan_id: str, conflict_key: str | None = None
+) -> None:
     with repo.transaction() as conn:
         _insert_plan(conn, plan_id)
+        if conflict_key is not None:
+            conn.execute(
+                "UPDATE plans SET binding = %s WHERE plan_id = %s",
+                (Jsonb({"source": {}, "conflict_keys": [conflict_key]}), plan_id),
+            )
+            fencing_token = Repository.acquire_lease(
+                conn, conflict_key, f"plan:{plan_id}", "operator", 60_000
+            )
+            assert fencing_token is not None
+            conn.execute(
+                "INSERT INTO plan_leases (plan_id, conflict_key, owner_id, fencing_token) "
+                "VALUES (%s, %s, %s, %s)",
+                (plan_id, conflict_key, f"plan:{plan_id}", fencing_token),
+            )
         conn.execute(
             "INSERT INTO control_state "
             "(singleton, snapshot_id, snapshot_generation, binding) VALUES "
@@ -1635,6 +1943,269 @@ def test_pre_tombstone_pdb_block_retries_replacement_preparation(
     assert results[-1]["source_retirement_intent_recorded"] is True
 
 
+def test_pre_eviction_resource_version_conflict_retries_after_reobservation(
+    clean_database: Database,
+) -> None:
+    class RetryTarget(FakeScaleTarget):
+        source_retirement_preparation_enabled = True
+
+        def __init__(self) -> None:
+            super().__init__(1)
+            self.prepare_calls = 0
+
+        def prepare_source_retirement(self, *_args: object) -> dict[str, object]:
+            self.prepare_calls += 1
+            if self.prepare_calls == 1:
+                raise TargetPreconditionFailed("target resource version changed")
+            return {"stage": "REPLACEMENT_REQUESTED"}
+
+    repo = clean_database.repository
+    plan_id = "retirement-status-cas-retry"
+    _prepare_retirement_action(repo, plan_id, f"workload:{plan_id}")
+    target = RetryTarget()
+    controller = ExecutionController(repo, target, FakeHealth(), "controller-a")
+
+    controller.run_once()
+    with repo.transaction() as conn:
+        action = conn.execute(
+            "SELECT execution_state FROM action_intents WHERE plan_id = %s",
+            (plan_id,),
+        ).fetchone()
+        execution = conn.execute(
+            "SELECT status FROM plan_executions WHERE plan_id = %s", (plan_id,)
+        ).fetchone()
+        lock = conn.execute(
+            "SELECT count(*) AS total FROM plan_leases WHERE plan_id = %s", (plan_id,)
+        ).fetchone()
+
+    assert target.prepare_calls == 1
+    assert action["execution_state"] == "RUNNING"
+    assert execution["status"] == "EXECUTING"
+    assert lock["total"] == 1
+
+    controller.run_once()
+
+    with repo.transaction() as conn:
+        action = conn.execute(
+            "SELECT execution_state, execution_error, execution_result "
+            "FROM action_intents WHERE plan_id = %s",
+            (plan_id,),
+        ).fetchone()
+        execution = conn.execute(
+            "SELECT status FROM plan_executions WHERE plan_id = %s", (plan_id,)
+        ).fetchone()
+    results = [item["result"] for item in action["execution_result"]["progress"]]
+    assert target.prepare_calls == 2
+    assert action["execution_state"] == "RUNNING"
+    assert action["execution_error"] is None
+    assert results[-1]["stage"] == "REPLACEMENT_REQUESTED"
+    assert execution["status"] == "EXECUTING"
+
+
+def test_post_eviction_readiness_deadline_starts_at_observed_source_removal(
+    clean_database: Database,
+) -> None:
+    class WaitingRetirementTarget(FakeFleetRightWorkloadTarget):
+        source_retirement_preparation_enabled = True
+
+        def __init__(self) -> None:
+            super().__init__(2)
+            self.complete = False
+            self.retirement_calls = 0
+
+        def prepare_source_retirement(self, *_args: object, **_kwargs: object):
+            raise AssertionError("resumed retirement must not start a second replacement")
+
+        def observe_source_retirement(self, *_args: object, **_kwargs: object):
+            self.retirement_calls += 1
+            if not self.complete:
+                return {
+                    "stage": "RETIREMENT_WAITING_FINAL_HEALTH",
+                    "source_removed_observed": True,
+                    "observation": self.observe_scale("cpu-api"),
+                }
+            return {
+                "stage": "RETIREMENT_COMPLETE",
+                "observation": self.observe_scale("cpu-api"),
+            }
+
+    repo = clean_database.repository
+    plan_id = "retirement-post-source-readiness"
+    _prepare_retirement_action(repo, plan_id, f"workload:{plan_id}")
+    target = WaitingRetirementTarget()
+    health = FakeHealth()
+    controller = ExecutionController(
+        repo, target, health, "controller-a", readiness_timeout_seconds=30
+    )
+    payload = {
+        "operation_id": "retire",
+        "health": {
+            "p99_limit_ms": 120,
+            "error_slo_ppm": 1000,
+            "max_queue_growth_milli": 0,
+        },
+    }
+    with repo.transaction() as conn:
+        execution = conn.execute(
+            "SELECT controller_fencing_token FROM plan_executions WHERE plan_id = %s",
+            (plan_id,),
+        ).fetchone()
+        token = execution["controller_fencing_token"]
+        conn.execute(
+            "UPDATE action_intents SET payload = %s WHERE plan_id = %s",
+            (Jsonb(payload), plan_id),
+        )
+        Repository.transition_action(
+            conn,
+            plan_id,
+            "retire",
+            "NOT_STARTED",
+            "RUNNING",
+            "controller-a",
+            token,
+            pre_observation=target.observe_scale("cpu-api"),
+        )
+        conn.execute(
+            "UPDATE action_intents SET execution_started_at = clock_timestamp() "
+            "- interval '5 minutes' "
+            "WHERE plan_id = %s",
+            (plan_id,),
+        )
+        Repository.record_action_progress(
+            conn,
+            plan_id,
+            "retire",
+            "controller-a",
+            token,
+            observation=target.observe_scale("cpu-api"),
+            result={"stage": "EVICTION_ACCEPTED", "source_retirement_intent_recorded": True},
+        )
+        action = conn.execute(
+            "SELECT * FROM action_intents WHERE plan_id = %s", (plan_id,)
+        ).fetchone()
+
+    controller._start_source_retirement(plan_id, token, action, payload, None)
+
+    with repo.transaction() as conn:
+        action = conn.execute(
+            "SELECT execution_state, execution_result FROM action_intents WHERE plan_id = %s",
+            (plan_id,),
+        ).fetchone()
+        execution = conn.execute(
+            "SELECT status FROM plan_executions WHERE plan_id = %s", (plan_id,)
+        ).fetchone()
+        lock = conn.execute(
+            "SELECT count(*) AS total FROM plan_leases WHERE plan_id = %s", (plan_id,)
+        ).fetchone()
+    waiting = [
+        item
+        for item in action["execution_result"]["progress"]
+        if item.get("result", {}).get("stage") == "RETIREMENT_WAITING_FINAL_HEALTH"
+    ]
+    assert action["execution_state"] == "RUNNING"
+    assert execution["status"] == "EXECUTING"
+    assert lock["total"] == 1
+    assert len(waiting) == 1, action
+    assert waiting[0]["result"]["source_removed_observed"] is True
+    assert waiting[0]["recorded_at"]
+    assert health.calls == 1
+
+    target.complete = True
+    with repo.transaction() as conn:
+        action = conn.execute(
+            "SELECT * FROM action_intents WHERE plan_id = %s", (plan_id,)
+        ).fetchone()
+    controller._start_source_retirement(plan_id, token, action, payload, None)
+    with repo.transaction() as conn:
+        action = conn.execute(
+            "SELECT execution_state, execution_result FROM action_intents WHERE plan_id = %s",
+            (plan_id,),
+        ).fetchone()
+    assert action["execution_state"] == "SUCCEEDED"
+    assert action["execution_result"]["result"]["stage"] == "RETIREMENT_COMPLETE"
+
+
+def test_retirement_does_not_evict_without_fresh_healthy_slo(
+    clean_database: Database,
+) -> None:
+    class ReadyRetirementTarget(FakeScaleTarget):
+        supports_workload_execution = True
+        source_retirement_preparation_enabled = True
+
+        def observe_source_retirement(self, *_args: object, **_kwargs: object):
+            return {"stage": "EVICTION_RETRY_SAFE"}
+
+        def evict_source(self, *_args: object, **_kwargs: object):
+            raise AssertionError("Eviction dispatched with unhealthy SLO")
+
+    repo = clean_database.repository
+    plan_id = "retirement-unhealthy-slo"
+    _prepare_retirement_action(repo, plan_id, f"resource:{plan_id}")
+    target = ReadyRetirementTarget(2)
+    health = FakeHealth([False])
+    controller = ExecutionController(repo, target, health, "controller-a")
+    with repo.transaction() as conn:
+        action = conn.execute(
+            "SELECT * FROM action_intents WHERE plan_id = %s AND intent_id = 'retire'",
+            (plan_id,),
+        ).fetchone()
+        payload = {
+            **action["payload"],
+            "health": {
+                "p99_limit_ms": 120,
+                "error_slo_ppm": 1000,
+                "max_queue_growth_milli": 0,
+            },
+        }
+        conn.execute(
+            "UPDATE action_intents SET payload = %s WHERE plan_id = %s AND intent_id = 'retire'",
+            (Jsonb(payload), plan_id),
+        )
+        claim = conn.execute(
+            "SELECT controller_fencing_token FROM plan_executions WHERE plan_id = %s",
+            (plan_id,),
+        ).fetchone()
+        token = claim["controller_fencing_token"]
+        observation = target.observe_scale("cpu-api")
+        Repository.transition_action(
+            conn,
+            plan_id,
+            "retire",
+            "NOT_STARTED",
+            "RUNNING",
+            "controller-a",
+            token,
+            pre_observation=observation,
+        )
+        Repository.record_action_progress(
+            conn,
+            plan_id,
+            "retire",
+            "controller-a",
+            token,
+            observation=observation,
+            result={"stage": "READY_FOR_SAFE_EVICTION", "source_retirement_intent_recorded": True},
+        )
+        action = conn.execute(
+            "SELECT * FROM action_intents WHERE plan_id = %s AND intent_id = 'retire'",
+            (plan_id,),
+        ).fetchone()
+
+    controller._start_source_retirement(plan_id, token, action, payload, None)
+
+    with repo.transaction() as conn:
+        action = conn.execute(
+            "SELECT execution_state, execution_result FROM action_intents "
+            "WHERE plan_id = %s AND intent_id = 'retire'",
+            (plan_id,),
+        ).fetchone()
+        assert action["execution_state"] == "RUNNING"
+        assert not any(
+            item.get("result", {}).get("stage") == "EVICTION_INTENT"
+            for item in action["execution_result"]["progress"]
+        )
+
+
 def test_retirement_takeover_stays_unresolved_without_target_fence(
     clean_database: Database,
 ) -> None:
@@ -1684,6 +2255,384 @@ def test_retirement_takeover_stays_unresolved_without_target_fence(
     assert fence is None
 
 
+def _completed_retirement_takeover(
+    repo: Repository, plan_id: str
+) -> tuple[ExecutionController, FakeFleetRightWorkloadTarget, int]:
+    _prepare_retirement_action(repo, plan_id)
+    payload = {
+        "operation_id": "retire",
+        "source_owner_uid": "deployment-uid",
+        "workload_generation": 1,
+        "baseline_replicas": 1,
+        "surge_desired_replicas": 2,
+        "final_desired_replicas": 2,
+        "destination_nodes": [{"name": "worker-b", "uid": "node-b-uid"}],
+        "profile_required_replicas": 1,
+        "source_logical_slot_id": "slot-0",
+        "source_pod_name": "source-pod",
+        "source_pod_uid": "source-pod-uid",
+        "source_node_id": "worker-a",
+        "source_node_uid": "node-a-uid",
+        "maximum_live_replicas": 3,
+        "maximum_temporary_surge_replicas": 2,
+        "n_minus_1_recovery_target_replicas": 2,
+        "recovery_destination_nodes": [{"name": "worker-c", "uid": "node-c-uid"}],
+        "health": {
+            "p99_limit_ms": 120,
+            "error_slo_ppm": 1_000,
+            "max_queue_growth_milli": 0,
+        },
+    }
+    with repo.transaction() as conn:
+        old_token = conn.execute(
+            "SELECT controller_fencing_token FROM plan_executions WHERE plan_id = %s",
+            (plan_id,),
+        ).fetchone()["controller_fencing_token"]
+        conn.execute(
+            "UPDATE action_intents SET payload = %s WHERE plan_id = %s AND intent_id = 'retire'",
+            (Jsonb(payload), plan_id),
+        )
+
+    class CompletedRetirementTarget(FakeFleetRightWorkloadTarget):
+        source_retirement_preparation_enabled = True
+
+        def __init__(self) -> None:
+            super().__init__(2)
+            self.generation = self.observed_generation = 2
+            self.fencing_token = old_token
+            self.execution_request = {
+                "planID": plan_id,
+                "operationID": "retire",
+                "generation": old_token,
+                "expectedReplicas": 1,
+                "targetReplicas": 2,
+                "destinationNodes": payload["destination_nodes"],
+                "purpose": "staged-replacement-v1",
+                "minimumReadyReplicas": 1,
+            }
+            self.execution_fence = {
+                "planID": plan_id,
+                "operationID": "retire",
+                "generation": old_token,
+                "expectedGeneration": 1,
+                "expectedReplicas": 1,
+                "fencedGeneration": 2,
+            }
+            self.mark_applied()
+            self.retired_replica_slots = [
+                {
+                    "replicaID": "slot-0",
+                    "workloadUID": "deployment-uid",
+                    "podUID": "source-pod-uid",
+                    "planID": plan_id,
+                    "operationID": "retire",
+                }
+            ]
+            self.retirement_calls = 0
+            self.source_identity_valid = True
+
+        def observe_scale(self, workload_id: str) -> dict[str, object]:
+            return {
+                **super().observe_scale(workload_id),
+                "retired_replica_slots": self.retired_replica_slots,
+            }
+
+        def observe_source_retirement(
+            self,
+            workload_id: str,
+            verified_plan_id: str,
+            source_payload: dict[str, object],
+            prepared: dict[str, object],
+            *,
+            fencing_token: int,
+        ) -> dict[str, object]:
+            self.retirement_calls += 1
+            if (
+                not self.source_identity_valid
+                or verified_plan_id != plan_id
+                or source_payload["source_pod_uid"] != "source-pod-uid"
+                or prepared["source_pod_uid"] != "source-pod-uid"
+                or fencing_token != self.fencing_token
+            ):
+                raise ActionBlocked("RETIREMENT_IDENTITY_OR_AUTHORITY_CHANGED")
+            return {
+                **prepared,
+                "stage": "RETIREMENT_COMPLETE",
+                "observation": self.observe_scale(workload_id),
+            }
+
+    target = CompletedRetirementTarget()
+    final_result = {
+        "stage": "RETIREMENT_COMPLETE",
+        "observation": target.observe_scale("cpu-api"),
+        "source_pod_uid": "source-pod-uid",
+        "replacement_pod_uid": "replacement-pod-uid",
+        "replacement_node_id": "worker-b",
+        "replacement_node_uid": "node-b-uid",
+        "final_desired_replicas": 2,
+    }
+    controller_a = ExecutionController(repo, target, FakeHealth(), "controller-a")
+    with repo.transaction() as conn:
+        Repository.transition_action(
+            conn,
+            plan_id,
+            "retire",
+            "NOT_STARTED",
+            "RUNNING",
+            "controller-a",
+            old_token,
+            pre_observation={"uid": "deployment-uid", "generation": 1, "replicas": 1},
+        )
+        Repository.transition_action(
+            conn,
+            plan_id,
+            "retire",
+            "RUNNING",
+            "SUCCEEDED",
+            "controller-a",
+            old_token,
+            target_observation=target.observe_scale("cpu-api"),
+            result=final_result,
+        )
+    controller_a._transition(plan_id, old_token, "EXECUTING", "VERIFYING", {"done": True})
+    with repo.transaction() as conn:
+        conn.execute(
+            "UPDATE plan_executions SET controller_lease_expires_at = clock_timestamp() "
+            "WHERE plan_id = %s",
+            (plan_id,),
+        )
+        execution = next(
+            item for item in Repository.runnable_executions(conn) if item["plan_id"] == plan_id
+        )
+    return controller_a, target, execution
+
+
+def test_takeover_refences_completed_retirement_before_verification(
+    clean_database: Database,
+) -> None:
+    repo = clean_database.repository
+    plan_id = "retirement-completed-takeover"
+    _controller_a, target, execution = _completed_retirement_takeover(repo, plan_id)
+    controller_b = ExecutionController(repo, target, FakeHealth(), "controller-b")
+    target.crash_after_fence = True
+
+    with pytest.raises(SystemExit, match="crash after target fence"):
+        controller_b._claim(execution)
+    with repo.transaction() as conn:
+        pending_token = conn.execute(
+            "SELECT pending_controller_fencing_token FROM plan_executions WHERE plan_id = %s",
+            (plan_id,),
+        ).fetchone()["pending_controller_fencing_token"]
+        pending = Repository.execution_fence_receipt(conn, plan_id, "retire", pending_token)
+    assert pending is not None and pending["state"] == "PENDING"
+    assert target.execution_fence["generation"] == pending_token
+    assert target.retired_replica_slots[0]["podUID"] == "source-pod-uid"
+
+    with repo.transaction() as conn:
+        execution = next(
+            item for item in Repository.runnable_executions(conn) if item["plan_id"] == plan_id
+        )
+    token = controller_b._claim(execution)
+
+    assert token == pending_token
+    assert target.fencing_token == pending_token
+    assert target.execution_fence["expectedGeneration"] == 1
+    assert target.execution_fence["expectedReplicas"] == 1
+    assert target.retirement_calls == 2
+    with repo.transaction() as conn:
+        action = conn.execute(
+            "SELECT execution_state FROM action_intents "
+            "WHERE plan_id = %s AND intent_id = 'retire'",
+            (plan_id,),
+        ).fetchone()
+        receipt = Repository.execution_fence_receipt(conn, plan_id, "retire", pending_token)
+    assert action["execution_state"] == "SUCCEEDED"
+    assert receipt is not None and receipt["state"] == "COMPLETE"
+    assert receipt["fence_replayed"] is True
+
+    with repo.transaction() as conn:
+        conn.execute(
+            "UPDATE plan_executions SET controller_lease_expires_at = clock_timestamp() "
+            "WHERE plan_id = %s",
+            (plan_id,),
+        )
+        execution = next(
+            item for item in Repository.runnable_executions(conn) if item["plan_id"] == plan_id
+        )
+    controller_c = ExecutionController(repo, target, FakeHealth(), "controller-c")
+    next_token = controller_c._claim(execution)
+    assert next_token == pending_token + 1
+    assert target.fencing_token == next_token
+    assert target.retirement_calls == 4
+
+
+def test_completed_retirement_takeover_verifies_the_new_fenced_generation(
+    clean_database: Database,
+) -> None:
+    repo = clean_database.repository
+    plan_id = "retirement-completed-takeover-verifies"
+    _controller_a, target, execution = _completed_retirement_takeover(repo, plan_id)
+    controller_b = ExecutionController(repo, target, FakeHealth(), "controller-b")
+
+    token = controller_b._claim(execution)
+    assert token is not None
+    target.mark_applied()
+    controller_b._reconcile(plan_id, token, None)
+
+    with repo.transaction() as conn:
+        result = conn.execute(
+            "SELECT status FROM plan_executions WHERE plan_id = %s", (plan_id,)
+        ).fetchone()
+        action = conn.execute(
+            "SELECT execution_state FROM action_intents "
+            "WHERE plan_id = %s AND intent_id = 'retire'",
+            (plan_id,),
+        ).fetchone()
+    assert result["status"] == "COMMITTED"
+    assert action["execution_state"] == "SUCCEEDED"
+    assert target.fencing_token == token
+    assert target.retirement_calls == 3
+
+
+def test_completed_retirement_takeover_compensates_on_fresh_health_regression(
+    clean_database: Database,
+) -> None:
+    repo = clean_database.repository
+    plan_id = "retirement-completed-takeover-health-regression"
+    _controller_a, target, execution = _completed_retirement_takeover(repo, plan_id)
+    health = FakeHealth([False])
+    controller_b = ExecutionController(repo, target, health, "controller-b")
+
+    token = controller_b._claim(execution)
+    assert token is not None
+    target.mark_applied()
+    controller_b._reconcile(plan_id, token, None)
+
+    with repo.transaction() as conn:
+        result = conn.execute(
+            "SELECT status FROM plan_executions WHERE plan_id = %s", (plan_id,)
+        ).fetchone()
+        compensation = conn.execute(
+            "SELECT execution_state, payload FROM action_intents "
+            "WHERE plan_id = %s AND compensates_intent_id = 'retire'",
+            (plan_id,),
+        ).fetchone()
+    assert result["status"] == "COMPENSATING"
+    assert compensation["execution_state"] == "NOT_STARTED"
+    assert compensation["payload"]["proposed_replicas"] == 3
+    assert health.calls == 1
+
+
+def test_completed_retirement_takeover_rejects_post_fence_generation_change(
+    clean_database: Database,
+) -> None:
+    repo = clean_database.repository
+    plan_id = "retirement-completed-takeover-external-change"
+    _controller_a, target, execution = _completed_retirement_takeover(repo, plan_id)
+    health = FakeHealth()
+    controller_b = ExecutionController(repo, target, health, "controller-b")
+
+    token = controller_b._claim(execution)
+    assert token is not None
+    target.mark_applied()
+    target.generation += 1
+    target.observed_generation += 1
+    controller_b._reconcile(plan_id, token, None)
+
+    with repo.transaction() as conn:
+        result = conn.execute(
+            "SELECT status, outcome FROM plan_executions WHERE plan_id = %s", (plan_id,)
+        ).fetchone()
+    assert result["status"] == "FAILED_SAFE"
+    assert result["outcome"]["FAILED_SAFE"]["reason"] == (
+        "retirement-target-changed-during-verification"
+    )
+    assert health.calls == 0
+
+
+def test_takeover_does_not_adopt_completed_retirement_after_identity_change(
+    clean_database: Database,
+) -> None:
+    repo = clean_database.repository
+    plan_id = "retirement-completed-identity-change"
+    _controller_a, target, execution = _completed_retirement_takeover(repo, plan_id)
+    target.source_identity_valid = False
+
+    token = ExecutionController(repo, target, FakeHealth(), "controller-b")._claim(execution)
+
+    assert token is None
+    with repo.transaction() as conn:
+        pending_token = conn.execute(
+            "SELECT pending_controller_fencing_token FROM plan_executions WHERE plan_id = %s",
+            (plan_id,),
+        ).fetchone()["pending_controller_fencing_token"]
+    assert target.fencing_token == execution["controller_fencing_token"] < pending_token
+    assert target.retirement_calls == 1
+    with repo.transaction() as conn:
+        action = conn.execute(
+            "SELECT execution_state FROM action_intents "
+            "WHERE plan_id = %s AND intent_id = 'retire'",
+            (plan_id,),
+        ).fetchone()
+        execution_state = conn.execute(
+            "SELECT controller_id, status FROM plan_executions WHERE plan_id = %s", (plan_id,)
+        ).fetchone()
+        assert (
+            Repository.execution_fence_receipt(
+                conn,
+                plan_id,
+                "retire",
+                conn.execute(
+                    "SELECT pending_controller_fencing_token FROM plan_executions "
+                    "WHERE plan_id = %s",
+                    (plan_id,),
+                ).fetchone()["pending_controller_fencing_token"],
+            )
+            is None
+        )
+    assert action["execution_state"] == "SUCCEEDED"
+    assert execution_state["controller_id"] == "controller-a"
+    assert execution_state["status"] == "VERIFYING"
+
+
+def test_new_controller_recovers_expired_pending_retirement_fence(
+    clean_database: Database,
+) -> None:
+    repo = clean_database.repository
+    plan_id = "retirement-completed-expired-pending-fence"
+    _controller_a, target, execution = _completed_retirement_takeover(repo, plan_id)
+    controller_b = ExecutionController(repo, target, FakeHealth(), "controller-b")
+    target.crash_after_fence = True
+
+    with pytest.raises(SystemExit, match="crash after target fence"):
+        controller_b._claim(execution)
+    with repo.transaction() as conn:
+        old_pending_token = conn.execute(
+            "SELECT pending_controller_fencing_token FROM plan_executions WHERE plan_id = %s",
+            (plan_id,),
+        ).fetchone()["pending_controller_fencing_token"]
+        conn.execute(
+            "UPDATE plan_executions SET controller_lease_expires_at = clock_timestamp(), "
+            "pending_controller_lease_expires_at = clock_timestamp() WHERE plan_id = %s",
+            (plan_id,),
+        )
+        execution = next(
+            item for item in Repository.runnable_executions(conn) if item["plan_id"] == plan_id
+        )
+
+    controller_c = ExecutionController(repo, target, FakeHealth(), "controller-c")
+    token = controller_c._claim(execution)
+
+    assert token is not None and token > old_pending_token
+    assert target.fencing_token == token
+    assert target.retirement_calls == 3
+    with repo.transaction() as conn:
+        old_receipt = Repository.execution_fence_receipt(conn, plan_id, "retire", old_pending_token)
+        receipt = Repository.execution_fence_receipt(conn, plan_id, "retire", token)
+    assert old_receipt is not None and old_receipt["state"] == "PENDING"
+    assert receipt is not None and receipt["state"] == "COMPLETE"
+
+
 def test_retirement_control_request_waits_for_target_fence_before_settling(
     clean_database: Database,
 ) -> None:
@@ -1725,6 +2674,262 @@ def test_retirement_control_request_waits_for_target_fence_before_settling(
     assert execution["status"] == "EXECUTING"
 
 
+@pytest.mark.parametrize(
+    ("control_request", "pending_create", "prepared_stage", "expected_state"),
+    [
+        ("PAUSE", False, "RETIREMENT_REQUESTED", "PAUSED"),
+        ("CANCEL", False, "RETIREMENT_REQUESTED", "CANCELLED"),
+        ("PAUSE", True, "RETIREMENT_REQUESTED", "EXECUTING"),
+        ("CANCEL", True, "RETIREMENT_REQUESTED", "EXECUTING"),
+        ("PAUSE", False, "REPLACEMENT_REQUESTED", "PAUSED"),
+        ("CANCEL", False, "PDB_BLOCKED", "CANCELLED"),
+        ("PAUSE", True, "REPLACEMENT_REQUESTED", "EXECUTING"),
+        ("CANCEL", True, "PDB_BLOCKED", "EXECUTING"),
+    ],
+)
+def test_control_settles_only_undispatched_retirement_request(
+    clean_database: Database,
+    control_request: str,
+    pending_create: bool,
+    prepared_stage: str,
+    expected_state: str,
+) -> None:
+    class PreDispatchTarget(FakeFleetRightWorkloadTarget):
+        source_retirement_preparation_enabled = True
+
+        def __init__(self) -> None:
+            super().__init__(1)
+            self.pending_pod_create = {"operationID": "retire"} if pending_create else None
+
+        def observe_scale(self, workload_id: str) -> dict[str, object]:
+            return {
+                **super().observe_scale(workload_id),
+                "pending_pod_create": self.pending_pod_create,
+            }
+
+        def prepare_source_retirement(self, *_args: object, **_kwargs: object) -> dict[str, object]:
+            raise AssertionError("control request must stop before target dispatch")
+
+        def get_pod(self, pod_name: str) -> dict[str, object] | None:
+            assert pod_name == "cpu-api-0-pod"
+            return {
+                "metadata": {"uid": "source-pod-uid"},
+                "spec": {"nodeName": "worker-a"},
+            }
+
+    repo = clean_database.repository
+    plan_id = f"retirement-control-{control_request.lower()}-{pending_create}"
+    _prepare_retirement_action(repo, plan_id, f"resource:{plan_id}")
+    target = PreDispatchTarget()
+    payload = {
+        "operation_id": "retire",
+        "source_owner_uid": target.uid,
+        "workload_generation": target.generation,
+        "baseline_replicas": 1,
+        "surge_desired_replicas": 2,
+        "final_desired_replicas": 2,
+        "profile_required_replicas": 1,
+        "destination_nodes": [{"name": "worker-b", "uid": "worker-b-uid"}],
+        "source_logical_slot_id": "cpu-api-0",
+        "source_pod_uid": "source-pod-uid",
+        "source_pod_name": "cpu-api-0-pod",
+        "source_node_id": "worker-a",
+    }
+    with repo.transaction() as conn:
+        execution = conn.execute(
+            "SELECT controller_fencing_token FROM plan_executions WHERE plan_id = %s",
+            (plan_id,),
+        ).fetchone()
+        token = execution["controller_fencing_token"]
+        conn.execute(
+            "UPDATE action_intents SET payload = %s WHERE plan_id = %s AND intent_id = 'retire'",
+            (Jsonb(payload), plan_id),
+        )
+        Repository.transition_action(
+            conn,
+            plan_id,
+            "retire",
+            "NOT_STARTED",
+            "RUNNING",
+            "controller-a",
+            token,
+            pre_observation=target.observe_scale("cpu-api"),
+            result={"stage": "RETIREMENT_REQUESTED"},
+        )
+        if prepared_stage != "RETIREMENT_REQUESTED":
+            target.pending_pod_create = None
+            target.authorize_scale(
+                "cpu-api",
+                token,
+                expected=target.observe_scale("cpu-api"),
+                plan_id=plan_id,
+                operation_id="retire",
+                target_replicas=2,
+            )
+            assert target.execution_request is not None
+            target.execution_request.update(
+                purpose="staged-replacement-v1",
+                destinationNodes=payload["destination_nodes"],
+            )
+            target.mark_applied()
+            assert target.execution is not None
+            target.execution["purpose"] = "staged-replacement-v1"
+            target.pending_pod_create = {"operationID": "retire"} if pending_create else None
+        Repository.record_action_progress(
+            conn,
+            plan_id,
+            "retire",
+            "controller-a",
+            token,
+            observation=target.observe_scale("cpu-api"),
+            result={"stage": prepared_stage},
+        )
+        Repository.request_execution_control(conn, plan_id, control_request, "test control")
+        conn.execute(
+            "UPDATE plan_executions SET controller_lease_expires_at = clock_timestamp() "
+            "WHERE plan_id = %s",
+            (plan_id,),
+        )
+
+    controller_b = ExecutionController(repo, target, FakeHealth(), "controller-b")
+    controller_b.run_once()
+    controller_b.run_once()
+
+    with repo.transaction() as conn:
+        action = conn.execute(
+            "SELECT execution_state FROM action_intents WHERE plan_id = %s", (plan_id,)
+        ).fetchone()
+        execution = conn.execute(
+            "SELECT status, controller_id, controller_fencing_token, "
+            "pending_controller_id, pause_requested, cancel_requested "
+            "FROM plan_executions WHERE plan_id = %s",
+            (plan_id,),
+        ).fetchone()
+        lease = conn.execute("SELECT 1 FROM plan_leases WHERE plan_id = %s", (plan_id,)).fetchone()
+        receipt = Repository.execution_fence_receipt(
+            conn, plan_id, "retire", execution["controller_fencing_token"]
+        )
+        saved_action = conn.execute(
+            "SELECT * FROM action_intents WHERE plan_id = %s AND intent_id = 'retire'",
+            (plan_id,),
+        ).fetchone()
+    assert action["execution_state"] == ("FAILED" if not pending_create else "RUNNING"), (
+        action,
+        execution,
+        lease,
+        receipt,
+        target.observe_scale("cpu-api"),
+        target.fencing_token,
+        controller_b._takeover_fence_matches(
+            saved_action, plan_id, execution["controller_fencing_token"], receipt
+        )
+        if receipt is not None
+        else None,
+    )
+    assert execution["status"] == expected_state
+    if pending_create:
+        assert lease is not None
+
+
+@pytest.mark.parametrize("action_kind", ["SET_REPLICA_COUNT", "PREPARE_SOURCE_RETIREMENT"])
+@pytest.mark.parametrize("pause_first", [False, True])
+def test_cancel_retains_plan_lock_until_failed_action_create_resolves(
+    clean_database: Database, action_kind: str, pause_first: bool
+) -> None:
+    class HeldCreateTarget(FakeFleetRightWorkloadTarget):
+        def __init__(self) -> None:
+            super().__init__(2)
+            self.pending_pod_create = {"operationID": "earlier-create"}
+
+        def observe_scale(self, workload_id: str) -> dict[str, object]:
+            return {
+                **super().observe_scale(workload_id),
+                "pending_pod_create": self.pending_pod_create,
+            }
+
+    repo = clean_database.repository
+    plan_id = f"cancel-held-create-{action_kind.lower()}-{pause_first}"
+    conflict_key = f"resource:{plan_id}"
+    if action_kind == "PREPARE_SOURCE_RETIREMENT":
+        _prepare_retirement_action(repo, plan_id, conflict_key)
+        action_id = "retire"
+    else:
+        _, _, _ = _prepare_controller(repo, plan_id, 2, 3, [conflict_key])
+        action_id = "scale"
+    target = HeldCreateTarget()
+    controller = ExecutionController(repo, target, FakeHealth(), "controller-a")
+
+    with repo.transaction() as conn:
+        token = conn.execute(
+            "SELECT controller_fencing_token FROM plan_executions WHERE plan_id = %s",
+            (plan_id,),
+        ).fetchone()["controller_fencing_token"]
+        observation = target.observe_scale("cpu-api")
+        Repository.transition_action(
+            conn,
+            plan_id,
+            action_id,
+            "NOT_STARTED",
+            "RUNNING",
+            "controller-a",
+            token,
+            pre_observation=observation,
+        )
+        Repository.transition_action(
+            conn,
+            plan_id,
+            action_id,
+            "RUNNING",
+            "FAILED",
+            "controller-a",
+            token,
+            target_observation=observation,
+            error="POD_CREATE_OUTCOME_UNKNOWN",
+        )
+
+    controller._fail_safe(plan_id, token, "POD_CREATE_OUTCOME_UNKNOWN")
+    with repo.transaction() as conn:
+        assert (
+            conn.execute(
+                "SELECT status FROM plan_executions WHERE plan_id = %s", (plan_id,)
+            ).fetchone()["status"]
+            == "EXECUTING"
+        )
+
+    if pause_first:
+        with repo.transaction() as conn:
+            Repository.request_execution_control(conn, plan_id, "PAUSE", "test pause")
+        controller.run_once()
+        with repo.transaction() as conn:
+            assert (
+                conn.execute(
+                    "SELECT status FROM plan_executions WHERE plan_id = %s", (plan_id,)
+                ).fetchone()["status"]
+                == "PAUSED"
+            )
+
+    with repo.transaction() as conn:
+        Repository.request_execution_control(conn, plan_id, "CANCEL", "test cancel")
+    controller.run_once()
+    with repo.transaction() as conn:
+        execution = conn.execute(
+            "SELECT status FROM plan_executions WHERE plan_id = %s", (plan_id,)
+        ).fetchone()
+        lease = conn.execute("SELECT 1 FROM plan_leases WHERE plan_id = %s", (plan_id,)).fetchone()
+    assert execution["status"] != "CANCELLED"
+    assert lease is not None
+
+    target.pending_pod_create = None
+    controller.run_once()
+    with repo.transaction() as conn:
+        execution = conn.execute(
+            "SELECT status FROM plan_executions WHERE plan_id = %s", (plan_id,)
+        ).fetchone()
+        lease = conn.execute("SELECT 1 FROM plan_leases WHERE plan_id = %s", (plan_id,)).fetchone()
+    assert execution["status"] == "CANCELLED"
+    assert lease is None
+
+
 def test_retirement_unknown_outcome_stays_blocked_after_controller_takeover(
     clean_database: Database,
 ) -> None:
@@ -1752,6 +2957,259 @@ def test_retirement_unknown_outcome_stays_blocked_after_controller_takeover(
     assert target.retirement_calls == 1
     assert action["execution_state"] == "OUTCOME_UNKNOWN"
     assert execution["status"] == "EXECUTING"
+
+
+def test_admitted_eviction_readiness_loss_after_takeover_keeps_plan_unresolved(
+    clean_database: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+    from unittest.mock import Mock
+
+    from fleetright.pod_admission import PodCreateAdmission
+    from fleetright.workload_controller import _pod_create_intent, _pod_object
+    from test_pod_admission import EvictionAPI, _eviction_request
+
+    repo = clean_database.repository
+    api = EvictionAPI()
+    workload = api.workload
+    source_name = api.source["metadata"]["name"]
+    payload = {
+        "operation_id": "operation-1",
+        "source_owner_name": "api",
+        "source_owner_uid": "workload-uid",
+        "source_pod_name": source_name,
+        "source_pod_uid": "source-uid",
+        "source_node_id": "worker-a",
+        "source_node_uid": "node-a-uid",
+        "source_logical_slot_id": "api-0",
+        "baseline_replicas": 1,
+        "surge_desired_replicas": 2,
+        "final_desired_replicas": 2,
+        "profile_required_replicas": 1,
+        "destination_nodes": [{"name": "worker-b", "uid": "node-b-uid"}],
+    }
+    with repo.transaction() as conn:
+        _insert_plan(conn, "plan-1")
+        conn.execute(
+            "UPDATE plans SET binding = %s WHERE plan_id = 'plan-1'",
+            (Jsonb({"source": {}, "conflict_keys": ["workload:api"]}),),
+        )
+        conn.execute(
+            "INSERT INTO control_state (singleton, snapshot_id, snapshot_generation, binding) "
+            "VALUES (TRUE, 'snapshot', 1, %s)",
+            (Jsonb({}),),
+        )
+        conn.execute(
+            "INSERT INTO conflict_leases (conflict_key, owner_id, principal, fencing_token, "
+            "expires_at) VALUES ('workload:api', 'lease-owner', 'operator', 7, "
+            "clock_timestamp() + interval '1 hour')"
+        )
+        conn.execute(
+            "INSERT INTO plan_leases (plan_id, conflict_key, owner_id, fencing_token) "
+            "VALUES ('plan-1', 'workload:api', 'lease-owner', 7)"
+        )
+        conn.execute(
+            "INSERT INTO action_intents (plan_id, intent_id, action_sequence, action_type, "
+            "workload_id, payload, status) VALUES ('plan-1', 'operation-1', 0, "
+            "'PREPARE_SOURCE_RETIREMENT', 'api', %s, 'APPROVED')",
+            (Jsonb(payload),),
+        )
+    old_token = _claim(repo, "plan-1")["execution"]["controller_fencing_token"]
+    workload["spec"]["executionRequest"]["generation"] = old_token
+    workload["spec"]["executionFence"]["generation"] = old_token
+    workload["status"]["execution"]["generation"] = old_token
+    request = _eviction_request(api)
+    request["object"]["metadata"]["annotations"]["fleetright.io/fencing-token"] = str(old_token)
+    assert PodCreateAdmission(api, "fleetright-v2", "fleetright-workload-controller").admit(
+        request
+    ) == (True, "")
+    admitted_delete = request["object"]["deleteOptions"]["preconditions"]
+    prepared = {
+        "stage": "EVICTION_INTENT",
+        "source_retirement_intent_recorded": True,
+        "workload_uid": "workload-uid",
+        "source_pod_name": source_name,
+        "source_pod_uid": "source-uid",
+        "source_pod_resource_version": "3",
+        "replacement_pod_name": api.replacement["metadata"]["name"],
+        "replacement_pod_uid": "replacement-uid",
+        "replacement_replica_id": "api-1",
+        "replacement_node_id": "worker-b",
+        "replacement_node_uid": "node-b-uid",
+        "replacement_create_id": "replacement-create-id",
+        "replacement_workload_generation": 2,
+    }
+    target = FleetRightWorkloadTarget(namespace="fleetright-v2")
+    extra_pods: list[dict[str, object]] = []
+
+    def target_json(*args: str) -> dict[str, object]:
+        if args[:2] == ("patch", "fleetrightworkload"):
+            patch = json.loads(args[args.index("-p") + 1])
+            assert patch["metadata"]["resourceVersion"] == workload["metadata"]["resourceVersion"]
+            workload["spec"].update(patch["spec"])
+            workload["metadata"]["generation"] += 1
+            workload["metadata"]["resourceVersion"] = str(
+                int(workload["metadata"]["resourceVersion"]) + 1
+            )
+            return deepcopy(workload)
+        if args[:2] == ("get", "pods"):
+            return {"items": [deepcopy(api.replacement), *deepcopy(extra_pods)]}
+        assert args[:2] == ("get", "node")
+        return deepcopy(next(node for node in api.nodes if node["metadata"]["name"] == args[2]))
+
+    monkeypatch.setattr(target, "_json", target_json)
+    monkeypatch.setattr(target, "_require_fencing_schema", lambda: None)
+    monkeypatch.setattr(
+        target, "observe_scale", lambda _: target._observe(deepcopy(workload), "api")
+    )
+    monkeypatch.setattr(
+        target,
+        "get_pod",
+        lambda name: deepcopy(api.source if name == source_name else api.replacement),
+    )
+    monkeypatch.setattr(
+        target,
+        "_kubectl",
+        lambda *_args, **_kwargs: pytest.fail("a second Eviction was dispatched"),
+    )
+    eviction_dispatch = Mock(wraps=target.evict_source)
+    monkeypatch.setattr(target, "evict_source", eviction_dispatch)
+    with repo.transaction() as conn:
+        Repository.transition_action(
+            conn,
+            "plan-1",
+            "operation-1",
+            "NOT_STARTED",
+            "RUNNING",
+            "controller-a",
+            old_token,
+            pre_observation={"uid": "workload-uid", "generation": 1, "replicas": 1},
+        )
+        Repository.record_action_progress(
+            conn,
+            "plan-1",
+            "operation-1",
+            "controller-a",
+            old_token,
+            observation=target.observe_scale("api"),
+            result=prepared,
+        )
+        Repository.transition_action(
+            conn,
+            "plan-1",
+            "operation-1",
+            "RUNNING",
+            "OUTCOME_UNKNOWN",
+            "controller-a",
+            old_token,
+            error="response lost while admitted source deletion is outstanding",
+        )
+        conn.execute(
+            "UPDATE plan_executions SET controller_lease_expires_at = clock_timestamp() "
+            "WHERE plan_id = 'plan-1'"
+        )
+        execution = Repository.runnable_executions(conn)[0]
+    controller = ExecutionController(repo, target, FakeHealth(), "controller-b")
+    token = controller._claim(execution)
+    assert token is not None and token > old_token
+    workload["status"]["observedGeneration"] = workload["metadata"]["generation"]
+    source_before = api.source
+    pending_create = {
+        "workloadUID": "workload-uid",
+        "workloadGeneration": workload["metadata"]["generation"],
+        "podName": "api-2",
+        "replicaID": "api-2",
+        "planID": "plan-1",
+        "operationID": "late-create",
+        "createID": "late-create-attempt",
+    }
+    workload["status"]["pendingPodCreate"] = pending_create
+    api.source = None
+    waiting = target.observe_source_retirement(
+        "api", "plan-1", payload, prepared, fencing_token=token
+    )
+    assert waiting["stage"] == "RETIREMENT_WAITING_FINAL_HEALTH"
+    assert waiting["source_removed_observed"] is True
+    assert waiting["observation"]["pending_pod_create"] == pending_create
+    workload["status"].pop("pendingPodCreate")
+    api.source = source_before
+    api.replacement["status"]["conditions"][0]["status"] = "False"
+    workload["status"].update(readyReplicas=1, availableReplicas=1)
+    assert (
+        target.observe_source_retirement("api", "plan-1", payload, prepared, fencing_token=token)[
+            "stage"
+        ]
+        != "EVICTION_RETRY_SAFE"
+    )
+
+    controller._reconcile("plan-1", token, None)
+
+    with repo.transaction() as conn:
+        action = conn.execute(
+            "SELECT execution_state, execution_result FROM action_intents WHERE plan_id = 'plan-1'"
+        ).fetchone()
+        execution = conn.execute(
+            "SELECT status FROM plan_executions WHERE plan_id = 'plan-1'"
+        ).fetchone()
+        assert action["execution_state"] in {"RUNNING", "OUTCOME_UNKNOWN"}
+        assert any(
+            item.get("result", {}).get("stage") == "EVICTION_INTENT"
+            for item in action["execution_result"]["progress"]
+        )
+        assert execution["status"] == "EXECUTING"
+        assert (
+            conn.execute("SELECT state FROM plans WHERE plan_id = 'plan-1'").fetchone()["state"]
+            == "EXECUTING"
+        )
+        assert (
+            conn.execute(
+                "SELECT count(*) AS total FROM plan_leases WHERE plan_id = 'plan-1'"
+            ).fetchone()["total"]
+            == 1
+        )
+        assert (
+            Repository.acquire_lease(conn, "workload:api", "competing-owner", "operator", 60_000)
+            is None
+        )
+    eviction_dispatch.assert_not_called()
+    assert admitted_delete == {
+        key: api.source["metadata"][key] for key in ("uid", "resourceVersion")
+    }
+
+    # Release the original exact-UID delete; readiness still prevents completion.
+    api.source = None
+    workload["status"].update(replicas=1, readyReplicas=0, availableReplicas=0)
+    controller.run_once()
+    with repo.transaction() as conn:
+        assert Repository.incomplete_actions(conn, "plan-1")[0]["execution_state"] in {
+            "RUNNING",
+            "OUTCOME_UNKNOWN",
+        }
+    api.replacement["status"]["conditions"][0]["status"] = "True"
+    create = _pod_create_intent(workload, 2)
+    final_pod = _pod_object(workload, 2, create)
+    final_pod["metadata"]["uid"] = "post-retirement-pod-uid"
+    final_pod["spec"]["nodeName"] = "worker-b"
+    final_pod["status"] = deepcopy(api.replacement["status"])
+    extra_pods.append(final_pod)
+    workload["status"]["authorizedPodCreates"].append(
+        {**create, "podUID": "post-retirement-pod-uid"}
+    )
+    workload["status"].update(
+        replicas=2,
+        readyReplicas=2,
+        availableReplicas=2,
+        conditions=[{"type": "Reconciled", "status": "True"}],
+    )
+    controller.run_once()
+    with repo.transaction() as conn:
+        completed = conn.execute(
+            "SELECT execution_state, execution_result FROM action_intents WHERE plan_id = 'plan-1'"
+        ).fetchone()
+    assert completed["execution_state"] == "SUCCEEDED"
+    assert completed["execution_result"]["result"]["source_pod_uid"] == admitted_delete["uid"]
+    assert api.source is None
+    eviction_dispatch.assert_not_called()
 
 
 def test_compensation_is_persisted_once_before_dispatch(clean_database: Database) -> None:
@@ -1908,11 +3366,14 @@ def test_compensation_is_persisted_once_before_dispatch(clean_database: Database
 
 
 @pytest.mark.parametrize(
-    ("verification_failure", "expected_execution_state"),
-    [(False, "COMPENSATED"), (True, "FAILED_SAFE")],
+    ("verification_failure", "pending_create", "expected_execution_state"),
+    [(False, False, "COMPENSATED"), (True, False, "FAILED_SAFE"), (False, True, "VERIFYING")],
 )
 def test_source_retirement_health_regression_restores_bounded_kubernetes_capacity(
-    clean_database: Database, verification_failure: bool, expected_execution_state: str
+    clean_database: Database,
+    verification_failure: bool,
+    pending_create: bool,
+    expected_execution_state: str,
 ) -> None:
     repo = clean_database.repository
     plan_id = "retirement-compensation"
@@ -1974,10 +3435,6 @@ def test_source_retirement_health_regression_restores_bounded_kubernetes_capacit
             target_observation={"uid": "deployment-uid", "generation": 2, "replicas": 2},
             result={"stage": "RETIREMENT_COMPLETE"},
         )
-        action = conn.execute(
-            "SELECT * FROM action_intents WHERE plan_id = %s AND intent_id = 'retire'",
-            (plan_id,),
-        ).fetchone()
 
     class RecoveryTarget(FakeFleetRightWorkloadTarget):
         def __init__(self) -> None:
@@ -1992,6 +3449,19 @@ def test_source_retirement_health_regression_restores_bounded_kubernetes_capacit
             }
             self.mark_applied()
             self.authorized_destinations: list[dict[str, str]] | None = None
+
+        def observe_source_retirement(self, *_args: object, **_kwargs: object) -> dict[str, object]:
+            return {
+                "stage": "RETIREMENT_WAITING_FINAL_HEALTH",
+                "source_removed_observed": True,
+                "observation": self.observe_scale("cpu-api"),
+            }
+
+        def observe_scale(self, workload_id: str) -> dict[str, object]:
+            return {
+                **super().observe_scale(workload_id),
+                "pending_pod_create": {"operationID": "late-create"} if pending_create else None,
+            }
 
         def authorize_scale(
             self,
@@ -2033,14 +3503,9 @@ def test_source_retirement_health_regression_restores_bounded_kubernetes_capacit
                 raise TargetPreconditionFailed("recovery target identity changed")
 
     target = RecoveryTarget()
-    controller = ExecutionController(repo, target, FakeHealth([True]), "controller-a")
-    controller._begin_compensation(
-        plan_id,
-        token,
-        action,
-        {"uid": "deployment-uid", "generation": 2, "replicas": 2},
-        "EXECUTING",
-    )
+    controller = ExecutionController(repo, target, FakeHealth([False, True]), "controller-a")
+    controller._transition(plan_id, token, "EXECUTING", "VERIFYING", {"actions": "observed"})
+    controller.run_once()
 
     with repo.transaction() as conn:
         compensation = conn.execute(
@@ -2048,6 +3513,14 @@ def test_source_retirement_health_regression_restores_bounded_kubernetes_capacit
             "WHERE plan_id = %s AND compensates_intent_id = 'retire'",
             (plan_id,),
         ).fetchone()
+    if pending_create:
+        assert compensation is None
+        with repo.transaction() as conn:
+            execution = conn.execute(
+                "SELECT status FROM plan_executions WHERE plan_id = %s", (plan_id,)
+            ).fetchone()
+        assert execution["status"] == "VERIFYING"
+        return
     assert compensation["payload"]["proposed_replicas"] == 3
     assert compensation["payload"]["destination_nodes"] == recovery_nodes
 
@@ -2059,12 +3532,17 @@ def test_source_retirement_health_regression_restores_bounded_kubernetes_capacit
             "SELECT status FROM plan_executions WHERE plan_id = %s", (plan_id,)
         ).fetchone()
         compensation = conn.execute(
-            "SELECT execution_state FROM action_intents WHERE plan_id = %s "
+            "SELECT execution_state, execution_error, execution_result "
+            "FROM action_intents WHERE plan_id = %s "
             "AND compensates_intent_id = 'retire'",
             (plan_id,),
         ).fetchone()
-    assert execution["status"] == expected_execution_state
-    assert compensation["execution_state"] == "SUCCEEDED"
+    assert execution["status"] == expected_execution_state, (
+        execution,
+        compensation,
+        target.observe_scale("cpu-api"),
+    )
+    assert compensation["execution_state"] == "SUCCEEDED", (execution, compensation)
     assert target.replicas == 3
     assert target.authorized_destinations == recovery_nodes
 

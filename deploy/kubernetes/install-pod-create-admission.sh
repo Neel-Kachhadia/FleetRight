@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-context=kind-fleetright-safety-lab
-namespace=fleetright-v2
-kubeconfig=/home/neel/.cache/fleetright/safety-lab.kubeconfig
+context=${FLEETRIGHT_LAB_CONTEXT:-kind-fleetright-safety-lab}
+namespace=${FLEETRIGHT_LAB_NAMESPACE:-fleetright-v2}
+kubeconfig=${FLEETRIGHT_LAB_ADMIN_KUBECONFIG:-/home/neel/.cache/fleetright/safety-lab.kubeconfig}
+kind_cluster=${FLEETRIGHT_KIND_CLUSTER:-fleetright-safety-lab}
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/fleetright-pod-admission.XXXXXX")"
 trap 'rm -rf "$tmp_dir"' EXIT
@@ -15,7 +16,7 @@ fi
 
 docker build -t fleetright-workload-controller:local \
   -f "$repo_root/deploy/kubernetes/workload-controller.Dockerfile" "$repo_root"
-kind load docker-image --name fleetright-safety-lab fleetright-workload-controller:local
+kind load docker-image --name "$kind_cluster" fleetright-workload-controller:local
 
 if ! kubectl --kubeconfig "$kubeconfig" --context "$context" get namespace "$namespace" >/dev/null 2>&1; then
   kubectl --kubeconfig "$kubeconfig" --context "$context" create namespace "$namespace"

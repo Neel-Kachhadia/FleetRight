@@ -23,5 +23,5 @@ webhooks:
       - apiGroups: [""]
         apiVersions: [v1]
         operations: [CREATE]
-        resources: [pods, pods/eviction]
+        resources: [pods, pods/eviction, pods/binding]
         scope: Namespaced

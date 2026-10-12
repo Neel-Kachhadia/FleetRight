@@ -205,6 +205,107 @@ def test_v2_snapshot_hash_round_trip_and_cpp_planner_verifier() -> None:
     assert accepted is False
 
 
+def test_v2_four_workload_node_drain_plan_reaches_execution_admission(monkeypatch) -> None:
+    fields, _, _ = _v2_snapshot()
+    now_ms = int(fields["evaluation_time_ms"])
+    node_ids = [node["node_id"] for node in fields["nodes"]]
+    base = fields["workloads"][0]
+    base["current_resources"] = {"cpu_millicores": 100, "memory_mib": 128, "network_mbps": 0}
+    workloads, placements, profiles, controllers = [], [], [], []
+    pods = []
+    for index in range(4):
+        workload_id = "cpu-api" if index == 0 else f"cpu-api-{index}"
+        workload = deepcopy(base)
+        workload.update(workload_id=workload_id, min_replicas=2, availability_floor=1)
+        workloads.append(workload)
+
+        profile = deepcopy(fields["capacity_profiles"][0])
+        profile.update(
+            workload_id=workload_id,
+            profile_id=f"{workload_id}-profile",
+            allocation=deepcopy(workload["current_resources"]),
+        )
+        profiles.append(profile)
+        for replica_index, node_id in enumerate(node_ids[:2]):
+            placements.append(
+                {
+                    "workload_id": workload_id,
+                    "replica_id": f"{workload_id}-{replica_index}",
+                    "node_id": node_id,
+                }
+            )
+        controllers.append(
+            {
+                "workload_id": workload_id,
+                "namespace": "default",
+                "owner_kind": "FleetRightWorkload",
+                "owner_name": workload_id,
+                "owner_uid": f"{workload_id}-owner",
+                "owner_resource_version": "workload-rv",
+                "owner_generation": 1,
+                "controller_type": "fleetright-workload-controller/v1",
+                "execution_protocol": "monotonic-scale-up-v1",
+                "pod_template_sha256": "template-digest",
+                "desired_replicas": 2,
+                "pdb_allowed_disruptions": 1,
+                "pdb_resource_version": "pdb-rv",
+                "observed_at_ms": now_ms - 1_000,
+            }
+        )
+
+    for placement in placements:
+        workload_id, replica_id = placement["workload_id"], placement["replica_id"]
+        pods.append(
+            {
+                **placement,
+                "pod_name": replica_id,
+                "pod_uid": f"{replica_id}-uid",
+                "owner_kind": "FleetRightWorkload",
+                "owner_name": workload_id,
+                "owner_uid": f"{workload_id}-owner",
+                "logical_slot_id": replica_id,
+                "ready": True,
+                "terminating": False,
+            }
+        )
+
+    fields["workloads"], fields["current_placements"], fields["capacity_profiles"] = (
+        workloads,
+        placements,
+        profiles,
+    )
+    for index, node in enumerate(fields["nodes"]):
+        node["labels"] = [("zone", f"zone-{index}"), ("rack", f"rack-{index}")]
+    fields["evacuation_v2"].update(
+        controllers=controllers,
+        pods=pods,
+        nodes=[
+            {"node_id": node_id, "node_uid": f"{node_id}-uid", "resource_version": f"{node_id}-rv"}
+            for node_id in node_ids
+        ],
+        inventory_observed_at_ms=now_ms - 1_000,
+    )
+    monkeypatch.setenv(
+        "FLEETRIGHT_KUBERNETES_WORKLOADS", ",".join(w["workload_id"] for w in workloads)
+    )
+
+    source, payload, _ = api_module._validate_snapshot(fields, now_ms)
+    _, _, _, _, summary = api_module._run_planner(payload, plan_schema_version=2)
+    assert summary["feasible"] is True
+    assert summary["verification_accepted"] is True
+    assert summary["mode"] == 1
+    assert [item["workload_id"] for item in summary["evacuations"]] == [
+        item["workload_id"] for item in workloads
+    ]
+    assert {item["source_node_id"] for item in summary["evacuations"]} == {node_ids[0]}
+    assert summary["plan_actions"][0]["stage"] == 7
+    assert summary["plan_actions"][1]["stage"] == 8
+    assert (
+        api_module._execution_admission_reasons(summary, source["workloads"], "kubernetes-workload")
+        == []
+    )
+
+
 def test_unknown_execution_protocol_is_not_admitted() -> None:
     summary = {
         "schema_version": 9,

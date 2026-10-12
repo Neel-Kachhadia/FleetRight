@@ -351,6 +351,55 @@ def _proto_scalar(text: str, field: str, default: object = None) -> object:
     return values[0] if values else default
 
 
+def _proto_top_scalar(text: str, field: str, default: object = None) -> object:
+    match = re.search(rf"(?m)^{re.escape(field)}\s*:\s*(.*?)\s*$", text)
+    if match is None:
+        return default
+    raw = match.group(1)
+    if raw.startswith('"'):
+        return json.loads(raw)
+    if raw in {"true", "false"}:
+        return raw == "true"
+    try:
+        return int(raw)
+    except ValueError:
+        return raw
+
+
+def _proto_message_scalar(text: str, field: str, default: object = None) -> object:
+    depth = 0
+    for line in text.splitlines():
+        if depth == 0:
+            match = re.match(rf"^\s*{re.escape(field)}\s*:\s*(.*?)\s*$", line)
+            if match is not None:
+                raw = match.group(1)
+                if raw.startswith('"'):
+                    return json.loads(raw)
+                if raw in {"true", "false"}:
+                    return raw == "true"
+                try:
+                    return int(raw)
+                except ValueError:
+                    return raw
+        quoted = False
+        escaped = False
+        for char in line:
+            if quoted:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    quoted = False
+            elif char == '"':
+                quoted = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+    return default
+
+
 def _plan_summary(plan_text: str) -> dict[str, object]:
     decisions: list[dict[str, object]] = []
     evacuations: list[dict[str, object]] = []
@@ -405,7 +454,7 @@ def _evacuation_plan_summary(plan_text: str) -> dict[str, object]:
         destination_ids = _proto_scalars(destinations, "allowed_node_ids") if destinations else []
         intermediate_states = [
             {
-                key: _proto_scalar(state, key, default)
+                key: _proto_message_scalar(state, key, default)
                 for key, default in (
                     ("kind", 0),
                     ("minimum_ready_replicas", 0),
@@ -418,17 +467,25 @@ def _evacuation_plan_summary(plan_text: str) -> dict[str, object]:
         ]
         actions = [
             {
-                "sequence": _proto_scalar(action, "sequence", 0),
-                "action_id": _proto_scalar(action, "action_id", ""),
-                "stage": _proto_scalar(action, "stage", 0),
+                "sequence": _proto_message_scalar(action, "sequence", 0),
+                "action_id": _proto_message_scalar(action, "action_id", ""),
+                "stage": _proto_message_scalar(action, "stage", 0),
                 "depends_on_sequences": _proto_scalars(action, "depends_on_sequences"),
-                "expected_postcondition": _proto_scalar(action, "expected_postcondition", ""),
-                "on_failure": _proto_scalar(action, "on_failure", 0),
+                "expected_postcondition": _proto_message_scalar(
+                    action, "expected_postcondition", ""
+                ),
+                "on_failure": _proto_message_scalar(action, "on_failure", 0),
             }
             for action in _proto_blocks(block, "actions")
         ]
         evacuation = {
-            "sequence": _proto_scalar(block, "sequence", 0),
+            "sequence": _proto_message_scalar(block, "sequence", 0),
+            "depends_on_operation_sequences": _proto_scalars(
+                block, "depends_on_operation_sequences"
+            ),
+            "depends_on_plan_action_sequences": _proto_scalars(
+                block, "depends_on_plan_action_sequences"
+            ),
             "workload_id": _proto_scalar(block, "workload_id", ""),
             "replica_id": _proto_scalar(block, "replica_id", ""),
             "source_pod_name": _proto_scalar(block, "source_pod_name", ""),
@@ -455,7 +512,7 @@ def _evacuation_plan_summary(plan_text: str) -> dict[str, object]:
                 for key in ("cpu_millicores", "memory_mib", "network_mbps")
             },
             **{
-                key: _proto_scalar(block, key, 0)
+                key: _proto_message_scalar(block, key, 0)
                 for key in (
                     "baseline_replicas",
                     "surge_desired_replicas",
@@ -473,22 +530,44 @@ def _evacuation_plan_summary(plan_text: str) -> dict[str, object]:
                     "n_minus_1_recovery_target_replicas",
                 )
             },
-            "topology_key": _proto_scalar(block, "topology_key", ""),
-            "failure_tolerance": _proto_scalar(block, "failure_tolerance", 0),
+            "topology_key": _proto_message_scalar(block, "topology_key", ""),
+            "failure_tolerance": _proto_message_scalar(block, "failure_tolerance", 0),
             "recovery_destination_node_ids": _proto_scalars(block, "recovery_destination_node_ids"),
-            "deactivate_source_node_after_empty": _proto_scalar(
+            "deactivate_source_node_after_empty": _proto_message_scalar(
                 block, "deactivate_source_node_after_empty", False
             ),
             "permitted_intermediate_states": intermediate_states,
             "actions": actions,
-            "on_failure": _proto_scalar(block, "on_failure", 0),
-            "n_minus_1_failure_domain_key": _proto_scalar(
+            "on_failure": _proto_message_scalar(block, "on_failure", 0),
+            "n_minus_1_failure_domain_key": _proto_message_scalar(
                 block, "n_minus_1_failure_domain_key", ""
             ),
         }
         evacuations.append(evacuation)
         if _proto_scalar(block, "deactivate_source_node_after_empty", False):
             deactivated.append(str(evacuation["source_node_id"]))
+    plan_actions = [
+        {
+            "sequence": _proto_scalar(action, "sequence", 0),
+            "action_id": _proto_scalar(action, "action_id", ""),
+            "stage": _proto_scalar(action, "stage", 0),
+            "depends_on_sequences": _proto_scalars(action, "depends_on_sequences"),
+            "source_node_id": _proto_scalar(action, "source_node_id", ""),
+            "source_node_uid": _proto_scalar(action, "source_node_uid", ""),
+        }
+        for action in _proto_blocks(plan_text, "plan_actions")
+    ]
+    stage_values = {
+        "EVACUATION_STAGE_CORDON_SOURCE_NODE": 7,
+        "EVACUATION_STAGE_VERIFY_SOURCE_NODE_EMPTY": 8,
+    }
+    for action in plan_actions:
+        action["stage"] = stage_values.get(action["stage"], action["stage"])
+    mode = _proto_top_scalar(plan_text, "mode", 0)
+    if mode == "EVACUATION_PLAN_MODE_SINGLE_SOURCE":
+        mode = 0
+    elif mode == "EVACUATION_PLAN_MODE_SEQUENTIAL_NODE_DRAIN":
+        mode = 1
     return {
         "schema_version": _proto_scalar(plan_text, "schema_version", 0),
         "plan_id": _proto_scalar(plan_text, "plan_id", ""),
@@ -499,6 +578,8 @@ def _evacuation_plan_summary(plan_text: str) -> dict[str, object]:
         "feasible": _proto_scalar(plan_text, "feasible", False),
         "infeasible_reason": _proto_scalar(plan_text, "infeasible_reason", ""),
         "planner_build_id": _proto_scalar(plan_text, "optimizer_build_id", "unknown"),
+        "mode": mode,
+        "plan_actions": plan_actions,
         "decisions": [],
         "deactivated_node_ids": deactivated,
         "evacuation_count": len(evacuations),
@@ -1305,18 +1386,30 @@ def _execution_admission_reasons(
         reasons.append("UNSUPPORTED_EXECUTION_PROTOCOL_VERSION")
     elif schema_version == 2:
         evacuations = summary.get("evacuations")
+        plan_actions = summary.get("plan_actions", [])
+        mode = summary.get("mode", 0)
+        sequential = type(mode) is int and mode == 1
+        mode_valid = type(mode) is int and (
+            (mode == 0 and isinstance(plan_actions, list) and not plan_actions)
+            or (sequential and isinstance(plan_actions, list) and len(plan_actions) == 2)
+        )
         if (
             target != "kubernetes-workload"
             or not isinstance(evacuations, list)
-            or len(evacuations) != 1
-            or summary.get("evacuation_count") != 1
+            or summary.get("evacuation_count") != len(evacuations)
+            or not mode_valid
+            or (not sequential and len(evacuations) != 1)
+            or (sequential and not 2 <= len(evacuations) <= 4)
         ):
             reasons.append("UNSUPPORTED_SOURCE_RETIREMENT_PREPARATION")
         else:
-            operation = evacuations[0]
-            if not isinstance(operation, dict):
-                reasons.append("UNSUPPORTED_SOURCE_RETIREMENT_PREPARATION")
-            else:
+            source_node: tuple[object, object] | None = None
+            workload_ids: set[str] = set()
+            valid = True
+            for index, operation in enumerate(evacuations):
+                if not isinstance(operation, dict):
+                    valid = False
+                    break
                 required = (
                     "workload_id",
                     "replica_id",
@@ -1334,15 +1427,57 @@ def _execution_admission_reasons(
                     not isinstance(operation.get(key), str) or not operation[key]
                     for key in required
                 ):
-                    reasons.append("UNSUPPORTED_SOURCE_RETIREMENT_PREPARATION")
-                elif (
-                    operation["workload_id"] not in _supported_execution_workloads(target)
+                    valid = False
+                    break
+                identity = (operation["source_node_id"], operation["source_node_uid"])
+                if source_node is None:
+                    source_node = identity
+                elif identity != source_node:
+                    valid = False
+                    break
+                if (
+                    operation["workload_id"] in workload_ids
                     or operation["source_owner_kind"] != "FleetRightWorkload"
                     or operation["source_owner_name"] != operation["workload_id"]
                     or operation["source_owner_uid"] != operation["source_controller_uid"]
                     or operation["source_logical_slot_id"] != operation["replica_id"]
+                    or type(operation.get("sequence")) is not int
+                    or operation["sequence"] != index
+                    or operation.get("depends_on_operation_sequences")
+                    != ([] if index == 0 else [index - 1])
+                    or operation.get("depends_on_plan_action_sequences")
+                    != ([0] if sequential and index == 0 else [])
                 ):
-                    reasons.append("UNSUPPORTED_SOURCE_RETIREMENT_IDENTITY")
+                    valid = False
+                    break
+                workload_ids.add(operation["workload_id"])
+            if valid and sequential and source_node is not None:
+                cordon, verify = plan_actions
+                valid = (
+                    isinstance(cordon, dict)
+                    and isinstance(verify, dict)
+                    and cordon.get("stage") == 7
+                    and cordon.get("sequence") == 0
+                    and cordon.get("depends_on_sequences") == []
+                    and verify.get("stage") == 8
+                    and verify.get("sequence") == len(evacuations) + 1
+                    and verify.get("depends_on_sequences") == [len(evacuations)]
+                    and (cordon.get("source_node_id"), cordon.get("source_node_uid")) == source_node
+                    and (verify.get("source_node_id"), verify.get("source_node_uid")) == source_node
+                )
+            supported = _supported_execution_workloads(target)
+            if not valid or any(
+                operation["workload_id"] not in supported for operation in evacuations
+            ):
+                reasons.append("UNSUPPORTED_SOURCE_RETIREMENT_PREPARATION")
+            elif any(
+                operation["source_owner_kind"] != "FleetRightWorkload"
+                or operation["source_owner_name"] != operation["workload_id"]
+                or operation["source_owner_uid"] != operation["source_controller_uid"]
+                or operation["source_logical_slot_id"] != operation["replica_id"]
+                for operation in evacuations
+            ):
+                reasons.append("UNSUPPORTED_SOURCE_RETIREMENT_IDENTITY")
     elif schema_version != 1:
         reasons.append("UNSUPPORTED_EXECUTION_PROTOCOL_VERSION")
     if schema_version != 2 and summary["deactivated_node_ids"]:
@@ -1517,15 +1652,107 @@ def _verify_source_retirement_actions(
             ),
         }
         expected[operation_id] = (operation["workload_id"], payload)
-    if len(actions) != len(expected) or len(retirements) != len(actions):
+
+    expected_order: list[tuple[str, str | None, dict[str, object]]] = []
+    if plan["mode"] == 1:
+        plan_actions = plan["plan_actions"]
+        evacuations = plan["evacuations"]
+        if not 2 <= len(evacuations) <= 4 or len(plan_actions) != 2:
+            raise ControlError("verified node-drain action contract is incomplete")
+        first, final = plan_actions
+        node_id = evacuations[0]["source_node_id"]
+        node_uid = evacuations[0]["source_node_uid"]
+        if any(
+            (operation["source_node_id"], operation["source_node_uid"]) != (node_id, node_uid)
+            for operation in evacuations
+        ) or any(
+            (action["source_node_id"], action["source_node_uid"]) != (node_id, node_uid)
+            for action in plan_actions
+        ):
+            raise ControlError("verified node-drain source identity is inconsistent")
+        expected_plan_actions = (
+            (first, "node-drain-cordon", 7, 0, []),
+            (final, "node-drain-verify-empty", 8, len(evacuations) + 1, [len(evacuations)]),
+        )
+        for action, action_id, stage, sequence, dependencies in expected_plan_actions:
+            if (
+                action["action_id"] != action_id
+                or action["stage"] != stage
+                or action["sequence"] != sequence
+                or action["depends_on_sequences"] != dependencies
+            ):
+                raise ControlError("verified node-drain plan actions are unsupported")
+        cordon_id = hashlib.sha256(f"{plan_id}:node-drain:cordon:{node_uid}".encode()).hexdigest()
+        expected_order.append(
+            (
+                cordon_id,
+                None,
+                {
+                    "operation_id": cordon_id,
+                    "source_node_id": node_id,
+                    "source_node_uid": node_uid,
+                },
+            )
+        )
+    elif plan["mode"] != 0 or plan["plan_actions"] or len(plan["evacuations"]) != 1:
+        raise ControlError("verified V2 execution mode is unsupported")
+
+    for operation in plan["evacuations"]:
+        operation_id = hashlib.sha256(
+            f"{plan_id}:retirement:{operation['sequence']}".encode()
+        ).hexdigest()
+        expected_order.append((operation_id, operation["workload_id"], expected[operation_id][1]))
+
+    if plan["mode"] == 1:
+        operation = plan["evacuations"][0]
+        node_id = operation["source_node_id"]
+        node_uid = operation["source_node_uid"]
+        verify_id = hashlib.sha256(f"{plan_id}:node-drain:verify:{node_uid}".encode()).hexdigest()
+        expected_order.append(
+            (
+                verify_id,
+                None,
+                {
+                    "operation_id": verify_id,
+                    "cordon_operation_id": cordon_id,
+                    "source_node_id": node_id,
+                    "source_node_uid": node_uid,
+                    "source_pods": [
+                        {
+                            "workload_id": item["workload_id"],
+                            "pod_name": item["source_pod_name"],
+                            "pod_uid": item["source_pod_uid"],
+                        }
+                        for item in plan["evacuations"]
+                    ],
+                },
+            )
+        )
+
+    if len(actions) != len(expected_order) or len(retirements) != len(plan["evacuations"]):
         raise ControlError("source-retirement journal does not match verified V2 operations")
-    for action in retirements:
-        expected_action = expected.get(action["intent_id"])
+    action_types = {
+        "CORDON_NODE": "CORDON_NODE",
+        "PREPARE_SOURCE_RETIREMENT": "PREPARE_SOURCE_RETIREMENT",
+        "VERIFY_NODE_DRAIN": "VERIFY_NODE_DRAIN",
+    }
+    expected_types = (
+        (["CORDON_NODE"] if plan["mode"] == 1 else [])
+        + ["PREPARE_SOURCE_RETIREMENT"] * len(plan["evacuations"])
+        + (["VERIFY_NODE_DRAIN"] if plan["mode"] == 1 else [])
+    )
+    for action, expected_type, (intent_id, workload_id, payload) in zip(
+        actions, expected_types, expected_order, strict=True
+    ):
         if (
-            expected_action is None
-            or action["workload_id"] != expected_action[0]
-            or action["payload"] != expected_action[1]
-            or not _valid_source_retirement_action(action["workload_id"], action["payload"])
+            action["action_type"] != action_types[expected_type]
+            or action["intent_id"] != intent_id
+            or action["workload_id"] != workload_id
+            or action["payload"] != payload
+            or (
+                expected_type == "PREPARE_SOURCE_RETIREMENT"
+                and not _valid_source_retirement_action(workload_id, payload)
+            )
         ):
             raise ControlError("source-retirement journal does not match verified V2 operation")
 
@@ -2077,6 +2304,22 @@ def create_app(
                         for item in source_fields["evacuation_v2"]["controllers"]
                     }
                     node_identities = source_fields["evacuation_v2"]["nodes"]
+                    if summary["mode"] == 1:
+                        node_action = summary["plan_actions"][0]
+                        cordon_id = hashlib.sha256(
+                            f"{native_id}:node-drain:cordon:{node_action['source_node_uid']}".encode()
+                        ).hexdigest()
+                        intents.append(
+                            {
+                                "intent_id": cordon_id,
+                                "action_type": "CORDON_NODE",
+                                "payload": {
+                                    "operation_id": cordon_id,
+                                    "source_node_id": node_action["source_node_id"],
+                                    "source_node_uid": node_action["source_node_uid"],
+                                },
+                            }
+                        )
                     for evacuation in summary["evacuations"]:
                         sequence = int(evacuation["sequence"])
                         operation_id = hashlib.sha256(
@@ -2113,6 +2356,34 @@ def create_app(
                                             "error_slo_ppm"
                                         ],
                                     ),
+                                },
+                            }
+                        )
+                    if summary["mode"] == 1:
+                        node_action = summary["plan_actions"][1]
+                        cordon_id = hashlib.sha256(
+                            f"{native_id}:node-drain:cordon:{summary['plan_actions'][0]['source_node_uid']}".encode()
+                        ).hexdigest()
+                        verify_id = hashlib.sha256(
+                            f"{native_id}:node-drain:verify:{node_action['source_node_uid']}".encode()
+                        ).hexdigest()
+                        intents.append(
+                            {
+                                "intent_id": verify_id,
+                                "action_type": "VERIFY_NODE_DRAIN",
+                                "payload": {
+                                    "operation_id": verify_id,
+                                    "cordon_operation_id": cordon_id,
+                                    "source_node_id": node_action["source_node_id"],
+                                    "source_node_uid": node_action["source_node_uid"],
+                                    "source_pods": [
+                                        {
+                                            "workload_id": evacuation["workload_id"],
+                                            "pod_name": evacuation["source_pod_name"],
+                                            "pod_uid": evacuation["source_pod_uid"],
+                                        }
+                                        for evacuation in summary["evacuations"]
+                                    ],
                                 },
                             }
                         )
@@ -2300,6 +2571,8 @@ def create_app(
                 )
                 for action in actions:
                     payload = action["payload"]
+                    if action["action_type"] in {"CORDON_NODE", "VERIFY_NODE_DRAIN"}:
+                        continue
                     if action["action_type"] == "PREPARE_SOURCE_RETIREMENT":
                         if (
                             not _valid_source_retirement_action(action["workload_id"], payload)
@@ -2627,6 +2900,8 @@ def _mutate_plan(
                 )
                 for action in approval_actions:
                     payload = action["payload"]
+                    if action["action_type"] in {"CORDON_NODE", "VERIFY_NODE_DRAIN"}:
+                        continue
                     if action["action_type"] == "PREPARE_SOURCE_RETIREMENT":
                         if (
                             not _valid_source_retirement_action(action["workload_id"], payload)
@@ -2649,6 +2924,8 @@ def _mutate_plan(
                         raise ControlError("plan contains an unsupported execution action")
                 if app.state.execution_enabled:
                     for action in approval_actions:
+                        if action["action_type"] in {"CORDON_NODE", "VERIFY_NODE_DRAIN"}:
+                            continue
                         payload = action["payload"]
                         try:
                             observed = app.state.execution_controller.target.observe_scale(

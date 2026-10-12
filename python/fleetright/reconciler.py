@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from datetime import datetime
 from typing import Any
 
 from fleetright.control import ControlError, LeaseConflict, Repository, StaleState
@@ -45,6 +46,91 @@ class ExecutionController:
         self.readiness_timeout_seconds = readiness_timeout_seconds
         self.poll_seconds = poll_seconds
 
+    @staticmethod
+    def _retirement_may_have_dispatched_eviction(action: dict[str, Any]) -> bool:
+        execution_result = action.get("execution_result") or {}
+        history = execution_result.get("progress", []) if isinstance(execution_result, dict) else []
+        for item in reversed(history):
+            result = item.get("result") if isinstance(item, dict) else None
+            stage = result.get("stage") if isinstance(result, dict) else None
+            if stage == "RETIREMENT_RECHECKED":
+                continue
+            return stage in {
+                "EVICTION_INTENT",
+                "EVICTION_ACCEPTED",
+                "EVICTION_IN_PROGRESS",
+                "EVICTION_OUTCOME_UNKNOWN",
+                "EVICTION_SOURCE_REMOVED",
+                "RETIREMENT_WAITING_FINAL_HEALTH",
+            }
+        return False
+
+    def _compensate_retirement_if_needed(
+        self,
+        plan_id: str,
+        token: int,
+        action: dict[str, Any],
+        observation: dict[str, Any],
+        phase: str = "EXECUTING",
+    ) -> bool:
+        if (
+            observation.get("pending_pod_create") is not None
+            or observation.get("pod_create_history_uncertain")
+            or observation.get("unverified_pod_creates")
+        ):
+            return False
+        health = self._health_observation(action)
+        fresh_bad_sample = (
+            health is not None
+            and health.get("fresh_sample") is True
+            and health.get("healthy") is False
+        )
+        final_wait_exists, final_wait_started_at = self._retirement_final_wait_started_at(action)
+        if action.get("action_type") == "PREPARE_SOURCE_RETIREMENT" and final_wait_exists:
+            timed_out = (
+                final_wait_started_at is not None
+                and time.time() - final_wait_started_at > self.readiness_timeout_seconds
+            )
+        else:
+            started = action.get(
+                "execution_finished_at" if phase == "VERIFYING" else "execution_started_at"
+            )
+            timed_out = (
+                started is not None
+                and time.time() - started.timestamp() > self.readiness_timeout_seconds
+            )
+        if fresh_bad_sample or timed_out:
+            self._begin_compensation(plan_id, token, action, observation, phase)
+            return True
+        return False
+
+    @staticmethod
+    def _retirement_final_wait_started_at(action: dict[str, Any]) -> tuple[bool, float | None]:
+        execution_result = action.get("execution_result") or {}
+        progress = (
+            execution_result.get("progress", []) if isinstance(execution_result, dict) else []
+        )
+        for item in progress:
+            result = item.get("result") if isinstance(item, dict) else None
+            if not (
+                isinstance(result, dict)
+                and result.get("stage") == "RETIREMENT_WAITING_FINAL_HEALTH"
+                and result.get("source_removed_observed") is True
+            ):
+                continue
+            recorded_at = item.get("recorded_at")
+            if isinstance(recorded_at, datetime):
+                return True, recorded_at.timestamp()
+            if isinstance(recorded_at, str):
+                try:
+                    return True, datetime.fromisoformat(
+                        recorded_at.replace("Z", "+00:00")
+                    ).timestamp()
+                except ValueError:
+                    return True, None
+            return True, None
+        return False, None
+
     def run_forever(self, stop: threading.Event) -> None:
         while not stop.is_set():
             try:
@@ -77,7 +163,13 @@ class ExecutionController:
                     if action["execution_state"] in {"RUNNING", "OUTCOME_UNKNOWN"}
                 ]
                 if any(
-                    action["action_type"] not in {"SET_REPLICA_COUNT", "PREPARE_SOURCE_RETIREMENT"}
+                    action["action_type"]
+                    not in {
+                        "SET_REPLICA_COUNT",
+                        "PREPARE_SOURCE_RETIREMENT",
+                        "CORDON_NODE",
+                        "VERIFY_NODE_DRAIN",
+                    }
                     for action in unresolved
                 ):
                     return None
@@ -110,7 +202,146 @@ class ExecutionController:
                 for action in Repository.incomplete_actions(conn, plan_id)
                 if action["execution_state"] in {"RUNNING", "OUTCOME_UNKNOWN"}
             ]
+            completed_retirements = Repository.completed_retirement_actions(conn, plan_id)
+        if completed_retirements:
+            if not getattr(self.target, "source_retirement_preparation_enabled", False):
+                return None
+            for action in completed_retirements:
+                if not self._fence_completed_retirement(action, plan_id, pending_token):
+                    return None
         for action in unresolved:
+            if action["action_type"] == "VERIFY_NODE_DRAIN":
+                if not getattr(self.target, "supports_workload_execution", False):
+                    return None
+                payload = action.get("payload")
+                observe_drain = getattr(self.target, "observe_source_node_drain", None)
+                cordon_node = getattr(self.target, "cordon_source_node", None)
+                if (
+                    not isinstance(payload, dict)
+                    or not callable(observe_drain)
+                    or not callable(cordon_node)
+                ):
+                    return None
+                node_payload = {
+                    **payload,
+                    "operation_id": payload.get("cordon_operation_id", payload.get("operation_id")),
+                }
+                target_ref = f"node:{payload.get('source_node_id')}:drain"
+                try:
+                    with self.repository.transaction() as conn:
+                        Repository.record_execution_fence(
+                            conn,
+                            plan_id,
+                            action["intent_id"],
+                            self.controller_id,
+                            pending_token,
+                            target_ref,
+                            {
+                                "state": "PENDING",
+                                "token": pending_token,
+                                "precondition": {"uid": payload.get("source_node_uid")},
+                            },
+                        )
+                    cordon_observation = cordon_node(plan_id, node_payload, pending_token)
+                    if not self._node_cordon_matches(
+                        cordon_observation, plan_id, node_payload, pending_token
+                    ):
+                        return None
+                    with self.repository.transaction() as conn:
+                        Repository.record_execution_fence(
+                            conn,
+                            plan_id,
+                            action["intent_id"],
+                            self.controller_id,
+                            pending_token,
+                            target_ref,
+                            {
+                                "state": "COMPLETE",
+                                "token": pending_token,
+                                "precondition": {"uid": payload.get("source_node_uid")},
+                                "observation": cordon_observation,
+                            },
+                        )
+                    observation = observe_drain(plan_id, payload, pending_token)
+                except TargetError:
+                    return None
+                if not self._node_drain_observation_matches(observation, plan_id, payload):
+                    return None
+                # This is a read-only observation; the new controller rechecks before commit.
+                with self.repository.transaction() as conn:
+                    Repository.record_execution_fence(
+                        conn,
+                        plan_id,
+                        action["intent_id"],
+                        self.controller_id,
+                        pending_token,
+                        f"node:{payload.get('source_node_id')}:drain",
+                        {
+                            "state": "COMPLETE",
+                            "token": pending_token,
+                            "precondition": {"uid": payload.get("source_node_uid")},
+                            "observation": observation,
+                        },
+                    )
+                continue
+            if action["action_type"] == "CORDON_NODE":
+                if not getattr(self.target, "supports_workload_execution", False):
+                    return None
+                payload = action.get("payload")
+                if not isinstance(payload, dict) or not callable(
+                    getattr(self.target, "cordon_source_node", None)
+                ):
+                    return None
+                with self.repository.transaction() as conn:
+                    saved_fence = Repository.execution_fence_receipt(
+                        conn, plan_id, action["intent_id"], pending_token
+                    )
+                if saved_fence is not None and saved_fence.get("state") == "COMPLETE":
+                    if not self._node_cordon_matches(
+                        saved_fence.get("observation"),
+                        plan_id,
+                        payload,
+                        pending_token,
+                    ):
+                        return None
+                    continue
+                with self.repository.transaction() as conn:
+                    Repository.record_execution_fence(
+                        conn,
+                        plan_id,
+                        action["intent_id"],
+                        self.controller_id,
+                        pending_token,
+                        f"node:{payload.get('source_node_id')}",
+                        {
+                            "state": "PENDING",
+                            "precondition": {"uid": payload.get("source_node_uid")},
+                        },
+                    )
+                try:
+                    result = self.target.cordon_source_node(plan_id, payload, pending_token)
+                except TargetError:
+                    return None
+                if not self._node_cordon_matches(result, plan_id, payload, pending_token):
+                    return None
+                with self.repository.transaction() as conn:
+                    Repository.record_execution_fence(
+                        conn,
+                        plan_id,
+                        action["intent_id"],
+                        self.controller_id,
+                        pending_token,
+                        f"node:{payload.get('source_node_id')}",
+                        {
+                            "state": "COMPLETE",
+                            "token": pending_token,
+                            "precondition": {
+                                "uid": payload.get("source_node_uid"),
+                            },
+                            "observation": result,
+                        },
+                    )
+                continue
             if action["action_type"] == "PREPARE_SOURCE_RETIREMENT":
                 if not getattr(
                     self.target, "source_retirement_preparation_enabled", False
@@ -137,6 +368,8 @@ class ExecutionController:
                 try:
                     live = self.target.observe_scale(action["workload_id"])
                 except TargetNotFound:
+                    if getattr(self.target, "supports_workload_execution", False):
+                        return None
                     with self.repository.transaction() as conn:
                         Repository.fail_takeover_for_missing_target(
                             conn,
@@ -213,6 +446,8 @@ class ExecutionController:
                     except TargetError:
                         return None
             except TargetNotFound:
+                if getattr(self.target, "supports_workload_execution", False):
+                    return None
                 with self.repository.transaction() as conn:
                     Repository.fail_takeover_for_missing_target(
                         conn,
@@ -272,6 +507,162 @@ class ExecutionController:
                 self.lease_ttl_ms,
             )
         return token
+
+    @staticmethod
+    def _node_cordon_matches(
+        observation: object, plan_id: str, payload: dict[str, Any], token: int
+    ) -> bool:
+        if not isinstance(observation, dict):
+            return False
+        return (
+            observation.get("source_node_id") == payload.get("source_node_id")
+            and observation.get("source_node_uid") == payload.get("source_node_uid")
+            and observation.get("plan_id") == plan_id
+            and observation.get("operation_id") == payload.get("operation_id")
+            and observation.get("fencing_token") == token
+            and observation.get("unschedulable") is True
+        )
+
+    @staticmethod
+    def _node_drain_matches(observation: object, plan_id: str, payload: dict[str, Any]) -> bool:
+        return (
+            ExecutionController._node_drain_observation_matches(observation, plan_id, payload)
+            and observation.get("stage") == "NODE_DRAIN_COMPLETE"
+        )
+
+    @staticmethod
+    def _node_drain_observation_matches(
+        observation: object, plan_id: str, payload: dict[str, Any]
+    ) -> bool:
+        if not isinstance(observation, dict):
+            return False
+        remaining = observation.get("remaining_source_pod_uids")
+        return (
+            observation.get("stage") in {"NODE_DRAIN_WAITING", "NODE_DRAIN_COMPLETE"}
+            and observation.get("source_node_id") == payload.get("source_node_id")
+            and observation.get("source_node_uid") == payload.get("source_node_uid")
+            and observation.get("plan_id") == plan_id
+            and observation.get("operation_id") == payload.get("cordon_operation_id")
+            and observation.get("unschedulable") is True
+            and isinstance(remaining, list)
+            and all(isinstance(uid, str) and uid for uid in remaining)
+            and (
+                bool(remaining)
+                if observation.get("stage") == "NODE_DRAIN_WAITING"
+                else not remaining
+            )
+            and isinstance(observation.get("exempt_pods"), list)
+            and type(observation.get("inventory_pod_count")) is int
+        )
+
+    def _fence_completed_retirement(
+        self, action: dict[str, Any], plan_id: str, pending_token: int
+    ) -> bool:
+        """Transfer completed retirement observation to the new target fence before verify."""
+        if not getattr(self.target, "supports_workload_execution", False):
+            return False
+        journal = action.get("execution_result")
+        payload = action.get("payload")
+        final_result = journal.get("result") if isinstance(journal, dict) else None
+        original = final_result.get("observation") if isinstance(final_result, dict) else None
+        old_token = original.get("fencing_token") if isinstance(original, dict) else None
+        if (
+            not isinstance(payload, dict)
+            or not isinstance(final_result, dict)
+            or final_result.get("stage") != "RETIREMENT_COMPLETE"
+            or type(old_token) is not int
+            or old_token <= 0
+            or not action.get("workload_id")
+        ):
+            return False
+
+        try:
+            with self.repository.transaction() as conn:
+                receipt = Repository.execution_fence_receipt(
+                    conn, plan_id, action["intent_id"], pending_token
+                )
+            if receipt is None:
+                live = self.target.observe_scale(action["workload_id"])
+                old_token = live.get("fencing_token")
+                if (
+                    live.get("uid") != payload.get("source_owner_uid")
+                    or type(old_token) is not int
+                    or old_token <= 0
+                ):
+                    return False
+                observed = self.target.observe_source_retirement(
+                    action["workload_id"],
+                    plan_id,
+                    payload,
+                    final_result,
+                    fencing_token=old_token,
+                )
+                if observed.get("stage") != "RETIREMENT_COMPLETE":
+                    return False
+                current = observed.get("observation")
+                if not isinstance(current, dict):
+                    return False
+                precondition = {key: current[key] for key in ("uid", "generation", "replicas")}
+                prefix = "fleetrightworkload"
+                with self.repository.transaction() as conn:
+                    Repository.record_execution_fence(
+                        conn,
+                        plan_id,
+                        action["intent_id"],
+                        self.controller_id,
+                        pending_token,
+                        f"{prefix}:{action['workload_id']}",
+                        {"state": "PENDING", "precondition": precondition},
+                    )
+                receipt = {"state": "PENDING", "precondition": precondition}
+
+            if receipt.get("state") != "COMPLETE":
+                precondition = receipt.get("precondition")
+                if not isinstance(precondition, dict):
+                    return False
+                target = self._fence_workload_target(action, plan_id, pending_token, precondition)
+                candidate = {
+                    "state": "COMPLETE",
+                    "token": pending_token,
+                    "precondition": precondition,
+                    "fence_precondition": target.get("fence_precondition"),
+                    "generation": target.get("generation"),
+                    "prior_execution_fence": target.get("prior_execution_fence"),
+                    "fence_replayed": target.get("fence_replayed", False),
+                    "operation_applied_before_fence": target.get(
+                        "operation_applied_before_fence", False
+                    ),
+                    "observation": target,
+                }
+                if not self._takeover_fence_matches(action, plan_id, pending_token, candidate):
+                    return False
+                with self.repository.transaction() as conn:
+                    Repository.record_execution_fence(
+                        conn,
+                        plan_id,
+                        action["intent_id"],
+                        self.controller_id,
+                        pending_token,
+                        f"fleetrightworkload:{action['workload_id']}",
+                        candidate,
+                    )
+
+            adopted = self.target.observe_source_retirement(
+                action["workload_id"],
+                plan_id,
+                payload,
+                final_result,
+                fencing_token=pending_token,
+            )
+            return adopted.get("stage") in {
+                "RETIREMENT_COMPLETE",
+                "RETIREMENT_WAITING_FINAL_HEALTH",
+            } and (
+                adopted.get("stage") == "RETIREMENT_COMPLETE"
+                or adopted.get("source_removed_observed") is True
+            )
+        except (TargetError, KeyError, TypeError, ValueError):
+            return False
 
     def _fence_workload_target(
         self,
@@ -369,6 +760,9 @@ class ExecutionController:
                 if unresolved[0]["action_type"] == "PREPARE_SOURCE_RETIREMENT":
                     self._settle_source_retirement_control_request(plan_id, token, unresolved[0])
                     return
+                if unresolved[0]["action_type"] in {"CORDON_NODE", "VERIFY_NODE_DRAIN"}:
+                    self._start_node_action(plan_id, token, unresolved[0])
+                    return
                 if stop is not None and stop.is_set():
                     return
                 self._reconcile_action(plan_id, token, unresolved[0], False, allow_dispatch=False)
@@ -430,6 +824,12 @@ class ExecutionController:
 
         action = candidates[0]
         state = action["execution_state"]
+        if action["action_type"] in {"CORDON_NODE", "VERIFY_NODE_DRAIN"}:
+            if state in {"NOT_STARTED", "RUNNING", "OUTCOME_UNKNOWN"}:
+                self._start_node_action(plan_id, token, action)
+            else:
+                self._fail_safe(plan_id, token, "node-action-state-invalid")
+            return
         if action["action_type"] not in {"SET_REPLICA_COUNT", "PREPARE_SOURCE_RETIREMENT"}:
             self._fail_safe(plan_id, token, "unsupported-action")
             return
@@ -465,6 +865,48 @@ class ExecutionController:
             if not isinstance(previous, dict):
                 self._fail_safe(plan_id, token, "verification-journal-invalid")
                 return
+            if action["action_type"] == "CORDON_NODE":
+                final_result = result.get("result") if isinstance(result, dict) else None
+                cordon_observation = completed
+                cordon_token = (
+                    final_result.get("fencing_token") if isinstance(final_result, dict) else None
+                )
+                if (
+                    not isinstance(payload, dict)
+                    or not isinstance(final_result, dict)
+                    or final_result.get("stage") != "NODE_CORDONED"
+                    or type(cordon_token) is not int
+                    or not self._node_cordon_matches(
+                        cordon_observation, plan_id, payload, cordon_token
+                    )
+                ):
+                    self._fail_safe(plan_id, token, "node-cordon-verification-journal-invalid")
+                    return
+                evidence.append(
+                    {"intent_id": action["intent_id"], "node_cordon": cordon_observation}
+                )
+                continue
+            if action["action_type"] == "VERIFY_NODE_DRAIN":
+                final_result = result.get("result") if isinstance(result, dict) else None
+                if (
+                    not isinstance(payload, dict)
+                    or not isinstance(final_result, dict)
+                    or final_result.get("stage") != "NODE_DRAIN_COMPLETE"
+                    or not self._node_drain_matches(completed, plan_id, payload)
+                ):
+                    self._fail_safe(plan_id, token, "node-drain-verification-journal-invalid")
+                    return
+                try:
+                    observed_drain = self.target.observe_source_node_drain(plan_id, payload)
+                except ActionBlocked as error:
+                    self._fail_safe(plan_id, token, error.reason)
+                    return
+                except TargetError:
+                    return
+                if not self._node_drain_matches(observed_drain, plan_id, payload):
+                    return
+                evidence.append({"intent_id": action["intent_id"], "node_drain": observed_drain})
+                continue
             if action["action_type"] == "PREPARE_SOURCE_RETIREMENT":
                 final_result = result.get("result") if isinstance(result, dict) else None
                 if (
@@ -488,6 +930,15 @@ class ExecutionController:
                 except TargetError:
                     return
                 if observed_retirement.get("stage") != "RETIREMENT_COMPLETE":
+                    observation = observed_retirement.get("observation")
+                    if (
+                        observed_retirement.get("stage") == "RETIREMENT_WAITING_FINAL_HEALTH"
+                        and observed_retirement.get("source_removed_observed") is True
+                        and isinstance(observation, dict)
+                    ):
+                        self._compensate_retirement_if_needed(
+                            plan_id, token, action, observation, phase="VERIFYING"
+                        )
                     return
                 observed = observed_retirement.get("observation")
                 completion_observation = final_result.get("observation")
@@ -499,10 +950,26 @@ class ExecutionController:
                 ):
                     self._fail_safe(plan_id, token, "retirement-verification-observation-invalid")
                     return
+                generation_matches = observed.get("generation") == completion_observation.get(
+                    "generation"
+                )
+                if completion_observation.get("fencing_token") != token:
+                    receipt = self._takeover_fence_receipt(plan_id, action["intent_id"], token)
+                    fenced_observation = receipt.get("observation") if receipt else None
+                    generation_matches = (
+                        receipt is not None
+                        and receipt.get("state") == "COMPLETE"
+                        and self._takeover_fence_matches(action, plan_id, token, receipt)
+                        and isinstance(fenced_observation, dict)
+                        and receipt.get("generation") == observed.get("generation")
+                        and observed.get("fencing_token") == token
+                        and fenced_observation.get("execution_fence")
+                        == observed.get("execution_fence")
+                    )
                 if (
                     observed.get("uid") != previous.get("uid")
                     or observed.get("replicas") != desired
-                    or observed.get("generation") != completion_observation.get("generation")
+                    or not generation_matches
                 ):
                     self._fail_safe(plan_id, token, "retirement-target-changed-during-verification")
                     return
@@ -597,6 +1064,14 @@ class ExecutionController:
     def _transition(
         self, plan_id: str, token: int, old: str, new: str, outcome: dict[str, Any]
     ) -> None:
+        if new in {"COMMITTED", "CANCELLED", "COMPENSATED", "FAILED_SAFE"} and not (
+            self._workload_creates_resolved(plan_id)
+        ):
+            LOG.error(
+                "execution remains active until workload CREATE outcomes are known",
+                extra={"plan_id": plan_id, "state": new},
+            )
+            return
         with self.repository.transaction() as conn:
             Repository.transition_execution_and_plan(
                 conn,
@@ -623,12 +1098,163 @@ class ExecutionController:
             },
         )
 
+    def _workload_creates_resolved(self, plan_id: str) -> bool:
+        if not getattr(self.target, "supports_workload_execution", False):
+            return True
+        with self.repository.transaction() as conn:
+            actions = conn.execute(
+                "SELECT workload_id, payload, execution_result FROM action_intents "
+                "WHERE plan_id = %s AND workload_id IS NOT NULL",
+                (plan_id,),
+            ).fetchall()
+        expected_uids: dict[str, set[str]] = {}
+        for action in actions:
+            payload = action["payload"] if isinstance(action["payload"], dict) else {}
+            precondition = payload.get("target_precondition")
+            journal = action["execution_result"]
+            pre_observation = journal.get("pre_observation") if isinstance(journal, dict) else None
+            uid = payload.get("source_owner_uid")
+            if not isinstance(uid, str) and isinstance(precondition, dict):
+                uid = precondition.get("uid")
+            if not isinstance(uid, str) and isinstance(pre_observation, dict):
+                uid = pre_observation.get("uid")
+            if not isinstance(uid, str) or not uid:
+                return False
+            expected_uids.setdefault(action["workload_id"], set()).add(uid)
+        for workload_id, uids in expected_uids.items():
+            if len(uids) != 1:
+                return False
+            try:
+                observed = self.target.observe_scale(workload_id)
+            except TargetError:
+                return False
+            if (
+                observed.get("uid") not in uids
+                or "pending_pod_create" not in observed
+                or observed.get("pending_pod_create") is not None
+                or observed.get("pod_create_history_uncertain") is not False
+                or type(observed.get("unverified_pod_creates")) is not int
+                or observed.get("unverified_pod_creates") != 0
+            ):
+                return False
+        return True
+
     @staticmethod
     def _payload(action: dict[str, Any]) -> dict[str, Any]:
         payload = action.get("payload")
         if not isinstance(payload, dict):
             raise TargetPreconditionFailed("action payload is invalid")
         return payload
+
+    def _start_node_action(self, plan_id: str, token: int, action: dict[str, Any]) -> None:
+        payload = self._payload(action)
+        action_type = action["action_type"]
+        if action_type not in {"CORDON_NODE", "VERIFY_NODE_DRAIN"}:
+            self._fail_safe(plan_id, token, "unsupported-node-action")
+            return
+        method = (
+            getattr(self.target, "cordon_source_node", None)
+            if action_type == "CORDON_NODE"
+            else getattr(self.target, "observe_source_node_drain", None)
+        )
+        if not getattr(self.target, "supports_workload_execution", False) or not callable(method):
+            self._fail_safe(plan_id, token, "node-action-target-unsupported")
+            return
+        state = action["execution_state"]
+        if state == "NOT_STARTED":
+            stage = (
+                "NODE_CORDON_INTENT" if action_type == "CORDON_NODE" else "NODE_DRAIN_VERIFY_INTENT"
+            )
+            try:
+                with self.repository.transaction() as conn:
+                    updated = Repository.transition_action(
+                        conn,
+                        plan_id,
+                        action["intent_id"],
+                        "NOT_STARTED",
+                        "RUNNING",
+                        self.controller_id,
+                        token,
+                        pre_observation={
+                            "source_node_id": payload.get("source_node_id"),
+                            "source_node_uid": payload.get("source_node_uid"),
+                        },
+                        result={"stage": stage},
+                    )
+                action = {**action, **updated}
+            except (ControlError, LeaseConflict, StaleState):
+                return
+        try:
+            if action_type == "CORDON_NODE":
+                result = method(plan_id, payload, token)
+                if not self._node_cordon_matches(result, plan_id, payload, token):
+                    raise ActionBlocked("DRAIN_NODE_CORDON_POSTCONDITION_FAILED")
+                self._finish_action(
+                    plan_id,
+                    token,
+                    action,
+                    "SUCCEEDED",
+                    result,
+                    result={
+                        "stage": "NODE_CORDONED",
+                        "source_node_uid": payload["source_node_uid"],
+                        "fencing_token": token,
+                    },
+                )
+                return
+
+            cordon_payload = {
+                **payload,
+                "operation_id": payload.get("cordon_operation_id", payload.get("operation_id")),
+            }
+            cordon_observation = self.target.cordon_source_node(plan_id, cordon_payload, token)
+            if not self._node_cordon_matches(cordon_observation, plan_id, cordon_payload, token):
+                raise ActionBlocked("DRAIN_NODE_CORDON_POSTCONDITION_FAILED")
+            observation = method(plan_id, payload, token)
+            if observation.get("stage") == "NODE_DRAIN_WAITING":
+                if state == "RUNNING":
+                    with self.repository.transaction() as conn:
+                        Repository.record_action_progress(
+                            conn,
+                            plan_id,
+                            action["intent_id"],
+                            self.controller_id,
+                            token,
+                            observation=observation,
+                            result={
+                                "stage": "NODE_DRAIN_WAITING",
+                                "remaining_source_pod_uids": observation.get(
+                                    "remaining_source_pod_uids"
+                                ),
+                            },
+                        )
+                return
+            if not self._node_drain_matches(observation, plan_id, payload):
+                raise ActionBlocked("DRAIN_NODE_FINAL_OBSERVATION_INVALID")
+            self._finish_action(
+                plan_id,
+                token,
+                action,
+                "SUCCEEDED",
+                observation,
+                result={
+                    "stage": "NODE_DRAIN_COMPLETE",
+                    "source_node_uid": payload["source_node_uid"],
+                    "exempt_pods": observation["exempt_pods"],
+                    "inventory_pod_count": observation["inventory_pod_count"],
+                },
+            )
+        except OutcomeUnknown:
+            self._mark_unknown(plan_id, token, action, "node-cordon-response-unknown")
+        except ActionBlocked as error:
+            self._finish_action(plan_id, token, action, "FAILED", {}, error.reason)
+            self._fail_safe(plan_id, token, error.reason)
+        except TargetPreconditionFailed:
+            # A resourceVersion CAS conflict proves this patch did not commit.
+            return
+        except TargetError:
+            if action_type == "CORDON_NODE":
+                self._mark_unknown(plan_id, token, action, "node-cordon-outcome-unknown")
 
     def _start_action(
         self,
@@ -744,6 +1370,10 @@ class ExecutionController:
         try:
             observed = self.target.observe_scale(workload)
         except TargetNotFound:
+            if getattr(self.target, "supports_workload_execution", False):
+                return
+            if self._retirement_may_have_dispatched_eviction(action):
+                return
             if action["execution_state"] in {"RUNNING", "OUTCOME_UNKNOWN"}:
                 self._finish_action(
                     plan_id,
@@ -814,17 +1444,28 @@ class ExecutionController:
         else:
             return
         eviction_attempt = False
+        post_source_removal_observation: dict[str, Any] | None = None
         try:
-            with self.repository.transaction() as conn:
-                Repository.record_action_progress(
-                    conn,
-                    plan_id,
-                    action["intent_id"],
-                    self.controller_id,
-                    token,
-                    observation=observed,
-                    result=progress_result,
-                )
+            settled_retirement_stages = {
+                "EVICTION_INTENT",
+                "EVICTION_ACCEPTED",
+                "EVICTION_IN_PROGRESS",
+                "EVICTION_OUTCOME_UNKNOWN",
+                "EVICTION_SOURCE_REMOVED",
+                "RETIREMENT_WAITING_FINAL_HEALTH",
+            }
+            if not (state == "RUNNING" and prior_stage in settled_retirement_stages):
+                with self.repository.transaction() as conn:
+                    progress_action = Repository.record_action_progress(
+                        conn,
+                        plan_id,
+                        action["intent_id"],
+                        self.controller_id,
+                        token,
+                        observation=observed,
+                        result=progress_result,
+                    )
+                action = {**action, **progress_action}
             with self.repository.transaction() as conn:
                 Repository.authorize_action(
                     conn, plan_id, action["intent_id"], self.controller_id, token
@@ -840,6 +1481,7 @@ class ExecutionController:
                 "EVICTION_INTENT",
                 "EVICTION_ACCEPTED",
                 "EVICTION_IN_PROGRESS",
+                "EVICTION_OUTCOME_UNKNOWN",
                 "EVICTION_SOURCE_REMOVED",
                 "RETIREMENT_WAITING_FINAL_HEALTH",
             } or (
@@ -850,7 +1492,6 @@ class ExecutionController:
                 if not getattr(self.target, "supports_workload_execution", False):
                     raise ActionBlocked("SOURCE_RETIREMENT_TARGET_UNAVAILABLE")
                 prepared = dict(prior_result)
-                prepared["stage"] = "READY_FOR_SAFE_EVICTION"
                 observed_retirement = self.target.observe_source_retirement(
                     workload,
                     plan_id,
@@ -873,6 +1514,23 @@ class ExecutionController:
                     )
                     return
                 if stage == "EVICTION_RETRY_SAFE":
+                    health = self._health_observation(action)
+                    required_ready = max(
+                        current.get("availability_floor", 0),
+                        payload.get("profile_required_replicas", 0),
+                    )
+                    if (
+                        not self._capacity_ready(current)
+                        or current.get("ready_replicas", 0)
+                        < payload.get("surge_desired_replicas", 0)
+                        or current.get("available_replicas", 0) < required_ready
+                        or health is None
+                        or health.get("ready") is not True
+                        or health.get("fresh_sample") is not True
+                        or health.get("healthy") is not True
+                    ):
+                        self._compensate_retirement_if_needed(plan_id, token, action, current)
+                        return
                     prepared = dict(observed_retirement)
                     prepared["stage"] = "READY_FOR_SAFE_EVICTION"
                     intent = {
@@ -880,34 +1538,47 @@ class ExecutionController:
                         "stage": "EVICTION_INTENT",
                         "fencing_token": token,
                     }
-                    with self.repository.transaction() as conn:
-                        Repository.record_action_progress(
-                            conn,
-                            plan_id,
-                            action["intent_id"],
-                            self.controller_id,
-                            token,
-                            observation=current,
-                            result=intent,
-                        )
-                        Repository.authorize_action(
-                            conn, plan_id, action["intent_id"], self.controller_id, token
-                        )
-                        self._assert_plan_fresh(conn, plan_id)
-                    if stop is not None and stop.is_set():
-                        return
-                    eviction_attempt = True
+
+                    def journal_eviction_intent() -> bool:
+                        nonlocal eviction_attempt
+                        if stop is not None and stop.is_set():
+                            return False
+                        with self.repository.transaction() as conn:
+                            Repository.record_action_progress(
+                                conn,
+                                plan_id,
+                                action["intent_id"],
+                                self.controller_id,
+                                token,
+                                observation=current,
+                                result=intent,
+                            )
+                            Repository.authorize_action(
+                                conn, plan_id, action["intent_id"], self.controller_id, token
+                            )
+                            self._assert_plan_fresh(conn, plan_id)
+                        eviction_attempt = True
+                        return True
+
                     result = self.target.evict_source(
                         workload,
                         plan_id,
                         payload,
                         prepared,
                         fencing_token=token,
+                        before_dispatch=journal_eviction_intent,
                     )
                     if result.get("stage") == "EVICTION_ACCEPTED":
                         result = {**prepared, **result, "fencing_token": token}
                 else:
                     result = observed_retirement
+                    if (
+                        stage == "RETIREMENT_WAITING_FINAL_HEALTH"
+                        and observed_retirement.get("source_removed_observed") is True
+                    ):
+                        post_source_removal_observation = observed_retirement.get("observation")
+                        if not isinstance(post_source_removal_observation, dict):
+                            raise TargetError("post-eviction wait has no target observation")
             else:
                 result = (
                     prepare(workload, plan_id, payload, fencing_token=token)
@@ -917,6 +1588,9 @@ class ExecutionController:
         except (ControlError, LeaseConflict, StaleState):
             return
         except ActionBlocked as error:
+            if eviction_attempt or self._retirement_may_have_dispatched_eviction(action):
+                self._mark_unknown(plan_id, token, action, error.reason)
+                return
             try:
                 current = self.target.observe_scale(workload)
             except TargetError:
@@ -949,7 +1623,17 @@ class ExecutionController:
             self._fail_safe(plan_id, token, error.reason)
             return
         except TargetPreconditionFailed as error:
-            if eviction_attempt:
+            if (
+                not eviction_attempt
+                and str(error) == "target resource version changed"
+                and not self._retirement_may_have_dispatched_eviction(action)
+            ):
+                LOG.info(
+                    "retirement status compare-and-swap changed; retrying after fresh observation",
+                    extra={"plan_id": plan_id, "action_id": action["intent_id"]},
+                )
+                return
+            if eviction_attempt or self._retirement_may_have_dispatched_eviction(action):
                 self._mark_unknown(plan_id, token, action, "eviction-precondition-needs-reconcile")
                 return
             try:
@@ -979,6 +1663,7 @@ class ExecutionController:
             "EVICTION_INTENT",
             "EVICTION_ACCEPTED",
             "EVICTION_IN_PROGRESS",
+            "EVICTION_OUTCOME_UNKNOWN",
             "EVICTION_SOURCE_REMOVED",
             "RETIREMENT_WAITING_FINAL_HEALTH",
         }:
@@ -986,9 +1671,9 @@ class ExecutionController:
             history = progress.get("progress", []) if isinstance(progress, dict) else []
             last = history[-1].get("result") if history and isinstance(history[-1], dict) else None
             if last != result:
-                current = self.target.observe_scale(workload)
+                current = post_source_removal_observation or self.target.observe_scale(workload)
                 with self.repository.transaction() as conn:
-                    Repository.record_action_progress(
+                    progress_action = Repository.record_action_progress(
                         conn,
                         plan_id,
                         action["intent_id"],
@@ -997,6 +1682,11 @@ class ExecutionController:
                         observation=current,
                         result=result,
                     )
+                action = {**action, **progress_action}
+            if post_source_removal_observation is not None:
+                self._compensate_retirement_if_needed(
+                    plan_id, token, action, post_source_removal_observation
+                )
             return
         self._mark_unknown(plan_id, token, action, "retirement-preparation-result-unqualified")
 
@@ -1008,34 +1698,166 @@ class ExecutionController:
             and getattr(self.target, "supports_workload_execution", False)
         ):
             return
+        receipt = self._takeover_fence_receipt(plan_id, action["intent_id"], token)
+        if receipt is None or not self._takeover_fence_matches(action, plan_id, token, receipt):
+            return
         execution_result = action.get("execution_result") or {}
         history = execution_result.get("progress", []) if isinstance(execution_result, dict) else []
-        if any(
-            isinstance(item, dict)
-            and isinstance(item.get("result"), dict)
-            and item["result"].get("stage")
-            in {
-                "EVICTION_INTENT",
-                "EVICTION_ACCEPTED",
-                "EVICTION_IN_PROGRESS",
-                "EVICTION_SOURCE_REMOVED",
-                "PDB_BLOCKED",
-                "RETIREMENT_WAITING_FINAL_HEALTH",
-            }
-            for item in history
+        prepared = None
+        for item in reversed(history):
+            result = item.get("result") if isinstance(item, dict) else None
+            if not isinstance(result, dict) or result.get("stage") == "RETIREMENT_RECHECKED":
+                continue
+            prepared = result
+            break
+        if not isinstance(prepared, dict):
+            return
+        stage = prepared.get("stage")
+        pre_eviction_stages = {
+            "REPLACEMENT_REQUESTED",
+            "REPLACEMENT_CREATE_PENDING",
+            "REPLACEMENT_SCHEDULING",
+            "REPLACEMENT_WAITING_READY",
+            "REPLACEMENT_WARMING",
+            "REPLACEMENT_CAPACITY_PENDING",
+            "PDB_STATUS_PENDING",
+            "PDB_BLOCKED",
+        }
+        if stage == "RETIREMENT_REQUESTED" or (
+            isinstance(stage, str)
+            and stage in pre_eviction_stages
+            and prepared.get("source_retirement_intent_recorded") is not True
         ):
+            try:
+                observed = self.target.observe_scale(action["workload_id"])
+            except TargetError:
+                return
+            payload = self._payload(action)
+            fence_observation = receipt.get("observation", {})
+            request = observed.get("execution_request")
+            execution = observed.get("execution")
+            retired_slots = observed.get("retired_replica_slots")
+            source_getter = getattr(self.target, "get_pod", None)
+            source_name = payload.get("source_pod_name")
+            if not callable(source_getter) or not isinstance(source_name, str):
+                return
+            try:
+                source = source_getter(source_name)
+            except TargetError:
+                return
+            source_metadata = source.get("metadata", {}) if isinstance(source, dict) else {}
+            source_spec = source.get("spec", {}) if isinstance(source, dict) else {}
+            source_is_current = (
+                isinstance(source_metadata, dict)
+                and source_metadata.get("uid") == payload.get("source_pod_uid")
+                and source_metadata.get("deletionTimestamp") is None
+                and isinstance(source_spec, dict)
+                and source_spec.get("nodeName") == payload.get("source_node_id")
+            )
+            creates_resolved = (
+                observed.get("pending_pod_create") is None
+                and observed.get("pod_create_history_uncertain") is False
+                and type(observed.get("unverified_pod_creates")) is int
+                and observed.get("unverified_pod_creates") == 0
+            )
+            previous_request_resolved = request is None or (
+                isinstance(request, dict)
+                and isinstance(execution, dict)
+                and execution.get("phase") == "APPLIED"
+                and (request.get("planID"), request.get("operationID"))
+                != (plan_id, action["intent_id"])
+            )
+            same_operation_applied = (
+                isinstance(request, dict)
+                and isinstance(execution, dict)
+                and (request.get("planID"), request.get("operationID"))
+                == (plan_id, action["intent_id"])
+                and request.get("targetReplicas") == payload.get("surge_desired_replicas")
+                and request.get("destinationNodes") == payload.get("destination_nodes")
+                and request.get("purpose") == "staged-replacement-v1"
+                and execution.get("phase") == "APPLIED"
+            )
+            pre_dispatch_request_resolved = (
+                previous_request_resolved
+                and observed.get("replicas") == payload.get("baseline_replicas")
+            ) or (
+                same_operation_applied
+                and observed.get("replicas") == payload.get("surge_desired_replicas")
+            )
+            prepared_request_resolved = same_operation_applied and observed.get(
+                "replicas"
+            ) == payload.get("surge_desired_replicas")
+            if (
+                payload.get("source_owner_uid") != observed.get("uid")
+                or observed.get("uid") != fence_observation.get("uid")
+                or observed.get("generation") != receipt.get("generation")
+                or observed.get("fencing_token") != token
+                or observed.get("execution_fence") != fence_observation.get("execution_fence")
+                or not source_is_current
+                or not isinstance(retired_slots, list)
+                or any(
+                    isinstance(slot, dict)
+                    and (
+                        slot.get("replicaID") == payload.get("source_logical_slot_id")
+                        or slot.get("podUID") == payload.get("source_pod_uid")
+                    )
+                    for slot in retired_slots
+                )
+                or not creates_resolved
+                or not (
+                    pre_dispatch_request_resolved
+                    if stage == "RETIREMENT_REQUESTED"
+                    else prepared_request_resolved
+                )
+            ):
+                return
+            self._finish_action(
+                plan_id,
+                token,
+                action,
+                "FAILED",
+                observed,
+                "source-retirement-stopped-before-target-dispatch",
+                result={
+                    "stage": "BLOCKED",
+                    "blocked_at": "CONTROL_REQUESTED",
+                    "reason": "source-retirement-not-dispatched",
+                },
+            )
+            return
+        try:
+            retirement = self.target.observe_source_retirement(
+                action["workload_id"],
+                plan_id,
+                self._payload(action),
+                prepared,
+                fencing_token=token,
+            )
+        except TargetNotFound:
+            return
+        except TargetError:
+            return
+        stage = retirement.get("stage")
+        if stage == "RETIREMENT_COMPLETE":
+            observed = retirement.get("observation")
+            if isinstance(observed, dict):
+                self._finish_action(
+                    plan_id,
+                    token,
+                    action,
+                    "SUCCEEDED",
+                    observed,
+                    result=retirement,
+                )
+            return
+        if stage not in {"EVICTION_RETRY_SAFE"}:
             if action["execution_state"] == "RUNNING":
                 self._mark_unknown(
                     plan_id, token, action, "eviction-outcome-needs-read-only-reconciliation"
                 )
             return
-        receipt = self._takeover_fence_receipt(plan_id, action["intent_id"], token)
-        if receipt is None or not self._takeover_fence_matches(action, plan_id, token, receipt):
-            return
         try:
             observed = self.target.observe_scale(action["workload_id"])
-        except TargetNotFound:
-            return
         except TargetError:
             return
         fence_observation = receipt.get("observation", {})
@@ -2137,6 +2959,18 @@ class ExecutionController:
                     extra={"plan_id": plan_id, "action_id": action["intent_id"], "reason": reason},
                 )
                 return
+            if getattr(self.target, "supports_workload_execution", False) and (
+                "pending_pod_create" not in observed
+                or observed.get("pending_pod_create") is not None
+                or observed.get("pod_create_history_uncertain") is not False
+                or type(observed.get("unverified_pod_creates")) is not int
+                or observed.get("unverified_pod_creates") != 0
+            ):
+                LOG.error(
+                    "execution remains active until Pod CREATE outcomes are known",
+                    extra={"plan_id": plan_id, "action_id": action["intent_id"], "reason": reason},
+                )
+                return
             dispatch = self._latest_dispatch(action)
             target_fence = self._takeover_fence_receipt(
                 plan_id,
@@ -2188,6 +3022,12 @@ class ExecutionController:
                         result={"target_fence": target_fence},
                         error=reason,
                     )
+        if not self._workload_creates_resolved(plan_id):
+            LOG.error(
+                "execution remains active until workload identity and CREATE outcomes are known",
+                extra={"plan_id": plan_id, "reason": reason},
+            )
+            return
         with self.repository.transaction() as conn:
             execution = Repository.assert_execution_controller(
                 conn, plan_id, self.controller_id, token

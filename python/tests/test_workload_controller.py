@@ -212,6 +212,55 @@ class CompareAndSwapStatusAPI(FakeAPI):
             return result
 
 
+def test_unchanged_applied_operation_does_not_churn_status() -> None:
+    api = CompareAndSwapStatusAPI()
+    workload = _workload(executionProtocol="monotonic-scale-up-v1", surgeBudget=1)
+    reconcile_workload(api, workload, _nodes())
+    source = next(iter(api.pods.values()))
+    source["spec"]["nodeName"] = "worker-a"
+    source["status"] = {
+        "phase": "Running",
+        "conditions": [{"type": "Ready", "status": "True"}],
+    }
+    workload["metadata"]["resourceVersion"] = api.status_resource_version
+    workload["status"] = deepcopy(api.status)
+    reconcile_workload(api, workload, _nodes())
+
+    workload["metadata"].update(generation=2, resourceVersion=api.status_resource_version)
+    workload["spec"].update(
+        replicas=2,
+        executionRequest={
+            "planID": "plan-1",
+            "operationID": "action-1",
+            "generation": 13,
+            "expectedReplicas": 1,
+            "targetReplicas": 2,
+            "minimumReadyReplicas": 1,
+            "destinationNodes": [{"name": "worker-b", "uid": "worker-b-uid"}],
+            "purpose": "staged-replacement-v1",
+        },
+    )
+    workload["status"] = deepcopy(api.status)
+    reconcile_workload(api, workload, _nodes())
+    replacement = api.pods[_pod_name("workload-uid", 1)]
+    replacement["spec"]["nodeName"] = "worker-b"
+    replacement["status"] = {
+        "phase": "Running",
+        "conditions": [{"type": "Ready", "status": "True"}],
+    }
+
+    workload["metadata"]["resourceVersion"] = api.status_resource_version
+    workload["status"] = deepcopy(api.status)
+    reconcile_workload(api, workload, _nodes())
+    workload["metadata"]["resourceVersion"] = api.status_resource_version
+    workload["status"] = deepcopy(api.status)
+    stable_version = api.status_resource_version
+    reconcile_workload(api, workload, _nodes())
+
+    assert api.status["execution"]["phase"] == "APPLIED"
+    assert api.status_resource_version == stable_version
+
+
 def test_creates_owned_pod_with_hard_allowed_set_topology_and_pdb_selector() -> None:
     api = FakeAPI()
     workload = _workload()
@@ -328,7 +377,7 @@ def test_takeover_fence_blocks_a_superseded_workload_request() -> None:
         surgeBudget=1,
         executionFence={
             "planID": "plan-1",
-            "operationID": "action-1",
+            "operationID": "action-2",
             "generation": 14,
             "expectedGeneration": 1,
             "expectedReplicas": 1,
@@ -365,6 +414,91 @@ def test_takeover_fence_blocks_a_superseded_workload_request() -> None:
         condition.get("reason") == "StaleExecutionAuthority"
         for condition in api.status["conditions"]
     )
+
+
+def test_same_operation_fence_takeover_resumes_and_preserves_retired_slot() -> None:
+    api = CompareAndSwapStatusAPI()
+    workload = _workload(
+        executionProtocol="monotonic-scale-up-v1",
+        replicas=1,
+        surgeBudget=1,
+    )
+    reconcile_workload(api, workload, _nodes())
+    source = next(iter(api.pods.values()))
+    source["spec"]["nodeName"] = "worker-a"
+    source["status"] = {
+        "phase": "Running",
+        "conditions": [{"type": "Ready", "status": "True"}],
+    }
+    reconcile_workload(api, workload, _nodes())
+
+    takeover = deepcopy(workload)
+    takeover["metadata"].update(
+        generation=2,
+        resourceVersion=api.status_resource_version,
+    )
+    takeover["spec"].update(
+        replicas=2,
+        executionFence={
+            "planID": "plan-1",
+            "operationID": "action-1",
+            "generation": 14,
+            "expectedGeneration": 1,
+            "expectedReplicas": 1,
+            "fencedGeneration": 2,
+        },
+        executionRequest={
+            "planID": "plan-1",
+            "operationID": "action-1",
+            "generation": 13,
+            "expectedReplicas": 1,
+            "targetReplicas": 2,
+        },
+    )
+    takeover["status"] = deepcopy(api.status)
+    reconcile_workload(api, takeover, _nodes())
+    assert api.status["execution"]["phase"] == "APPLIED"
+    replacement = api.pods[_pod_name("workload-uid", 1)]
+    replacement["spec"]["nodeName"] = "worker-b"
+    replacement["status"] = {
+        "phase": "Running",
+        "conditions": [
+            {
+                "type": "Ready",
+                "status": "True",
+                "lastTransitionTime": "2000-01-01T00:00:00Z",
+            }
+        ],
+    }
+    takeover["metadata"]["resourceVersion"] = api.status_resource_version
+    takeover["status"] = deepcopy(api.status)
+    retirement = {
+        "replacement_pod_uid": replacement["metadata"]["uid"],
+        "replacement_pod_name": replacement["metadata"]["name"],
+        "replacement_replica_id": "api-1",
+        "replacement_node_id": "worker-b",
+        "replacement_node_uid": "worker-b-uid",
+        "replacement_create_id": replacement["metadata"]["annotations"][
+            POD_CREATE_ATTEMPT_ANNOTATION
+        ],
+        "replacement_workload_generation": 2,
+        "readiness_stabilization_ms": 0,
+    }
+    _write_retired_slot_tombstone(
+        api, takeover, source, "plan-1", "action-1", _nodes(), replacement=retirement
+    )
+    del api.pods[source["metadata"]["name"]]
+    takeover["metadata"]["resourceVersion"] = api.status_resource_version
+    takeover["status"] = deepcopy(api.status)
+    reconcile_workload(api, takeover, _nodes())
+
+    assert set(pod["metadata"]["labels"][REPLICA_ID_LABEL] for pod in api.pods.values()) == {
+        "api-1",
+        "api-2",
+    }
+    assert api.status["retiredReplicaSlots"][0]["replicaID"] == "api-0"
+    assert api.status["execution"]["phase"] == "APPLIED"
+    assert api.status["conditions"][2]["reason"] == "Reconciled"
 
 
 def test_delayed_create_is_journaled_and_takeover_resolves_exact_pod() -> None:
