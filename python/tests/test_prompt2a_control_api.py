@@ -2604,7 +2604,19 @@ def test_live_v2_authenticated_node_drain_partial_crash_recovery(
                     break
                 assert status not in {"FAILED_SAFE", "COMPENSATING"}, detail
                 time.sleep(0.5)
-            assert detail["execution"]["status"] == "COMMITTED", detail
+            assert detail["execution"]["status"] == "COMMITTED", [
+                (
+                    action["action_type"],
+                    action["execution_state"],
+                    [
+                        (item.get("result") or {}).get("stage")
+                        for item in (action.get("execution_result") or {}).get("progress", [])
+                        if isinstance(item, dict)
+                    ][-3:],
+                    str((action.get("execution_result") or {}).get("error"))[:300],
+                )
+                for action in detail["candidate_actions"]
+            ]
             assert all(
                 action["execution_state"] == "SUCCEEDED" for action in detail["candidate_actions"]
             )

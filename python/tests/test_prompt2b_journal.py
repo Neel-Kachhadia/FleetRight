@@ -23,6 +23,7 @@ from fleetright.execution import (
     ActionBlocked,
     FleetRightWorkloadTarget,
     OutcomeUnknown,
+    TargetError,
     TargetNotFound,
     TargetPreconditionFailed,
     TargetUnavailable,
@@ -1105,6 +1106,140 @@ def test_takeover_recovers_running_node_drain_verification(clean_database: Datab
         assert action["execution_result"]["progress"][-1]["result"]["stage"] == (
             "NODE_DRAIN_WAITING"
         )
+
+
+def test_persistent_node_drain_observation_error_is_journaled_then_fails_safe(
+    clean_database: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fleetright import reconciler
+
+    monkeypatch.setattr(reconciler, "NODE_DRAIN_OBSERVATION_ERROR_LIMIT", 2)
+    repo = clean_database.repository
+    payload = {
+        "operation_id": "verify-operation",
+        "cordon_operation_id": "cordon-operation",
+        "source_node_id": "worker-1",
+        "source_node_uid": "worker-uid",
+        "source_pods": [{"workload_id": "api", "pod_name": "api-0", "pod_uid": "pod-uid"}],
+    }
+    with repo.transaction() as conn:
+        _insert_plan(conn, "verify-forbidden")
+        conn.execute(
+            "INSERT INTO action_intents (plan_id, intent_id, action_sequence, action_type, "
+            "payload, status) VALUES ('verify-forbidden', 'verify-node', 0, "
+            "'VERIFY_NODE_DRAIN', %s, 'APPROVED')",
+            (Jsonb(payload),),
+        )
+    token = _claim(repo, "verify-forbidden")["execution"]["controller_fencing_token"]
+
+    class Target:
+        supports_workload_execution = True
+
+        def cordon_source_node(self, plan_id: str, node_payload: dict[str, object], token: int):
+            return {
+                "source_node_id": "worker-1",
+                "source_node_uid": "worker-uid",
+                "plan_id": plan_id,
+                "operation_id": node_payload["operation_id"],
+                "fencing_token": token,
+                "unschedulable": True,
+            }
+
+        def observe_source_node_drain(self, *_args: object):
+            raise TargetError("daemonsets is forbidden")
+
+    controller = ExecutionController(repo, Target(), object(), "controller-a")
+    for _ in range(3):
+        controller._reconcile("verify-forbidden", token, None)
+    with repo.transaction() as conn:
+        row = conn.execute(
+            "SELECT execution_state, execution_result FROM action_intents "
+            "WHERE plan_id = 'verify-forbidden'"
+        ).fetchone()
+        status = conn.execute(
+            "SELECT status FROM plan_executions WHERE plan_id = 'verify-forbidden'"
+        ).fetchone()["status"]
+    stages = [item["result"]["stage"] for item in row["execution_result"]["progress"]]
+    assert stages == ["NODE_DRAIN_OBSERVATION_ERROR"] * 2
+    assert row["execution_state"] == "FAILED"
+    assert status == "FAILED_SAFE"
+
+
+def test_node_drain_plan_commits_after_final_fenced_reobservation(
+    clean_database: Database,
+) -> None:
+    repo = clean_database.repository
+    node = {"source_node_id": "worker-1", "source_node_uid": "worker-uid"}
+    with repo.transaction() as conn:
+        _insert_plan(conn, "drain-commit")
+        for sequence, (intent, action_type, payload) in enumerate(
+            [
+                ("cordon", "CORDON_NODE", {**node, "operation_id": "cordon-operation"}),
+                (
+                    "verify",
+                    "VERIFY_NODE_DRAIN",
+                    {
+                        **node,
+                        "operation_id": "verify-operation",
+                        "cordon_operation_id": "cordon-operation",
+                        "source_pods": [
+                            {"workload_id": "api", "pod_name": "api-0", "pod_uid": "pod-uid"}
+                        ],
+                    },
+                ),
+            ]
+        ):
+            conn.execute(
+                "INSERT INTO action_intents (plan_id, intent_id, action_sequence, action_type, "
+                "payload, status) VALUES ('drain-commit', %s, %s, %s, %s, 'APPROVED')",
+                (intent, sequence, action_type, Jsonb(payload)),
+            )
+    _claim(repo, "drain-commit")
+
+    class Target:
+        """Mirrors the real signatures: observation fails unless the Node fence matches."""
+
+        supports_workload_execution = True
+
+        def __init__(self) -> None:
+            self.node_token = 0
+            self.observed_tokens: list[int] = []
+
+        def _view(self, plan_id: str, operation_id: object) -> dict[str, object]:
+            return {
+                **node,
+                "plan_id": plan_id,
+                "operation_id": operation_id,
+                "fencing_token": self.node_token,
+                "unschedulable": True,
+            }
+
+        def cordon_source_node(self, plan_id: str, payload: dict[str, object], token: int):
+            self.node_token = max(self.node_token, token)
+            return {**self._view(plan_id, payload["operation_id"]), "stage": "NODE_CORDONED"}
+
+        def observe_source_node_drain(self, plan_id: str, payload: dict[str, object], token: int):
+            if token != self.node_token:
+                raise TargetPreconditionFailed("Node drain authority is not held")
+            self.observed_tokens.append(token)
+            return {
+                **self._view(plan_id, payload["cordon_operation_id"]),
+                "stage": "NODE_DRAIN_COMPLETE",
+                "remaining_source_pod_uids": [],
+                "exempt_pods": [],
+                "inventory_pod_count": 1,
+            }
+
+    target = Target()
+    controller = ExecutionController(repo, target, FakeHealth(), "controller-a")
+    for _ in range(10):
+        controller.run_once()
+    with repo.transaction() as conn:
+        status = conn.execute(
+            "SELECT status FROM plan_executions WHERE plan_id = 'drain-commit'"
+        ).fetchone()["status"]
+    assert status == "COMMITTED"
+    assert len(target.observed_tokens) >= 2  # action observation + final re-observation
 
 
 def test_workload_takeover_recovers_preapply_crash(clean_database: Database) -> None:

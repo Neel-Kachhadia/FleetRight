@@ -18,6 +18,8 @@ from fleetright.execution import (
 )
 
 LOG = logging.getLogger("fleetright.execution")
+# shortcut: counts journaled failures, not wall time; upgrade to a deadline if polls get slower.
+NODE_DRAIN_OBSERVATION_ERROR_LIMIT = 60
 
 
 class ExecutionController:
@@ -896,8 +898,16 @@ class ExecutionController:
                 ):
                     self._fail_safe(plan_id, token, "node-drain-verification-journal-invalid")
                     return
+                cordon_payload = {
+                    **payload,
+                    "operation_id": payload.get("cordon_operation_id", payload.get("operation_id")),
+                }
                 try:
-                    observed_drain = self.target.observe_source_node_drain(plan_id, payload)
+                    # Idempotent: re-adopts the Node fence if a takeover advanced the token.
+                    cordon = self.target.cordon_source_node(plan_id, cordon_payload, token)
+                    if not self._node_cordon_matches(cordon, plan_id, cordon_payload, token):
+                        return
+                    observed_drain = self.target.observe_source_node_drain(plan_id, payload, token)
                 except ActionBlocked as error:
                     self._fail_safe(plan_id, token, error.reason)
                     return
@@ -1249,12 +1259,46 @@ class ExecutionController:
         except ActionBlocked as error:
             self._finish_action(plan_id, token, action, "FAILED", {}, error.reason)
             self._fail_safe(plan_id, token, error.reason)
-        except TargetPreconditionFailed:
-            # A resourceVersion CAS conflict proves this patch did not commit.
-            return
-        except TargetError:
+        except TargetPreconditionFailed as error:
+            # A resourceVersion CAS conflict proves the cordon patch did not commit.
+            if action_type == "VERIFY_NODE_DRAIN":
+                self._record_node_drain_observation_error(plan_id, token, action, error)
+        except TargetError as error:
             if action_type == "CORDON_NODE":
                 self._mark_unknown(plan_id, token, action, "node-cordon-outcome-unknown")
+            else:
+                self._record_node_drain_observation_error(plan_id, token, action, error)
+
+    def _record_node_drain_observation_error(
+        self, plan_id: str, token: int, action: dict[str, Any], error: Exception
+    ) -> None:
+        """Journal each failed drain observation; a persistent failure must fail safe."""
+        progress = (action.get("execution_result") or {}).get("progress", [])
+        failures = sum(
+            1
+            for item in progress
+            if isinstance(item, dict)
+            and (item.get("result") or {}).get("stage") == "NODE_DRAIN_OBSERVATION_ERROR"
+        )
+        if failures >= NODE_DRAIN_OBSERVATION_ERROR_LIMIT:
+            self._finish_action(
+                plan_id, token, action, "FAILED", {}, "node-drain-observation-failed"
+            )
+            self._fail_safe(plan_id, token, "node-drain-observation-failed")
+            return
+        try:
+            with self.repository.transaction() as conn:
+                Repository.record_action_progress(
+                    conn,
+                    plan_id,
+                    action["intent_id"],
+                    self.controller_id,
+                    token,
+                    observation={"error": str(error)[:300]},
+                    result={"stage": "NODE_DRAIN_OBSERVATION_ERROR"},
+                )
+        except (ControlError, LeaseConflict, StaleState):
+            return
 
     def _start_action(
         self,
