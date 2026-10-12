@@ -4397,6 +4397,40 @@ def test_scale_out_health_regression_never_compensates_by_scaling_down(
     assert target.mutations == [9]
 
 
+def test_compensation_that_never_becomes_ready_fails_safe_after_timeout(
+    clean_database: Database,
+) -> None:
+    controller, target, health = _prepare_controller(
+        clean_database.repository, "compensation-timeout", 10, 9
+    )
+    health.samples = [True, False]  # healthy before the scale-in, regressed after it
+    real_observe = target.observe_scale
+
+    def observe_with_unplaceable_replica(workload_id: str) -> dict[str, object]:
+        observed = real_observe(workload_id)
+        if target.mutations[-1:] == [10] and len(target.mutations) > 1:
+            observed["ready_replicas"] = observed["available_replicas"] = 9  # never schedulable
+        return observed
+
+    target.observe_scale = observe_with_unplaceable_replica  # type: ignore[method-assign]
+    for _ in range(6):
+        controller.run_once()
+        if target.mutations == [9, 10]:
+            controller.readiness_timeout_seconds = 0
+
+    with clean_database.repository.transaction() as conn:
+        execution = conn.execute(
+            "SELECT status FROM plan_executions WHERE plan_id = 'compensation-timeout'"
+        ).fetchone()
+        states = conn.execute(
+            "SELECT execution_state, compensates_intent_id, execution_result->>'error' AS error "
+            "FROM action_intents WHERE plan_id = 'compensation-timeout' ORDER BY action_sequence"
+        ).fetchall()
+    assert target.mutations == [9, 10]  # one scale-in, one bounded restore, nothing more
+    assert execution["status"] == "FAILED_SAFE", states
+    assert [row["execution_state"] for row in states] == ["FAILED", "FAILED"]
+
+
 def test_destructive_action_waits_for_fresh_health_sample(
     clean_database: Database,
 ) -> None:

@@ -1,5 +1,91 @@
 # V2 Execution Progress
 
+## 2026-10-12 Prompt 2B qualification — Milestone 4 (Claude Code takeover)
+
+**Branch:** `phase4/safe-execution-reconciliation`. **Start SHA:** `06f43e6`. All
+Codex WIP was preserved (backup patch kept outside the repo, then committed in
+logical steps). Prompt 3 not started; nothing pushed.
+
+### What the takeover found and fixed (each backed by a regression)
+
+| Defect | Found by | Fix / regression |
+|---|---|---|
+| Stale tests after `fencing_token` / DaemonSet-inventory signature changes (23 failures) | Python suite | fixtures updated to the real signatures; no assertion weakened |
+| Live `VERIFY_NODE_DRAIN` stuck `RUNNING` forever: executor lacked `daemonsets list` on the lab and the controller swallowed every observation error | live 4-Pod drain, run 2 | errors are journaled as `NODE_DRAIN_OBSERVATION_ERROR` and fail safe after `NODE_DRAIN_OBSERVATION_ERROR_LIMIT`; `test_persistent_node_drain_observation_error_is_journaled_then_fails_safe` |
+| Final drain re-observation still used the old 2-arg call (TypeError at commit time) | live drain run 3 | re-adopts the Node fence for the current token, then observes; `test_node_drain_plan_commits_after_final_fenced_reobservation` (fails without the fix) |
+| `kubectl patch node` printed non-JSON, so `cordon_source_node` raised "invalid JSON" after a successful cordon (masked by unknown-outcome re-observation) | live binding test | `-o json`; unit fixture now asserts it |
+| Executor `patch nodes` was cluster-wide with no field limit | audit | `ValidatingAdmissionPolicy` in `rbac.yaml`: one-way cordon, `fleetright.io/*` annotations only, fencing token never decreases; probed live (taint/label/uncordon/token-decrease denied) |
+| Lab webhook/controller ran a stale image | live binding test | redeployed with `install-pod-create-admission.sh` (now parameterised for any lab) |
+| Opus review #1: lost response on the read-only drain check parked the action in `OUTCOME_UNKNOWN`, disabling the failure bound | independent review | stays `RUNNING` and counted; `test_lost_drain_check_response_stays_running_and_counted` |
+| Opus review #2: takeover re-observation could fail unjournaled forever | independent review | takeover only re-fences the Node; the normal path journals/bounds the observation |
+| Opus review #3: pre-cordon `unschedulable` never recorded | independent review | journaled in `pre_observation.unschedulable_before`; `test_cordon_journals_pre_existing_unschedulable_state` |
+
+### Gate ledger (final commit)
+
+| Gate | Result | Evidence |
+|---|---|---|
+| Independent V2 verifier enforced | PASS | CTest 51/51; live plans `verification_accepted` |
+| Workload/source/replacement identity, bounded surge, readiness, destination placement | PASS | live drain asserts exact UIDs, anti-affinity, approved Nodes, `final = baseline+1` |
+| Source retirement durable; pre-eviction CAS | PASS | deterministic tombstone-CAS tests + live PDB-permitted run |
+| Delayed CREATE safety | PASS (see limits) | live: forged/replayed CREATE denied with no current reservation, non-controller CREATE denied; unit/PG adversarial set |
+| Lost CREATE response | PASS (emulated) | live: reservation admitted while controller down, controller restarted, Pod adopted (same UID), pending cleared, no duplicate |
+| Destructive execution authority | PASS | RBAC (no Pod delete), Node policy, Eviction/Binding webhook, fences; live forged Eviction (wrong UID, no retirement) denied |
+| Delayed Eviction / lost Eviction response | PASS | live `takeover-held-response`; accepted Eviction held across takeover |
+| PDB-permitted / PDB-denied | PASS | live `pdb-permitted`, `pdb-blocked` |
+| Unknown outcomes reconciled; takeover; crash recovery | PASS | live drain with a real `multiprocessing` process kill + new controller |
+| Node cordon / bounded drain / partial-drain recovery | PASS | live 4-Pod drain: 2 moves done, process killed with the 3rd Eviction pending, takeover, exactly 4 Evictions total, Node empty, original Node UID, still cordoned |
+| Health-driven compensation | PASS (6-node lab) | live API→PG→controller→K8s `COMPENSATED` after verified recovery |
+| Unplaceable compensation | PASS (deterministic) | `test_compensation_that_never_becomes_ready_fails_safe_after_timeout`: one restore, then `FAILED_SAFE` |
+| Unauthorized mutation denial | PASS | live `can-i` + Node policy probes + forged CREATE/Eviction |
+| Unsupported workload rejection | PASS | live: legacy `cpu-api` refused before any mutation (resourceVersion unchanged) |
+| Docker E2E | PASS 3/3 | process-crash, target-timeout, health-regression fail-safe |
+| PostgreSQL integration, Python | PASS | 471 passed, 14 skipped (live-gated) |
+| C++ | PASS | CTest 51/51 |
+| Ruff check/format, compile, shell syntax, `git diff --check`, secret scan | PASS | repo-wide |
+
+Live runs on the final commit: 4-Pod drain/crash/takeover **1 passed (410s)**;
+replacement + PDB-permitted + PDB-blocked + Binding fence **3 passed (199s)**;
+API/journal evacuation + held-Eviction takeover + health compensation **3 passed
+(273s)**; live admission negatives **3 passed**; Docker **3 passed**.
+
+### Honest limits (not proven live, or by design)
+
+- **Compensation needs a free destination.** The verified contract excludes the
+  evacuated source from recovery. On the 4-worker lab the compensation replica
+  was unplaceable (Pending, anti-affinity); qualification used a throw-away
+  6-node lab (deleted afterwards). Behavior when unplaceable is bounded
+  (`FAILED_SAFE`) but was only exercised deterministically.
+- **Lost CREATE response** is emulated (admit, then controller down), not a
+  dropped TCP response. A genuinely in-flight CREATE crossing a takeover is
+  prevented structurally (one outstanding reservation, claimed by admission UID)
+  rather than raced live.
+- **Legacy `cpu-api` scale-up E2E** (`test_kubernetes_workload_api_recovers_...`)
+  is obsolete: that workload is deliberately fail-closed
+  (`LegacyPodCreateUncertain`). Monotonic scale-up is qualified through managed
+  workloads (surge and compensation scale-ups).
+- Node `fleetright.io/{plan-id,operation-id,fencing-token}` annotations are never
+  removed; a later plan on the same Node is refused and Binding admission keeps
+  denying `fleetright-v2` Pods on it until an operator clears them.
+- Final verification (`VERIFYING`) retries target errors without a bound (all
+  actions, pre-existing); the drain observation phase is bounded.
+- Static-mirror classification relies on fields any Pod creator can set (same as
+  `kubectl drain`). Drain completion is a point-in-time read.
+- FleetRight re-asserts its cordon on every drain tick, overriding an
+  administrator's uncordon during a drain.
+- The Opus review ran before its three fixes; the fixes were not re-reviewed
+  independently (they are covered by the regressions above).
+
+### Operations
+
+| Operation | State |
+|---|---|
+| SCALE_UP (managed workloads, monotonic) | ENABLED AND QUALIFIED |
+| MOVE_REPLICA / EVICT_SOURCE (staged, PDB-safe) | ENABLED AND QUALIFIED |
+| DRAIN_NODE (sequential, 2–4 supported Pods) | ENABLED AND QUALIFIED |
+| COMPENSATE (bounded capacity restore) | ENABLED AND QUALIFIED (needs free destination; else FAILED_SAFE) |
+| SCALE_DOWN | DISABLED |
+| DEACTIVATE_NODE | DISABLED / UNSUPPORTED |
+
 ## 2026-10-12 completion continuation
 
 **Authorized start:** 07:12:28 UTC from branch `phase4/safe-execution-reconciliation`
