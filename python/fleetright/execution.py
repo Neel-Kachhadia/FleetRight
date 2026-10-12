@@ -651,7 +651,14 @@ class FleetRightWorkloadTarget(KubernetesTarget):
             {"op": "add", "path": "/spec/unschedulable", "value": True},
         ]
         self._json(
-            "patch", "node", current["source_node_id"], "--type=json", "-p", json.dumps(patch)
+            "patch",
+            "node",
+            current["source_node_id"],
+            "-o",
+            "json",
+            "--type=json",
+            "-p",
+            json.dumps(patch),
         )
         observed = self._observe_source_node(plan_id, payload)
         if not observed["unschedulable"] or observed["fencing_token"] != fencing_token:

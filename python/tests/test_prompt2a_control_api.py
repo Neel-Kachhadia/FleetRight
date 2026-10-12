@@ -3515,7 +3515,8 @@ def test_kubernetes_workload_api_recovers_after_ready_scale_up_crash(
         (("delete", "pods"), "no"),
         (("create", "pods", "--subresource=eviction"), "no"),
         (("get", "secrets"), "no"),
-        (("patch", "nodes"), "no"),
+        # Cluster-wide patch is granted for cordon; the Node admission policy confines it.
+        (("patch", "nodes"), "yes"),
     ):
         access = subprocess.run(
             [

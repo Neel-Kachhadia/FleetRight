@@ -2734,6 +2734,7 @@ def _node_drain_target(monkeypatch: pytest.MonkeyPatch):
         if args[:3] == ("get", "pods", "--all-namespaces"):
             return deepcopy(state["inventory"])
         assert args[:3] == ("patch", "node", "worker-a")
+        assert args[3:5] == ("-o", "json"), "kubectl patch prints non-JSON text without -o json"
         patch = json.loads(args[args.index("-p") + 1])
         state["patches"].append(patch)
         metadata = state["node"]["metadata"]

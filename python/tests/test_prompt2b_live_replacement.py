@@ -425,8 +425,36 @@ def test_live_workload_prepares_and_evacuates_source_with_real_pod_identity(
         assert (denied.returncode, denied.stdout.strip()) == (1, "no"), denied.stderr
         denied = can_i("delete", "pods")
         assert (denied.returncode, denied.stdout.strip()) == (1, "no"), denied.stderr
-        denied = can_i("patch", "nodes")
-        assert (denied.returncode, denied.stdout.strip()) == (1, "no"), denied.stderr
+        # Node patch is granted cluster-wide (cordon); the admission policy confines it.
+        assert can_i("patch", "nodes").stdout.strip() == "yes"
+        worker = next(
+            node["metadata"]["name"]
+            for node in json.loads(kubectl("get", "nodes", "-o", "json").stdout)["items"]
+            if not any(key.endswith("/control-plane") for key in node["metadata"].get("labels", {}))
+        )
+        for forbidden in (
+            {"spec": {"unschedulable": True, "taints": [{"key": "evil", "effect": "NoSchedule"}]}},
+            {"spec": {"unschedulable": True}, "metadata": {"labels": {"evil": "x"}}},
+            {"spec": {"unschedulable": False}},
+        ):
+            probe = subprocess.run(
+                [
+                    "kubectl",
+                    f"--kubeconfig={executor_config}",
+                    "patch",
+                    "node",
+                    worker,
+                    "--type=merge",
+                    "-p",
+                    json.dumps(forbidden),
+                ],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=15,
+            )
+            assert probe.returncode != 0, probe.stdout
+            assert "may only cordon a Node" in probe.stderr, probe.stderr
 
         executor_target = FleetRightWorkloadTarget(
             kubeconfig=str(executor_config), namespace="fleetright-v2"
@@ -904,4 +932,13 @@ def test_live_pod_binding_admission_blocks_fleetright_cordoned_node() -> None:
                     )
                 elif "unschedulable" in spec:
                     patch.append({"op": "remove", "path": "/spec/unschedulable"})
-                target._json("patch", "node", source_name, "--type=json", "-p", json.dumps(patch))
+                target._json(
+                    "patch",
+                    "node",
+                    source_name,
+                    "-o",
+                    "json",
+                    "--type=json",
+                    "-p",
+                    json.dumps(patch),
+                )
