@@ -620,6 +620,13 @@ class FleetRightWorkloadTarget(KubernetesTarget):
             "annotations_present": "annotations" in metadata,
         }
 
+    def observe_source_node_state(self, plan_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Read-only Node identity and schedulability, journaled before any cordon."""
+        observed = self._observe_source_node(plan_id, payload)
+        return {
+            key: observed[key] for key in ("source_node_id", "source_node_uid", "unschedulable")
+        }
+
     def cordon_source_node(
         self, plan_id: str, payload: dict[str, Any], fencing_token: int
     ) -> dict[str, Any]:

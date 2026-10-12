@@ -1084,7 +1084,7 @@ def test_takeover_recovers_running_node_drain_verification(clean_database: Datab
         )
     token = controller._claim(execution)
     assert token is not None and token > old_token
-    assert target.cordons == [token] and target.observations == [token]
+    assert target.cordons == [token] and target.observations == []
     with repo.transaction() as conn:
         receipt = Repository.execution_fence_receipt(conn, "verify-takeover", "verify-node", token)
         assert receipt is not None
@@ -1099,7 +1099,7 @@ def test_takeover_recovers_running_node_drain_verification(clean_database: Datab
         )
 
     controller._reconcile("verify-takeover", token, None)
-    assert target.observations == [token, token]
+    assert target.observations == [token]
     with repo.transaction() as conn:
         action = Repository.incomplete_actions(conn, "verify-takeover")[0]
         assert action["execution_state"] == "RUNNING"
@@ -1214,6 +1214,9 @@ def test_node_drain_plan_commits_after_final_fenced_reobservation(
                 "unschedulable": True,
             }
 
+        def observe_source_node_state(self, _plan_id: str, _payload: dict[str, object]):
+            return {**node, "unschedulable": True}
+
         def cordon_source_node(self, plan_id: str, payload: dict[str, object], token: int):
             self.node_token = max(self.node_token, token)
             return {**self._view(plan_id, payload["operation_id"]), "stage": "NODE_CORDONED"}
@@ -1240,6 +1243,104 @@ def test_node_drain_plan_commits_after_final_fenced_reobservation(
         ).fetchone()["status"]
     assert status == "COMMITTED"
     assert len(target.observed_tokens) >= 2  # action observation + final re-observation
+
+
+def test_lost_drain_check_response_stays_running_and_counted(
+    clean_database: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fleetright import reconciler
+
+    monkeypatch.setattr(reconciler, "NODE_DRAIN_OBSERVATION_ERROR_LIMIT", 2)
+    repo = clean_database.repository
+    node = {"source_node_id": "worker-1", "source_node_uid": "worker-uid"}
+    with repo.transaction() as conn:
+        _insert_plan(conn, "drain-timeout")
+        conn.execute(
+            "INSERT INTO action_intents (plan_id, intent_id, action_sequence, action_type, "
+            "payload, status) VALUES ('drain-timeout', 'verify-node', 0, 'VERIFY_NODE_DRAIN', %s, "
+            "'APPROVED')",
+            (
+                Jsonb(
+                    {
+                        **node,
+                        "operation_id": "verify-operation",
+                        "cordon_operation_id": "cordon-operation",
+                        "source_pods": [{"workload_id": "a", "pod_name": "a-0", "pod_uid": "u"}],
+                    }
+                ),
+            ),
+        )
+    token = _claim(repo, "drain-timeout")["execution"]["controller_fencing_token"]
+
+    class Target:
+        supports_workload_execution = True
+
+        def cordon_source_node(self, plan_id: str, payload: dict[str, object], token: int):
+            return {
+                **node,
+                "plan_id": plan_id,
+                "operation_id": payload["operation_id"],
+                "fencing_token": token,
+                "unschedulable": True,
+            }
+
+        def observe_source_node_drain(self, *_args: object):
+            raise OutcomeUnknown("kubectl timed out listing Pods")
+
+    controller = ExecutionController(repo, Target(), object(), "controller-a")
+    for _ in range(3):
+        controller._reconcile("drain-timeout", token, None)
+    with repo.transaction() as conn:
+        row = conn.execute(
+            "SELECT execution_state, execution_result FROM action_intents "
+            "WHERE plan_id = 'drain-timeout'"
+        ).fetchone()
+        status = conn.execute(
+            "SELECT status FROM plan_executions WHERE plan_id = 'drain-timeout'"
+        ).fetchone()["status"]
+    stages = [item["result"]["stage"] for item in row["execution_result"]["progress"]]
+    # A timeout never parks the action in OUTCOME_UNKNOWN, so the bound still applies.
+    assert stages == ["NODE_DRAIN_OBSERVATION_ERROR"] * 2
+    assert row["execution_state"] == "FAILED" and status == "FAILED_SAFE"
+
+
+def test_cordon_journals_pre_existing_unschedulable_state(clean_database: Database) -> None:
+    repo = clean_database.repository
+    node = {"source_node_id": "worker-1", "source_node_uid": "worker-uid"}
+    with repo.transaction() as conn:
+        _insert_plan(conn, "cordon-pre")
+        conn.execute(
+            "INSERT INTO action_intents (plan_id, intent_id, action_sequence, action_type, "
+            "payload, status) VALUES ('cordon-pre', 'cordon', 0, 'CORDON_NODE', %s, 'APPROVED')",
+            (Jsonb({**node, "operation_id": "cordon-operation"}),),
+        )
+    token = _claim(repo, "cordon-pre")["execution"]["controller_fencing_token"]
+
+    class Target:
+        supports_workload_execution = True
+
+        def observe_source_node_state(self, *_args: object):
+            return {**node, "unschedulable": True}  # an administrator cordoned it first
+
+        def cordon_source_node(self, plan_id: str, payload: dict[str, object], token: int):
+            return {
+                **node,
+                "plan_id": plan_id,
+                "operation_id": payload["operation_id"],
+                "fencing_token": token,
+                "unschedulable": True,
+            }
+
+    ExecutionController(repo, Target(), object(), "controller-a")._reconcile(
+        "cordon-pre", token, None
+    )
+    with repo.transaction() as conn:
+        row = conn.execute(
+            "SELECT execution_state, execution_result FROM action_intents "
+            "WHERE plan_id = 'cordon-pre'"
+        ).fetchone()
+    assert row["execution_state"] == "SUCCEEDED"
+    assert row["execution_result"]["pre_observation"]["unschedulable_before"] is True
 
 
 def test_workload_takeover_recovers_preapply_crash(clean_database: Database) -> None:

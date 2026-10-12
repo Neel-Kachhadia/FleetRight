@@ -84,3 +84,53 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: fleetright-executor-cluster-access
+---
+# Server-side limit for the executor's cluster-wide Node `patch` grant: RBAC cannot
+# scope a patch to fields, so this policy confines the FleetRight executor to a
+# one-way cordon plus fleetright.io/* annotations whose fencing token never decreases.
+# Everything else on the Node
+# (taints, labels, finalizers, uncordon) stays denied for this identity.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: fleetright-executor-node-mutation
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [UPDATE]
+        resources: [nodes]
+  matchConditions:
+    - name: fleetright-executor-only
+      expression: request.userInfo.username == 'system:serviceaccount:fleetright:fleetright-controller'
+  validations:
+    - expression: >-
+        object.spec.?unschedulable.orValue(false) == true &&
+        object.spec.?taints == oldObject.spec.?taints &&
+        object.spec.?providerID == oldObject.spec.?providerID &&
+        object.spec.?podCIDRs == oldObject.spec.?podCIDRs &&
+        object.spec.?configSource == oldObject.spec.?configSource &&
+        object.metadata.?labels == oldObject.metadata.?labels &&
+        object.metadata.?finalizers == oldObject.metadata.?finalizers &&
+        object.metadata.?ownerReferences == oldObject.metadata.?ownerReferences &&
+        object.metadata.?annotations.orValue({}).all(k,
+          k.startsWith('fleetright.io/') ||
+          (k in oldObject.metadata.?annotations.orValue({}) &&
+           oldObject.metadata.?annotations.orValue({})[k] == object.metadata.annotations[k])) &&
+        oldObject.metadata.?annotations.orValue({}).all(k,
+          k.startsWith('fleetright.io/') || k in object.metadata.?annotations.orValue({})) &&
+        (!('fleetright.io/fencing-token' in oldObject.metadata.?annotations.orValue({})) ||
+          ('fleetright.io/fencing-token' in object.metadata.?annotations.orValue({}) &&
+           int(object.metadata.annotations['fleetright.io/fencing-token']) >=
+           int(oldObject.metadata.annotations['fleetright.io/fencing-token'])))
+      message: FleetRight executor may only cordon a Node and write fleetright.io/ annotations.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: fleetright-executor-node-mutation
+spec:
+  policyName: fleetright-executor-node-mutation
+  validationActions: [Deny]

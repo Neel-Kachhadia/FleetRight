@@ -216,13 +216,8 @@ class ExecutionController:
                 if not getattr(self.target, "supports_workload_execution", False):
                     return None
                 payload = action.get("payload")
-                observe_drain = getattr(self.target, "observe_source_node_drain", None)
                 cordon_node = getattr(self.target, "cordon_source_node", None)
-                if (
-                    not isinstance(payload, dict)
-                    or not callable(observe_drain)
-                    or not callable(cordon_node)
-                ):
+                if not isinstance(payload, dict) or not callable(cordon_node):
                     return None
                 node_payload = {
                     **payload,
@@ -264,27 +259,14 @@ class ExecutionController:
                                 "observation": cordon_observation,
                             },
                         )
-                    observation = observe_drain(plan_id, payload, pending_token)
+                except ActionBlocked as error:
+                    LOG.error(
+                        "node drain takeover blocked",
+                        extra={"plan_id": plan_id, "reason": error.reason},
+                    )
+                    return None
                 except TargetError:
                     return None
-                if not self._node_drain_observation_matches(observation, plan_id, payload):
-                    return None
-                # This is a read-only observation; the new controller rechecks before commit.
-                with self.repository.transaction() as conn:
-                    Repository.record_execution_fence(
-                        conn,
-                        plan_id,
-                        action["intent_id"],
-                        self.controller_id,
-                        pending_token,
-                        f"node:{payload.get('source_node_id')}:drain",
-                        {
-                            "state": "COMPLETE",
-                            "token": pending_token,
-                            "precondition": {"uid": payload.get("source_node_uid")},
-                            "observation": observation,
-                        },
-                    )
                 continue
             if action["action_type"] == "CORDON_NODE":
                 if not getattr(self.target, "supports_workload_execution", False):
@@ -1175,6 +1157,20 @@ class ExecutionController:
             stage = (
                 "NODE_CORDON_INTENT" if action_type == "CORDON_NODE" else "NODE_DRAIN_VERIFY_INTENT"
             )
+            pre_observation = {
+                "source_node_id": payload.get("source_node_id"),
+                "source_node_uid": payload.get("source_node_uid"),
+            }
+            if action_type == "CORDON_NODE":
+                try:
+                    before = self.target.observe_source_node_state(plan_id, payload)
+                except ActionBlocked as error:
+                    self._finish_action(plan_id, token, action, "FAILED", {}, error.reason)
+                    self._fail_safe(plan_id, token, error.reason)
+                    return
+                except TargetError:
+                    return
+                pre_observation["unschedulable_before"] = before["unschedulable"]
             try:
                 with self.repository.transaction() as conn:
                     updated = Repository.transition_action(
@@ -1185,10 +1181,7 @@ class ExecutionController:
                         "RUNNING",
                         self.controller_id,
                         token,
-                        pre_observation={
-                            "source_node_id": payload.get("source_node_id"),
-                            "source_node_uid": payload.get("source_node_uid"),
-                        },
+                        pre_observation=pre_observation,
                         result={"stage": stage},
                     )
                 action = {**action, **updated}
@@ -1254,8 +1247,12 @@ class ExecutionController:
                     "inventory_pod_count": observation["inventory_pod_count"],
                 },
             )
-        except OutcomeUnknown:
-            self._mark_unknown(plan_id, token, action, "node-cordon-response-unknown")
+        except OutcomeUnknown as error:
+            if action_type == "VERIFY_NODE_DRAIN":
+                # Observation is read-only and the re-cordon is idempotent and fenced.
+                self._record_node_drain_observation_error(plan_id, token, action, error)
+            else:
+                self._mark_unknown(plan_id, token, action, "node-cordon-response-unknown")
         except ActionBlocked as error:
             self._finish_action(plan_id, token, action, "FAILED", {}, error.reason)
             self._fail_safe(plan_id, token, error.reason)

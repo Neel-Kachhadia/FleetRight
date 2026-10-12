@@ -59,7 +59,6 @@ sed "s|__CA_BUNDLE__|$ca_bundle|g" \
 
 kubectl --kubeconfig "$kubeconfig" --context "$context" apply -f "$repo_root/deploy/kubernetes/fleetright-workload-controller.yaml"
 kubectl --kubeconfig "$kubeconfig" --context "$context" apply -f "$repo_root/deploy/kubernetes/rbac.yaml"
-kubectl --kubeconfig "$kubeconfig" --context "$context" apply -f "$repo_root/deploy/kubernetes/node-mutation-policy.yaml"
 kubectl --kubeconfig "$kubeconfig" --context "$context" -n "$namespace" rollout restart deployment/fleetright-workload-controller
 kubectl --kubeconfig "$kubeconfig" --context "$context" -n "$namespace" rollout status \
   deployment/fleetright-workload-controller --timeout=180s
