@@ -446,25 +446,17 @@ def run_demo(output: Path, seed: int = 42) -> Path:
         "accepted": accepted,
         "current_cost_micros_per_hour": int(_field(plan_text, "current_cost_micros_per_hour")),
         "proposed_cost_micros_per_hour": int(_field(plan_text, "proposed_cost_micros_per_hour")),
-        "current_objective_cost_micros": int(
-            _field(plan_text, "current_objective_cost_micros")
-        ),
-        "proposed_objective_cost_micros": int(
-            _field(plan_text, "proposed_objective_cost_micros")
-        ),
+        "current_objective_cost_micros": int(_field(plan_text, "current_objective_cost_micros")),
+        "proposed_objective_cost_micros": int(_field(plan_text, "proposed_objective_cost_micros")),
         "objective_costs": {
             "movement_micros": int(_field(plan_text, "proposed_movement_cost_micros", "0")),
             "churn_micros": int(_field(plan_text, "proposed_churn_cost_micros", "0")),
-            "uncertainty_micros": int(
-                _field(plan_text, "proposed_uncertainty_cost_micros", "0")
-            ),
+            "uncertainty_micros": int(_field(plan_text, "proposed_uncertainty_cost_micros", "0")),
             "boundary_micros": int(_field(plan_text, "proposed_boundary_cost_micros", "0")),
             "current_uncertainty_micros": int(
                 _field(plan_text, "current_uncertainty_cost_micros", "0")
             ),
-            "current_boundary_micros": int(
-                _field(plan_text, "current_boundary_cost_micros", "0")
-            ),
+            "current_boundary_micros": int(_field(plan_text, "current_boundary_cost_micros", "0")),
         },
         "action_count": int(_field(plan_text, "action_count")),
         "workload_decisions": [
@@ -477,9 +469,7 @@ def run_demo(output: Path, seed: int = 42) -> Path:
                     _field(block, "effective_qps_per_replica_milli")
                 ),
                 "profile_point_index": int(_field(block, "profile_point_index", "0")),
-                "uncertainty_exposure_ppm": int(
-                    _field(block, "uncertainty_exposure_ppm", "0")
-                ),
+                "uncertainty_exposure_ppm": int(_field(block, "uncertainty_exposure_ppm", "0")),
                 "boundary_risk_ppm": int(_field(block, "boundary_risk_ppm", "0")),
             }
             for block in _blocks(plan_text, "workload_decisions")
