@@ -129,6 +129,13 @@ recommendations. Prompt 2B adds the explicitly configured live execution path be
 
 ## Prompt 2B safe execution
 
+> **Status note (v1.0.0).** This section was written while staged execution was still disabled and
+> is kept as the record of the scale-up/journal design, which still holds. Statements that
+> eviction, drain and compensation are "unimplemented" are **superseded**: Milestone 4 enabled and
+> live-qualified `MOVE_REPLICA`, `EVICT_SOURCE`, `DRAIN_NODE` and `COMPENSATE` (ledger in
+> `docs/V2_EXECUTION_PROGRESS.md`, 2026-10-13). See `docs/ENGINEERING_WALKTHROUGH.md` for the
+> current end-to-end description.
+
 Fresh installs still default to `RECOMMEND`. Live execution requires both
 `FLEETRIGHT_MODE=EXECUTE` and `FLEETRIGHT_EXECUTION_TARGET=docker` or
 `kubernetes-workload`. The
@@ -204,7 +211,7 @@ and process recovery only. The 2026-10-11 opt-in live test was not rerun because
 workload was already 4/4 Ready while the test requires a 3/3 baseline. No destructive operation
 was qualified by that run.
 
-At this HEAD, the API rejects `MOVE_REPLICA`, `DEACTIVATE_NODE`, and resource resizing before
+**Historical (superseded by Milestone 4):** at the time of writing the API rejected `MOVE_REPLICA`, `DEACTIVATE_NODE`, and resource resizing before
 claiming execution. No Pod eviction or Node-cordon mutator is present in the current target, and the
 RBAC manifests grant neither permission. Durable PDB-blocked execution, staged replacement, bounded
 node drain, partial-drain restart recovery, and live compensation therefore remain unimplemented.

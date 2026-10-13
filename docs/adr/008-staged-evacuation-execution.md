@@ -1,6 +1,12 @@
 # ADR-008: Keep verifier-v1 evacuation actions disabled
 
-Status: Blocked
+Status: Accepted for the Milestone 4 operation set (originally Blocked)
+
+> **v1.0.0 note.** The sections below are a chronological record of why staged evacuation was
+> blocked and what had to be built. Milestone 4 built it and qualified it live; the closing
+> addendum (2026-10-13) and the ledger in `docs/V2_EXECUTION_PROGRESS.md` describe the enabled
+> operations. `SCALE_DOWN` remains disabled and `DEACTIVATE_NODE` unsupported. Where a historical
+> section says an operation is disabled or unqualified, the Milestone 4 ledger supersedes it.
 
 ## 2026-10-11 source-retirement admission audit
 
