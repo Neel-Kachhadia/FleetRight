@@ -99,6 +99,9 @@ violations). The evaluation scenarios then use the frozen knobs. The tuning *fam
 evaluation families S01-S03/S05; seeds and load level are disjoint. This is a documented weakness:
 it is seed-level, not family-level, hold-out. The first tuning rule (zero hard-violation windows) was
 unattainable for every reactive policy and was replaced before any evaluation data was generated.
+A first evaluation run was then inspected before two fairness additions were made: the static-reserve
+baseline was tuned like the others (it had a fixed 20% reserve) and the same-headroom ablation was
+added. Neither changed a FleetRight parameter, and the published run is a fresh run of the final code.
 
 ### Metrics
 
@@ -125,8 +128,9 @@ unattainable for every reactive policy and was replaced before any evaluation da
 
 Direct C++ API timings (protobuf loaded once), Release build, 1,000 workloads / 500 nodes / 1 extra
 profile alternative; planner target 250 ms p95, verifier target 25 ms p95, 100 measured iterations
-(`scripts/run_benchmarks.sh --iterations 100`). The first iteration is not discarded separately;
-the p50/p95/p99/max are over all iterations. Peak RSS is a single CLI run under GNU `time`.
+(`scripts/run_benchmarks.sh --iterations 100`). One untimed planner run and one untimed verifier
+run (which also validate the supplied plan) precede the measured loop; p50/p95/p99/max are over all
+measured iterations. Peak RSS is a single CLI run under GNU `time`.
 
 ### Not covered
 
