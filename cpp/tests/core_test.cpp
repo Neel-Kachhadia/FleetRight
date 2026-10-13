@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <numeric>
 #include <random>
 #include <string>
 #include <vector>
@@ -1322,6 +1323,60 @@ TEST(PlannerPropertyTest, RequiredReplicasNeverDecreaseAsDemandRises) {
     EXPECT_GE(replicas, previous);
     previous = replicas;
   }
+}
+
+TEST(PlannerPropertyTest, FeasiblePlansAreVerifiedAndRespectTheWorkloadMoveBudget) {
+  // Regression: the planner once moved replicas onto a node still hosting a sibling replica that
+  // the same plan removes, and ignored the per-workload move budget; the verifier rejected both.
+  std::minstd_rand random(0xC0FFEEU);
+  std::uint32_t feasible_plans = 0;
+  for (std::uint32_t trial = 0; trial < 96; ++trial) {
+    auto snapshot = Fixture();
+    const auto extra_nodes = random() % 5;
+    for (std::uint32_t extra = 0; extra < extra_nodes; ++extra) {
+      auto *node = snapshot.add_nodes();
+      *node = snapshot.nodes(0);
+      node->set_node_id("node-extra-" + std::to_string(extra));
+    }
+    // Mixed machine types make consolidation onto cheaper nodes (and thus moves) attractive.
+    auto *catalog = snapshot.mutable_machine_catalog();
+    for (const auto &[type, cpu, memory, network, price] :
+         {std::tuple{"medium", 4'000, 8'192, 2'000, 90'000},
+          std::tuple{"large", 8'000, 16'384, 4'000, 170'000}}) {
+      auto *machine = catalog->add_machines();
+      machine->set_machine_type(type);
+      SetResource(machine->mutable_allocatable(), cpu, memory, network);
+      machine->set_hourly_cost_micros(price);
+    }
+    for (auto &node : *snapshot.mutable_nodes()) {
+      const auto &machine = catalog->machines(static_cast<int>(random() % 3));
+      node.set_machine_type(machine.machine_type());
+      *node.mutable_allocatable() = machine.allocatable();
+      node.set_hourly_cost_micros(machine.hourly_cost_micros());
+    }
+    const std::uint32_t budgets[] = {0, 1, 2, 100};
+    const auto budget = budgets[random() % 4];
+    auto *workload = snapshot.mutable_workloads(0);
+    workload->set_max_moves(budget);
+    workload->set_demand_qps_milli(100'000 + random() % 1'200'000);
+    workload->set_concurrency_bound(20 + random() % 150);
+    std::vector<int> order(static_cast<std::size_t>(snapshot.nodes_size()));
+    std::iota(order.begin(), order.end(), 0);
+    std::shuffle(order.begin(), order.end(), random);
+    for (int i = 0; i < snapshot.current_placements_size(); ++i)
+      snapshot.mutable_current_placements(i)->set_node_id(
+          snapshot.nodes(order[static_cast<std::size_t>(i)]).node_id());
+    SealSnapshot(&snapshot);
+    const auto plan = fleetright::Plan(snapshot);
+    if (!plan.feasible())
+      continue;
+    ++feasible_plans;
+    EXPECT_LE(static_cast<std::uint32_t>(plan.evacuation_steps_size()), budget) << "trial " << trial;
+    const auto verification = fleetright::Verify(snapshot, plan);
+    EXPECT_TRUE(verification.accepted())
+        << "trial " << trial << "\n" << plan.DebugString() << verification.DebugString();
+  }
+  EXPECT_GE(feasible_plans, 48U);
 }
 
 TEST(PlannerPropertyTest, RandomizedNMinusOneTopologiesRemainIndependentlyFeasible) {

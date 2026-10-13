@@ -1387,10 +1387,19 @@ static v1::OptimizationPlan PlanWithProfileOverride(const OptimizationSnapshot &
            std::tie(right.workload_id, right.replica_id);
   });
 
+  // The verifier stages moves before scale-in removal, so a moved replica must not land on a node
+  // that currently hosts any replica of the same workload (even one about to be removed).
+  std::map<std::string, std::set<std::string>> hosts_by_workload;
+  for (const auto &placement : snapshot.current_placements())
+    hosts_by_workload[placement.workload_id()].insert(placement.node_id());
+
+  std::map<std::string, std::uint32_t> moves_used;
   for (const auto &replica : replicas) {
     const auto workload = workload_by_id.find(replica.workload_id);
     if (workload == workload_by_id.end())
       continue;
+    const bool move_budget_spent = moves_used[replica.workload_id] >= workload->second->max_moves();
+    const auto &current_hosts = hosts_by_workload[replica.workload_id];
     // Only the minimum is used; pointers avoid copying node ids and a full sort per replica.
     std::vector<std::tuple<bool, std::uint64_t, const std::string *>> choices;
     for (auto &[node_id, use] : uses) {
@@ -1407,6 +1416,8 @@ static v1::OptimizationPlan PlanWithProfileOverride(const OptimizationSnapshot &
       if (!topology_ok)
         continue;
       const bool movement = !replica.current_node.empty() && replica.current_node != node_id;
+      if (movement && (move_budget_spent || current_hosts.contains(node_id)))
+        continue;
       choices.emplace_back(movement, FragmentationScore(sum, use.capacity), &node_id);
     }
     if (choices.empty()) {
@@ -1418,11 +1429,14 @@ static v1::OptimizationPlan PlanWithProfileOverride(const OptimizationSnapshot &
       return plan;
     }
     // Same (movement, score, node id) order the previous full sort used; node ids are unique.
-    const auto &destination = *std::get<2>(*std::min_element(
-        choices.begin(), choices.end(), [](const auto &left, const auto &right) {
+    const auto best =
+        std::min_element(choices.begin(), choices.end(), [](const auto &left, const auto &right) {
           return std::tie(std::get<0>(left), std::get<1>(left), *std::get<2>(left)) <
                  std::tie(std::get<0>(right), std::get<1>(right), *std::get<2>(right));
-        }));
+        });
+    if (std::get<0>(*best))
+      ++moves_used[replica.workload_id];
+    const auto &destination = *std::get<2>(*best);
     auto &use = uses.at(destination);
     ProtoResourceVector sum;
     if (!AddResource(use.used, replica.resources, &sum)) {
@@ -1493,6 +1507,11 @@ static v1::OptimizationPlan PlanWithProfileOverride(const OptimizationSnapshot &
   }
   for (const auto &placement : plan.placements())
     ++placements_per_node[placement.node_id()];
+  const auto snapshot_node_of = [&](const ReplicaPlacement &placement) {
+    const auto found =
+        current_node_by_key.find(ReplicaKey(placement.workload_id(), placement.replica_id()));
+    return found == current_node_by_key.end() ? std::string() : found->second;
+  };
   std::uint32_t iterations = 0;
   bool improved = true;
   while (improved && iterations < limit) {
@@ -1513,8 +1532,21 @@ static v1::OptimizationPlan PlanWithProfileOverride(const OptimizationSnapshot &
               node.hourly_cost_micros() >= source->second->hourly_cost_micros())
             continue;
         }
+        // Same staging rule as the greedy pass: never move onto a node that currently hosts the
+        // workload (a replica staying in place is not a move).
+        if (snapshot_node_of(original) != node.node_id() &&
+            hosts_by_workload[original.workload_id()].contains(node.node_id()))
+          continue;
         auto candidate_plan = plan;
         candidate_plan.mutable_placements(index)->set_node_id(node.node_id());
+        const auto budget = workload_by_id.at(original.workload_id())->max_moves();
+        if (std::count_if(candidate_plan.placements().begin(), candidate_plan.placements().end(),
+                          [&](const auto &item) {
+                            const auto from = snapshot_node_of(item);
+                            return item.workload_id() == original.workload_id() && !from.empty() &&
+                                   from != item.node_id();
+                          }) > budget)
+          continue;
         std::set<std::string> candidate_used_nodes;
         for (const auto &item : candidate_plan.placements()) {
           candidate_used_nodes.insert(item.node_id());
