@@ -94,3 +94,40 @@ def test_bootstrap_ci_brackets_a_known_difference_and_is_seeded() -> None:
     assert qualify.bootstrap_ci(diffs, random.Random(1)) == (low, high)
     flat = qualify.bootstrap_ci([0.0] * 20, random.Random(1))
     assert flat == (0.0, 0.0)
+
+
+@pytest.mark.skipif(not PLANNER.is_file(), reason="C++ planner is not built")
+def test_placement_suite_meets_its_declared_expectations() -> None:
+    from fleetright import qualify_placement
+
+    report = qualify_placement.run()
+    failed = [row["id"] for row in report["cases"] if not row["pass"]]
+    assert not failed, failed
+    assert report["total"] >= 10
+
+
+@pytest.mark.skipif(not PLANNER.is_file(), reason="C++ planner is not built")
+def test_verifier_accepts_clean_planner_plans_and_rejects_every_mutation(monkeypatch) -> None:
+    import tempfile
+
+    from fleetright import optimizer_quality
+
+    monkeypatch.setattr(optimizer_quality, "SEEDS", (1, 2, 3, 12, 42, 50))
+    with tempfile.TemporaryDirectory() as tmp:
+        report = optimizer_quality.run(Path(tmp))
+    assert report["verifier_accepted_clean_plans"] == report["planner_feasible"] == 6
+    assert report["deterministic_replay"] == "6/6"
+    for kind, outcome in report["mutation_rejection"].items():
+        assert outcome["rejected"] == outcome["trials"] > 0, kind
+
+
+def test_forecast_evaluation_reports_calibrated_coverage_on_a_steady_series() -> None:
+    from fleetright import qualify_forecast
+    from fleetright.forecast import EwmaTrendModel
+
+    case = qualify_forecast.CASES[0][1]
+    metrics = qualify_forecast.evaluate_series(
+        qualify_forecast._series(case, 100), EwmaTrendModel(), qualify.WARMUP, None
+    )
+    assert metrics["n"] > 100 and metrics["wape"] < 0.05
+    assert 0.85 <= metrics["upper_bound_coverage_95"] <= 1.0
