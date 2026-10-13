@@ -35,7 +35,7 @@ reproduce: `scripts/run_qualification.sh`.
   HPA-like in five scenarios. A policy with any hard-violating seed is **not classified successful** in that
   scenario, whatever its cost. Scenarios free of hard violations: static peak 15/15, offline oracle 15/15,
   naive threshold 11/15, **FleetRight reactive 11/15**, HPA-like 10/15, FleetRight predictive 9/15.
-* **Execution safety (live).** Kind qualification re-run in this phase (first at c88f24b by an independent subagent, then again
+* **Execution safety (live).** Kind qualification re-run in this phase (first at c88f24b by an independent worker, then again
   at 7d4f0c4; the execution path is unchanged between those and the release commit, see
   `PROMPT3_QUALIFICATION.md`): 15 live tests passed both times (admission
   negatives, node ownership, replacement + PDB permit/deny, lost/held CREATE across takeover, drain

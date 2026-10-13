@@ -3,7 +3,7 @@
 Date 2026-10-13. Code under test: branch `phase5/final-qualification`, HEAD `c88f24b` (before the planner correctness fix `1cf56ac`, which only changes the v1 planner; the
 live suites exercise the V2 evacuation planner/verifier and the Python controllers). The final-commit rerun is
 recorded in `docs/PROMPT3_QUALIFICATION.md`. Host: Linux 7.0, gcc 13.3.0,
-clang 18.1.3, Python 3.12.3, pytest 9.1.1. Logs: `/tmp/claude-1000/streamB/`.
+clang 18.1.3, Python 3.12.3, pytest 9.1.1. Logs were written to a temporary directory and are not archived; the pass/fail lines below were copied from them.
 
 ## 1. Deterministic adversarial (non-live, PostgreSQL env set)
 

@@ -808,7 +808,8 @@ def publish(run_dir: Path, destination: Path) -> None:
     phase2 = sorted(run_dir.parent.parent.glob("phase2/*1000w-500n"))
     if phase2:  # newest planner/verifier scale benchmark (scripts/run_benchmarks.sh)
         (destination / "planner").mkdir(exist_ok=True)
-        for name in ("summary.json", "core_timings.json", "manifest.json", "report.md"):
+        # the benchmark manifest embeds local git status, so it is not published
+        for name in ("summary.json", "core_timings.json", "report.md"):
             shutil.copy2(phase2[-1] / name, destination / "planner" / name)
     for extra in ("forecast.json", "placement.json", "optimizer-quality.json"):
         if (run_dir.parent / extra).is_file():

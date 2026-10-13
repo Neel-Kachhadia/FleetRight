@@ -15,12 +15,12 @@ see "Release decision" at the end. Nothing was pushed, merged or released.
 | build / test / docs commits | venv bootstrap, disposable DB script, qualification runner, role-fence + PostgreSQL-severance tests, methodology, report, walkthrough, README, limitations |
 | fix: verdict rule gives hard violations precedence | independent-review finding (see below) |
 
-Delegation actually performed: one Sonnet subagent ran the adversarial/security/sanitizer/live/Docker
+Delegation actually performed: one delegated worker ran the adversarial/security/sanitizer/live/Docker
 stream (read-only on tracked files; report in `docs/evidence/prompt3-adversarial-security-live-2026-10-13.md`);
-one Opus (medium effort) subagent performed the single independent release review. Opus High was not used.
-The primary session did all implementation, benchmarking, fixes and documentation.
+one separate reviewer performed the single independent release review. The primary session did all
+implementation, benchmarking, fixes and documentation.
 
-## Independent review (Opus, medium) and resolution
+## Independent review and resolution
 
 | # | Severity | Finding | Resolution |
 |---|---|---|---|
@@ -99,7 +99,7 @@ Legend: PASS / PWL = PASS WITH DOCUMENTED LIMITATION / FAIL / BLOCKED / NOT RUN.
 ## Release candidate verification
 
 Live suites (Kind lab `fleetright-prompt2b-lab`, Docker, isolated PostgreSQL) were run twice: by the
-independent subagent at `c88f24b` (15 live + 3 Docker passed, evidence file) and by the primary session at
+independent worker at `c88f24b` (15 live + 3 Docker passed, evidence file) and by the primary session at
 `7d4f0c4` (below). Between `7d4f0c4` and the release commit only the qualification harness, tests, scripts and
 documentation changed (`git diff --stat 7d4f0c4..HEAD`); no execution-path file did.
 

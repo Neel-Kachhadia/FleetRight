@@ -125,7 +125,7 @@ added. Neither changed a FleetRight parameter, and the published run is a fresh 
   large effects only; for steady and flash crowd every seed has a distinct trace (distinct hashes) but the outcome is
   identical across seeds (one distinct cost value), so those intervals have an effective n of about 1 and
   say nothing about sampling variability. S09 differs from the other scenarios only in trace family
-  (bursty); every scenario has three tenants with different SLOs (80/120/150 ms).
+  (bursty); every scenario except S05 and S06 (one tenant each) has three tenants with different SLOs (80/120/150 ms).
 * A lower cost is not an improvement when it comes with significantly more violations (verdict rule).
 
 ### Optimizer performance contract
