@@ -92,7 +92,7 @@ Where things are written: `results/phase1|2|3/` (git-ignored run output), compac
 | Reactive FleetRight vs HPA-like (15 simulated scenarios) | median cost -8.6%; 6 better / 3 worse / 6 trade-off; hard-violation-free in 11/15 scenarios (HPA-like 10/15, static peak 15/15) | **simulated** |
 | Predictive vs reactive FleetRight | 0 better, 5 worse, 10 trade-off | **simulated** |
 | Live Kind qualification | 15 live tests + 3 Docker E2E passed | live, one lab |
-| Tests | C++ 52/52, Python 496 passed / 20 live-gated skips (live suites run separately), ASan+UBSan clean | |
+| Tests | C++ 52/52, Python 499 passed / 20 live-gated skips (live suites run separately), ASan+UBSan clean | |
 
 ## Documentation
 
