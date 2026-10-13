@@ -12,6 +12,7 @@ import csv
 import gzip
 import hashlib
 import json
+import os
 import random
 import shutil
 import statistics
@@ -622,7 +623,7 @@ def render_headline(summary: dict, names: dict[str, str]) -> str:
                 pair = scenario["paired"][f"{fr}__vs__{other}"]
                 rel = pair["node_cost_micros"]["relative_diff"]
                 slo = pair["slo_violation_windows"]["mean_diff_fr_minus_other"]
-                cells.append(f"{rel:+.0%} \| {slo:+.1f} \| {pair['verdict']}")
+                cells.append(f"{rel:+.0%} \\| {slo:+.1f} \\| {pair['verdict']}")
                 tally[other][pair["verdict"]] = tally[other].get(pair["verdict"], 0) + 1
             lines.append(f"| {sid} {names[sid]} | " + " | ".join(cells) + " |")
         lines.append(
@@ -713,9 +714,52 @@ def write_csv(path: Path, summary: dict, names: dict[str, str]) -> None:
                 writer.writerow(row + [m[x][stat] for x in metrics for stat in stats])
 
 
+def _tool_version(*command: str) -> str:
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=20)
+        return (result.stdout or result.stderr).splitlines()[0].strip()
+    except (OSError, IndexError, subprocess.SubprocessError):
+        return "unavailable"
+
+
+def environment() -> dict:
+    from importlib import metadata
+
+    packages = {}
+    for name in ("fastapi", "psycopg", "pydantic", "uvicorn", "pytest", "PyYAML", "httpx", "ruff"):
+        try:
+            packages[name] = metadata.version(name)
+        except metadata.PackageNotFoundError:
+            packages[name] = "not installed"
+    cpu = next(
+        (
+            line.split(":", 1)[1].strip()
+            for line in Path("/proc/cpuinfo").read_text(errors="replace").splitlines()
+            if line.startswith("model name")
+        ),
+        "unknown",
+    )
+    return {
+        "git_commit": _git("rev-parse", "HEAD"),
+        "python": sys.version.split()[0],
+        "packages": packages,
+        "compiler": _tool_version("c++", "--version"),
+        "cmake": _tool_version("cmake", "--version"),
+        "protoc": _tool_version("protoc", "--version"),
+        "kernel": _tool_version("uname", "-sr"),
+        "cpu_model": cpu,
+        "logical_cpus": os.cpu_count(),
+        "memory_total": _tool_version("sh", "-c", "grep MemTotal /proc/meminfo"),
+        "build_type": "Release (CMAKE_BUILD_TYPE) - scripts/bootstrap.sh",
+    }
+
+
 def publish(run_dir: Path, destination: Path) -> None:
     """Copy the compact, reviewable artifacts; raw results are gzipped with a recorded checksum."""
     destination.mkdir(parents=True, exist_ok=True)
+    (destination / "environment.json").write_text(
+        json.dumps(environment(), indent=2, sort_keys=True) + "\n"
+    )
     for name in ("manifest.json", "tuning.json", "comparison.md", "headline.md", "summary.csv"):
         shutil.copy2(run_dir / name, destination / name)
     with (
