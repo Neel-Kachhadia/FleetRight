@@ -143,10 +143,36 @@ def _host() -> dict[str, object]:
             ),
             "unknown",
         ),
+        "cpu_model": next(
+            (
+                line.split(":", 1)[1].strip()
+                for line in Path("/proc/cpuinfo").read_text(errors="replace").splitlines()
+                if line.startswith("model name")
+            ),
+            "unknown",
+        ),
+        "cxx_compiler_version": subprocess.run(
+            ["c++", "--version"], capture_output=True, text=True, check=False
+        ).stdout.splitlines()[:1],
         "build_type": "Release"
         if "CMAKE_BUILD_TYPE:STRING=Release" in compiler.stdout
         else "unknown",
     }
+
+
+def _peak_rss_kib(command: list[str]) -> int | None:
+    """Peak resident set of one CLI run via GNU time; None when /usr/bin/time is unavailable."""
+    if not Path("/usr/bin/time").is_file():
+        return None
+    with tempfile.NamedTemporaryFile("r") as report:
+        subprocess.run(
+            ["/usr/bin/time", "-f", "%M", "-o", report.name, *command],
+            cwd=ROOT,
+            capture_output=True,
+            timeout=90,
+            check=True,
+        )
+        return int(report.read().split()[-1])
 
 
 def _invoke(command: list[str], timeout: int = 90) -> float:
@@ -259,6 +285,13 @@ def run_benchmark(
     (run_dir / "policy_outputs/verification.textproto").write_text(
         verification_text, encoding="utf-8"
     )
+    planner_rss = _peak_rss_kib([str(planner), str(snapshot_path), str(run_dir / "rss-plan.pb")])
+    verifier_rss = _peak_rss_kib(
+        [str(verifier), str(snapshot_path), str(run_dir / "policy_outputs/plan.pb"),
+         str(run_dir / "rss-verification.pb")]
+    )  # fmt: skip
+    for scratch in ("rss-plan.pb", "rss-verification.pb"):
+        (run_dir / scratch).unlink(missing_ok=True)
     raw = {
         "schema_version": 1,
         "planner_process_seconds": planner_seconds,
@@ -275,6 +308,16 @@ def run_benchmark(
         "scenario_nodes": node_count,
         "profile_alternatives": 1,
         "iterations": iterations,
+        "planner_peak_rss_kib": planner_rss,
+        "verifier_peak_rss_kib": verifier_rss,
+        "planner_core_p99_seconds": sorted(core_timings["planner_seconds"])[
+            math.ceil(iterations * 0.99) - 1
+        ],
+        "planner_core_max_seconds": max(core_timings["planner_seconds"]),
+        "verifier_core_p99_seconds": sorted(core_timings["verifier_seconds"])[
+            math.ceil(iterations * 0.99) - 1
+        ],
+        "verifier_core_max_seconds": max(core_timings["verifier_seconds"]),
         "planner_p50_seconds": sorted(planner_seconds)[iterations // 2],
         "planner_p95_seconds": _p95(planner_seconds),
         "verifier_p50_seconds": sorted(verifier_seconds)[iterations // 2],
