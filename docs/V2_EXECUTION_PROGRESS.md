@@ -1,5 +1,61 @@
 # V2 Execution Progress
 
+## 2026-10-13 Prompt 2B final qualification (Claude Code, Sonnet 5.5; one Opus Medium review)
+
+**Branch** `phase4/safe-execution-reconciliation`. **Start** `a92e032`; **end** `1d04282`
+(commits `ed38241`, `6c2b635`, `e9d396a`, `8aefa78`, `1d04282`). Tag
+`milestone-4-safe-control-plane` still identifies `a92e032` (unmoved, unpushed). The qualified
+build is `1d04282`; the tag predates the cordon-ownership, bounded-verification and review fixes.
+**Decision requested from the owner:** keep the tag on the original build, or authorize a new
+tag for `1d04282` (not done without permission). Prompt 3 not started; nothing pushed.
+
+### Fixes (each with a regression)
+| Gap | Change | Regression / evidence |
+|---|---|---|
+| D unbounded verification | `VERIFYING`, `VERIFY_NODE_DRAIN` wait and `COMPENSATING` final check fail safe after `verification_deadline_seconds` (durable-timestamp anchored; survives takeover); verification never re-dispatches a destructive mutation | journal tests: immediate, bounded retry, never succeeds (2 error kinds), takeover inherits budget, stale controller, node uncordoned, compensation deadline |
+| C cordon ownership | `cordon-owned` recorded (true only if FleetRight cordoned a schedulable Node); no re-cordon over an external uncordon (`DRAIN_NODE_UNCORDONED_EXTERNALLY`); `plan-id/operation-id/cordon-owned` released after terminal state, retried by a sweep; `fencing-token` retained as monotonic high-water mark | target tests (schedulable, admin-cordoned, crash after cordon, duplicate, release, UID change, stale fence, stale re-claim); live ownership test |
+| Review HIGH | Opus found a stale controller could re-claim a Node after the token was removed on release | token retained; fresh claim must exceed it; `test_stale_controller_cannot_reclaim_a_released_node` |
+| Review MEDIUM x2 | unbounded COMPENSATING check; lost release after crash | deadline + `_sweep_node_metadata` tests |
+
+### Evidence ledger (final code; "LIVE" = real Kind API server)
+| Scenario | Classification | Evidence |
+|---|---|---|
+| A. Real lost CREATE response across takeover | PASS - LIVE | `test_prompt2b_live_lost_create[drop_response]`: TLS fault proxy on the Kind bridge let the API server commit the replacement CREATE (201), withheld the response, controller A (container) SIGKILLed, in-cluster controller B adopted the same Pod UID/create-id; one replacement, no duplicate, no early tombstone, source untouched |
+| A'. CREATE admitted after takeover | PASS - LIVE | `[hold_request]`: B waited (stage `REPLACEMENT_CREATE_PENDING`, no tombstone, no extra Pod), late CREATE then adopted; tombstone bound to the late Pod only after it was Ready |
+| B1. Compensation with free capacity | PASS - LIVE | `health-compensation` on a throw-away 6-node lab (deleted): COMPENSATING -> recovery Pod scheduled/ready -> COMPENSATED |
+| B2. Compensation without capacity | PASS - LIVE | `health-compensation-unplaceable` on the 4-worker lab: recovery Pod Unschedulable/Pending, 3 Ready, exactly 1 Eviction, `FAILED_SAFE` (`readiness-timeout`), unchanged after a replacement controller ran 6 ticks |
+| C. Node cordon ownership | PASS - LIVE + DETERMINISTIC | live ownership test (schedulable/admin-cordoned/duplicate/takeover/stale/other plan/uncordon/release/foreign UID, executor taint denied) + target tests |
+| D. Bounded verification | PASS - DETERMINISTIC (PostgreSQL) | reason codes `final-verification-deadline-exceeded`, `node-drain-wait-deadline-exceeded`, `compensation-verification-deadline-exceeded` are not driven live (would need real 10-minute waits) |
+| Replacement + PDB-permitted / PDB-denied eviction, Binding fence | PASS - LIVE | `test_prompt2b_live_replacement` 3 passed |
+| Held-response Eviction across takeover; API evacuation | PASS - LIVE | `takeover-held-response`, `api-evacuation` |
+| Drain A two-Pod | PASS - LIVE | `two-pod-drain`: COMMITTED, 2 Evictions, Node empty, cordon owned, metadata released |
+| Drain B/C/D four-Pod, crash, partial restart | PASS - LIVE | real process kill with third Eviction pending, takeover, exactly 4 Evictions |
+| Drain E PDB-blocked | PASS - LIVE | `pdb-blocked-drain`: live PDB allows 0, stale inventory claims 1; stage `PDB_BLOCKED`, 0 Evictions, sources untouched, no drain verification, <=1 surge Pod, plan stays EXECUTING |
+| Drain F insufficient destination capacity | PASS - DETERMINISTIC | C++ verifier `SequentialDrainRejectsCumulativeDestinationOvercapacity`; rejected at planning, no mutation |
+| Drain G unsupported Pod owner | PASS - MOCK/UNIT | target tests (`blocks_unselected_ordinary_pod`, unbound Pod); not run live |
+| Drain H already-cordoned Node | PASS - LIVE | live ownership test (admin cordon preserved) |
+| Drain I repeated reconciliation after completion | PASS - LIVE + DETERMINISTIC | resourceVersion unchanged on duplicate cordon; controller never visits terminal plans |
+| Drain J retry budget exhausted | PASS - DETERMINISTIC | observation-error limit and deadlines |
+| Drain K Node UID changed | PASS - LIVE (cordon) + DETERMINISTIC | foreign UID refused with no write |
+| Forged/stale CREATE and Eviction, legacy workload refusal | PASS - LIVE | `test_prompt2b_live_admission_negatives` 3 passed |
+| Docker E2E | PASS | 3/3 on `1d04282` |
+| Python | 487 passed, 20 skipped (all skips are live/Docker-gated, run separately above) | |
+| C++ CTest | 51/51 | |
+| Ruff check/format, compile, shell syntax, `git diff --check`, secret scan | PASS | |
+
+### Operations
+SCALE_UP, MOVE_REPLICA, EVICT_SOURCE, DRAIN_NODE (2-4 Pods), COMPENSATE: ENABLED AND VERIFIED.
+SCALE_DOWN: DISABLED. DEACTIVATE_NODE: UNSUPPORTED.
+
+### Honest limits
+- The three verification-deadline outcomes and Drain G are not exercised live.
+- The live suites share one lab; drained Nodes stay cordoned by design, so run modules with a lab
+  reset between them (a combined run once failed the Binding test on that leftover state).
+- The review fixes (token high-water mark, compensation deadline, sweep) were covered by tests
+  and live reruns but not re-reviewed by a second Opus pass.
+- `fleetright-safety-lab` was not redeployed with the final admission image and was not used.
+- A FAILED_SAFE compensation leaves the Pending recovery Pod for an operator.
+
 ## 2026-10-12 Prompt 2B qualification — Milestone 4 (Claude Code takeover)
 
 **Branch:** `phase4/safe-execution-reconciliation`. **Start SHA:** `06f43e6`. All
