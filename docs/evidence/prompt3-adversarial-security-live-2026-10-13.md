@@ -1,7 +1,8 @@
-# Stream B report: adversarial, security, sanitizer and live qualification
+# Prompt 3 adversarial, security, sanitizer and live qualification (independent run)
 
-Date 2026-10-13. Code under test: branch `phase5/final-qualification`, HEAD `c88f24b` plus the parent's
-uncommitted Python edits (baselines/traces/simulator are not on any tested path). Host: Linux 7.0, gcc 13.3.0,
+Date 2026-10-13. Code under test: branch `phase5/final-qualification`, HEAD `c88f24b` (before the planner correctness fix `1cf56ac`, which only changes the v1 planner; the
+live suites exercise the V2 evacuation planner/verifier and the Python controllers). The final-commit rerun is
+recorded in `docs/PROMPT3_QUALIFICATION.md`. Host: Linux 7.0, gcc 13.3.0,
 clang 18.1.3, Python 3.12.3, pytest 9.1.1. Logs: `/tmp/claude-1000/streamB/`.
 
 ## 1. Deterministic adversarial (non-live, PostgreSQL env set)
@@ -110,8 +111,7 @@ admission image, matching the ledger). A first attempt was killed when my shell 
 Pods, which cleared; the full rerun is the one reported.
 
 Clean-up: no temp executor kubeconfigs were created, no stray pytest/fault-proxy processes remain, both labs left running; prompt2b
-lab final state: 5 nodes Ready and schedulable, no `frw-*` Pods, admission x2 and controller Running. A container
-`fleetright-cleancheck-db` exists that I did not create (left alone).
+lab final state: 5 nodes Ready and schedulable, no `frw-*` Pods, admission x2 and controller Running. 
 
 ## 5. Docker E2E
 
