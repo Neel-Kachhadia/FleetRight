@@ -1,0 +1,201 @@
+{
+  "chosen": {
+    "fleetright_predictive": {
+      "param_ppm": 700000,
+      "rule_satisfied": true
+    },
+    "fleetright_reactive": {
+      "param_ppm": 600000,
+      "rule_satisfied": true
+    },
+    "hpa_like": {
+      "param_ppm": 500000,
+      "rule_satisfied": true
+    },
+    "naive_threshold": {
+      "param_ppm": 500000,
+      "rule_satisfied": true
+    },
+    "static_peak_reserve": {
+      "param_ppm": 50000,
+      "rule_satisfied": true
+    }
+  },
+  "grid": {
+    "fleetright_predictive": {
+      "1000000": {
+        "cost": 13329167.0,
+        "hard": 24,
+        "soft": 3397,
+        "windows": 14400
+      },
+      "600000": {
+        "cost": 16815833.0,
+        "hard": 7,
+        "soft": 44,
+        "windows": 14400
+      },
+      "700000": {
+        "cost": 15334166.0,
+        "hard": 11,
+        "soft": 186,
+        "windows": 14400
+      },
+      "800000": {
+        "cost": 14460001.0,
+        "hard": 11,
+        "soft": 1183,
+        "windows": 14400
+      },
+      "900000": {
+        "cost": 13819168.0,
+        "hard": 17,
+        "soft": 2867,
+        "windows": 14400
+      }
+    },
+    "fleetright_reactive": {
+      "1000000": {
+        "cost": 12537499.0,
+        "hard": 154,
+        "soft": 3611,
+        "windows": 14400
+      },
+      "600000": {
+        "cost": 14537501.0,
+        "hard": 79,
+        "soft": 229,
+        "windows": 14400
+      },
+      "700000": {
+        "cost": 13749999.0,
+        "hard": 111,
+        "soft": 525,
+        "windows": 14400
+      },
+      "800000": {
+        "cost": 13284165.0,
+        "hard": 123,
+        "soft": 1797,
+        "windows": 14400
+      },
+      "900000": {
+        "cost": 12880833.0,
+        "hard": 135,
+        "soft": 3235,
+        "windows": 14400
+      }
+    },
+    "hpa_like": {
+      "500000": {
+        "cost": 15250000.0,
+        "hard": 75,
+        "soft": 347,
+        "windows": 14400
+      },
+      "600000": {
+        "cost": 12515834.0,
+        "hard": 258,
+        "soft": 366,
+        "windows": 14400
+      },
+      "700000": {
+        "cost": 11730832.0,
+        "hard": 301,
+        "soft": 1189,
+        "windows": 14400
+      },
+      "800000": {
+        "cost": 9707499.0,
+        "hard": 362,
+        "soft": 3596,
+        "windows": 14400
+      }
+    },
+    "naive_threshold": {
+      "500000": {
+        "cost": 15825833.0,
+        "hard": 10,
+        "soft": 310,
+        "windows": 14400
+      },
+      "600000": {
+        "cost": 12634167.0,
+        "hard": 168,
+        "soft": 422,
+        "windows": 14400
+      },
+      "700000": {
+        "cost": 11997498.0,
+        "hard": 325,
+        "soft": 735,
+        "windows": 14400
+      },
+      "800000": {
+        "cost": 11008332.0,
+        "hard": 325,
+        "soft": 1679,
+        "windows": 14400
+      }
+    },
+    "static_peak_reserve": {
+      "0": {
+        "cost": 11800000.0,
+        "hard": 0,
+        "soft": 2702,
+        "windows": 14400
+      },
+      "100000": {
+        "cost": 15800000.0,
+        "hard": 0,
+        "soft": 80,
+        "windows": 14400
+      },
+      "200000": {
+        "cost": 16600000.0,
+        "hard": 0,
+        "soft": 80,
+        "windows": 14400
+      },
+      "300000": {
+        "cost": 18600000.0,
+        "hard": 0,
+        "soft": 0,
+        "windows": 14400
+      },
+      "400000": {
+        "cost": 21600000.0,
+        "hard": 0,
+        "soft": 0,
+        "windows": 14400
+      },
+      "50000": {
+        "cost": 15800000.0,
+        "hard": 0,
+        "soft": 80,
+        "windows": 14400
+      },
+      "500000": {
+        "cost": 23600000.0,
+        "hard": 0,
+        "soft": 0,
+        "windows": 14400
+      }
+    }
+  },
+  "rule": "min node cost s.t. (hard+soft) violation windows <= 3% of scored workload-windows; else min (hard+soft, cost)..",
+  "tuning_base_qps_milli": 450000,
+  "tuning_families": [
+    "steady",
+    "ramp",
+    "diurnal",
+    "bursty"
+  ],
+  "tuning_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ]
+}

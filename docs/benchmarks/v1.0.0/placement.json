@@ -1,0 +1,245 @@
+{
+  "cases": [
+    {
+      "case": "mixed CPU/memory workloads on the demo cluster",
+      "current_cost_micros_per_hour": 500000,
+      "deterministic": true,
+      "expect": "accepted",
+      "id": "S07",
+      "infeasible_reason": null,
+      "nodes_used": 4,
+      "outcome": "accepted",
+      "pass": true,
+      "planner_feasible": true,
+      "proposed_cost_micros_per_hour": 250000,
+      "rejection_codes": [],
+      "verifier_accepted": true,
+      "verifier_failed_invariants": []
+    },
+    {
+      "case": "one in-use node unexpectedly unhealthy",
+      "current_cost_micros_per_hour": 500000,
+      "deterministic": true,
+      "expect": "accepted_or_rejected",
+      "id": "S16",
+      "infeasible_reason": "surviving replicas cannot preserve demand after failure of zone=zone-1",
+      "nodes_used": 6,
+      "outcome": "infeasible",
+      "pass": true,
+      "planner_feasible": false,
+      "proposed_cost_micros_per_hour": 0,
+      "rejection_codes": [
+        "REJECTION_CODE_N_MINUS_1"
+      ],
+      "verifier_accepted": false,
+      "verifier_failed_invariants": [
+        "planner_feasibility_flag",
+        "eviction_recreation_intermediate_states",
+        "n_minus_1_serving_and_recovery",
+        "action_and_disruption_budgets",
+        "cost_catalog_consistency",
+        "weighted_objective_and_minimum_improvement"
+      ]
+    },
+    {
+      "case": "topology: 3 zones, min 2 domains (baseline)",
+      "current_cost_micros_per_hour": 500000,
+      "deterministic": true,
+      "expect": "accepted",
+      "id": "S17a",
+      "infeasible_reason": null,
+      "nodes_used": 4,
+      "outcome": "accepted",
+      "pass": true,
+      "planner_feasible": true,
+      "proposed_cost_micros_per_hour": 250000,
+      "rejection_codes": [],
+      "verifier_accepted": true,
+      "verifier_failed_invariants": []
+    },
+    {
+      "case": "topology bottleneck: every node in one zone",
+      "current_cost_micros_per_hour": 500000,
+      "deterministic": true,
+      "expect": "infeasible",
+      "id": "S17b",
+      "infeasible_reason": "fewer than two healthy failure domains can remain active",
+      "nodes_used": 7,
+      "outcome": "infeasible",
+      "pass": true,
+      "planner_feasible": false,
+      "proposed_cost_micros_per_hour": 0,
+      "rejection_codes": [
+        "REJECTION_CODE_N_MINUS_1"
+      ],
+      "verifier_accepted": false,
+      "verifier_failed_invariants": [
+        "planner_feasibility_flag",
+        "cpu_memory_network_headroom_topology_taints",
+        "eviction_recreation_intermediate_states",
+        "n_minus_1_serving_and_recovery",
+        "action_and_disruption_budgets",
+        "cost_catalog_consistency",
+        "weighted_objective_and_minimum_improvement"
+      ]
+    },
+    {
+      "case": "insufficient capacity: one node for the whole fleet",
+      "current_cost_micros_per_hour": 50000,
+      "deterministic": true,
+      "expect": "infeasible",
+      "id": "S18a",
+      "infeasible_reason": "no deterministic feasible node for replica queued-api-1",
+      "nodes_used": 1,
+      "outcome": "infeasible",
+      "pass": true,
+      "planner_feasible": false,
+      "proposed_cost_micros_per_hour": 0,
+      "rejection_codes": [
+        "REJECTION_CODE_NO_PLACEMENT"
+      ],
+      "verifier_accepted": false,
+      "verifier_failed_invariants": [
+        "planner_feasibility_flag",
+        "replica_ranges_and_single_placements",
+        "cpu_memory_network_headroom_topology_taints",
+        "eviction_recreation_intermediate_states",
+        "n_minus_1_serving_and_recovery",
+        "action_and_disruption_budgets",
+        "cost_catalog_consistency",
+        "weighted_objective_and_minimum_improvement"
+      ]
+    },
+    {
+      "case": "demand beyond the workload's max replicas",
+      "current_cost_micros_per_hour": 500000,
+      "deterministic": true,
+      "expect": "infeasible",
+      "id": "S18b",
+      "infeasible_reason": "current N-1 state lacks a fresh capacity profile for its resource shape",
+      "nodes_used": 10,
+      "outcome": "infeasible",
+      "pass": true,
+      "planner_feasible": false,
+      "proposed_cost_micros_per_hour": 500000,
+      "rejection_codes": [
+        "REJECTION_CODE_NO_SAFE_ENVELOPE",
+        "REJECTION_CODE_NO_SAFE_ENVELOPE"
+      ],
+      "verifier_accepted": false,
+      "verifier_failed_invariants": [
+        "planner_feasibility_flag",
+        "n_minus_1_serving_and_recovery"
+      ]
+    },
+    {
+      "case": "conflicting bounds (min > max replicas)",
+      "current_cost_micros_per_hour": 500000,
+      "deterministic": true,
+      "expect": "infeasible",
+      "id": "E01",
+      "infeasible_reason": "invalid workload units, bounds, or safety factors",
+      "nodes_used": 0,
+      "outcome": "infeasible",
+      "pass": true,
+      "planner_feasible": false,
+      "proposed_cost_micros_per_hour": 0,
+      "rejection_codes": [],
+      "verifier_accepted": false,
+      "verifier_failed_invariants": [
+        "planner_feasibility_flag",
+        "input_ids_units_and_enums",
+        "current_replica_snapshot_binding",
+        "profile_slo_evidence_and_shape",
+        "replica_ranges_and_single_placements",
+        "cpu_memory_network_headroom_topology_taints",
+        "eviction_recreation_intermediate_states",
+        "n_minus_1_serving_and_recovery",
+        "cost_catalog_consistency",
+        "weighted_objective_and_minimum_improvement"
+      ]
+    },
+    {
+      "case": "stale capacity profiles block rightsizing",
+      "current_cost_micros_per_hour": 500000,
+      "deterministic": true,
+      "expect": "hold_or_infeasible",
+      "id": "E02",
+      "infeasible_reason": "current N-1 state lacks a fresh capacity profile for its resource shape",
+      "nodes_used": 10,
+      "outcome": "infeasible",
+      "pass": true,
+      "planner_feasible": false,
+      "proposed_cost_micros_per_hour": 500000,
+      "rejection_codes": [
+        "REJECTION_CODE_NO_SAFE_ENVELOPE",
+        "REJECTION_CODE_NO_SAFE_ENVELOPE",
+        "REJECTION_CODE_NO_SAFE_ENVELOPE",
+        "REJECTION_CODE_NO_SAFE_ENVELOPE"
+      ],
+      "verifier_accepted": false,
+      "verifier_failed_invariants": [
+        "planner_feasibility_flag",
+        "n_minus_1_serving_and_recovery"
+      ]
+    },
+    {
+      "case": "extreme valid inputs (2^40 milli-qps, 100k max)",
+      "current_cost_micros_per_hour": 500000,
+      "deterministic": true,
+      "expect": "infeasible",
+      "id": "E03",
+      "infeasible_reason": "current N-1 state lacks a fresh capacity profile for its resource shape",
+      "nodes_used": 10,
+      "outcome": "infeasible",
+      "pass": true,
+      "planner_feasible": false,
+      "proposed_cost_micros_per_hour": 500000,
+      "rejection_codes": [
+        "REJECTION_CODE_NO_SAFE_ENVELOPE",
+        "REJECTION_CODE_NO_SAFE_ENVELOPE",
+        "REJECTION_CODE_NO_SAFE_ENVELOPE",
+        "REJECTION_CODE_NO_SAFE_ENVELOPE"
+      ],
+      "verifier_accepted": false,
+      "verifier_failed_invariants": [
+        "planner_feasibility_flag",
+        "n_minus_1_serving_and_recovery"
+      ]
+    },
+    {
+      "case": "single workload, one replica, three nodes",
+      "current_cost_micros_per_hour": 150000,
+      "deterministic": true,
+      "expect": "accepted",
+      "id": "E04",
+      "infeasible_reason": null,
+      "nodes_used": 1,
+      "outcome": "accepted",
+      "pass": true,
+      "planner_feasible": true,
+      "proposed_cost_micros_per_hour": 50000,
+      "rejection_codes": [],
+      "verifier_accepted": true,
+      "verifier_failed_invariants": []
+    },
+    {
+      "case": "many equal-cost placements are deterministic",
+      "current_cost_micros_per_hour": 150000,
+      "deterministic": true,
+      "expect": "accepted",
+      "id": "E05",
+      "infeasible_reason": null,
+      "nodes_used": 2,
+      "outcome": "accepted",
+      "pass": true,
+      "planner_feasible": true,
+      "proposed_cost_micros_per_hour": 100000,
+      "rejection_codes": [],
+      "verifier_accepted": true,
+      "verifier_failed_invariants": []
+    }
+  ],
+  "passed": 11,
+  "total": 11
+}

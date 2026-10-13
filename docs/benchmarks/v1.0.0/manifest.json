@@ -1,0 +1,291 @@
+{
+  "command": "python -m fleetright.qualify run",
+  "cost_model": "cost-model-v1",
+  "eval_base_qps_milli": 600000,
+  "eval_seeds": [
+    100,
+    101,
+    102,
+    103,
+    104,
+    105,
+    106,
+    107,
+    108,
+    109,
+    110,
+    111,
+    112,
+    113,
+    114,
+    115,
+    116,
+    117,
+    118,
+    119
+  ],
+  "git_commit": "93ae19557cf428bfa222d5f50b47b3a9c1e828ff",
+  "git_dirty": false,
+  "jitter_permille": 30,
+  "policies": [
+    "static_peak_reserve",
+    "naive_threshold",
+    "hpa_like",
+    "fleetright_reactive",
+    "fleetright_predictive",
+    "fleetright_predictive_same_headroom",
+    "offline_lookahead_oracle"
+  ],
+  "policy_params_ppm": {
+    "fleetright_predictive": 700000,
+    "fleetright_predictive_same_headroom": 600000,
+    "fleetright_reactive": 600000,
+    "hpa_like": 500000,
+    "naive_threshold": 500000,
+    "static_peak_reserve": 50000
+  },
+  "python": "3.12.3",
+  "results_sha256": "64bf94cf25241e94be89b9098d667d6dcdc06228a5c706c9140f838d1565fcf6",
+  "run_id": "20261013T070105Z",
+  "scenarios": [
+    {
+      "drift_ppm": null,
+      "family": "steady",
+      "loss_replicas": null,
+      "missing_every": 0,
+      "name": "steady",
+      "note": "",
+      "shift_permille": null,
+      "sid": "S01",
+      "startup_ms": null,
+      "workloads": [
+        "cpu-api",
+        "memory-api",
+        "queued-api"
+      ]
+    },
+    {
+      "drift_ppm": null,
+      "family": "ramp",
+      "loss_replicas": null,
+      "missing_every": 0,
+      "name": "gradual increase",
+      "note": "",
+      "shift_permille": null,
+      "sid": "S02",
+      "startup_ms": null,
+      "workloads": [
+        "cpu-api",
+        "memory-api",
+        "queued-api"
+      ]
+    },
+    {
+      "drift_ppm": null,
+      "family": "diurnal",
+      "loss_replicas": null,
+      "missing_every": 0,
+      "name": "daily peaks (compressed 12-window day)",
+      "note": "",
+      "shift_permille": null,
+      "sid": "S03",
+      "startup_ms": null,
+      "workloads": [
+        "cpu-api",
+        "memory-api",
+        "queued-api"
+      ]
+    },
+    {
+      "drift_ppm": null,
+      "family": "flash_crowd",
+      "loss_replicas": null,
+      "missing_every": 0,
+      "name": "flash crowd 5x",
+      "note": "",
+      "shift_permille": null,
+      "sid": "S04",
+      "startup_ms": null,
+      "workloads": [
+        "cpu-api",
+        "memory-api",
+        "queued-api"
+      ]
+    },
+    {
+      "drift_ppm": null,
+      "family": "bursty",
+      "loss_replicas": null,
+      "missing_every": 0,
+      "name": "CPU-intensive workload",
+      "note": "",
+      "shift_permille": null,
+      "sid": "S05",
+      "startup_ms": null,
+      "workloads": [
+        "cpu-api"
+      ]
+    },
+    {
+      "drift_ppm": null,
+      "family": "memory_heavy",
+      "loss_replicas": null,
+      "missing_every": 0,
+      "name": "memory-intensive workload",
+      "note": "",
+      "shift_permille": null,
+      "sid": "S06",
+      "startup_ms": null,
+      "workloads": [
+        "memory-api"
+      ]
+    },
+    {
+      "drift_ppm": null,
+      "family": "diurnal",
+      "loss_replicas": null,
+      "missing_every": 0,
+      "name": "slow-starting replicas (150 s)",
+      "note": "",
+      "shift_permille": null,
+      "sid": "S08",
+      "startup_ms": 150000,
+      "workloads": [
+        "cpu-api",
+        "memory-api",
+        "queued-api"
+      ]
+    },
+    {
+      "drift_ppm": null,
+      "family": "bursty",
+      "loss_replicas": null,
+      "missing_every": 0,
+      "name": "multiple tenants, different SLOs",
+      "note": "",
+      "shift_permille": null,
+      "sid": "S09",
+      "startup_ms": null,
+      "workloads": [
+        "cpu-api",
+        "memory-api",
+        "queued-api"
+      ]
+    },
+    {
+      "drift_ppm": null,
+      "family": "noisy_tenant",
+      "loss_replicas": null,
+      "missing_every": 0,
+      "name": "noisy-neighbour demand",
+      "note": "",
+      "shift_permille": null,
+      "sid": "S10",
+      "startup_ms": null,
+      "workloads": [
+        "cpu-api",
+        "memory-api",
+        "queued-api"
+      ]
+    },
+    {
+      "drift_ppm": null,
+      "family": "correlated_spike",
+      "loss_replicas": null,
+      "missing_every": 0,
+      "name": "correlated surges",
+      "note": "",
+      "shift_permille": null,
+      "sid": "S11",
+      "startup_ms": null,
+      "workloads": [
+        "cpu-api",
+        "memory-api",
+        "queued-api"
+      ]
+    },
+    {
+      "drift_ppm": null,
+      "family": "diurnal",
+      "loss_replicas": null,
+      "missing_every": 0,
+      "name": "forecast underprediction (+80% level shift)",
+      "note": "",
+      "shift_permille": 1800,
+      "sid": "S12",
+      "startup_ms": null,
+      "workloads": [
+        "cpu-api",
+        "memory-api",
+        "queued-api"
+      ]
+    },
+    {
+      "drift_ppm": null,
+      "family": "diurnal",
+      "loss_replicas": null,
+      "missing_every": 0,
+      "name": "forecast overprediction (-50% level shift)",
+      "note": "",
+      "shift_permille": 500,
+      "sid": "S13",
+      "startup_ms": null,
+      "workloads": [
+        "cpu-api",
+        "memory-api",
+        "queued-api"
+      ]
+    },
+    {
+      "drift_ppm": null,
+      "family": "diurnal",
+      "loss_replicas": null,
+      "missing_every": 3,
+      "name": "stale telemetry (1 of 3 windows missing)",
+      "note": "",
+      "shift_permille": null,
+      "sid": "S14",
+      "startup_ms": null,
+      "workloads": [
+        "cpu-api",
+        "memory-api",
+        "queued-api"
+      ]
+    },
+    {
+      "drift_ppm": 800000,
+      "family": "diurnal",
+      "loss_replicas": null,
+      "missing_every": 0,
+      "name": "capacity profile drift (-20% true capacity)",
+      "note": "",
+      "shift_permille": null,
+      "sid": "S15",
+      "startup_ms": null,
+      "workloads": [
+        "cpu-api",
+        "memory-api",
+        "queued-api"
+      ]
+    },
+    {
+      "drift_ppm": null,
+      "family": "steady",
+      "loss_replicas": 1,
+      "missing_every": 0,
+      "name": "one node lost (1 replica per tenant)",
+      "note": "",
+      "shift_permille": null,
+      "sid": "S16",
+      "startup_ms": null,
+      "workloads": [
+        "cpu-api",
+        "memory-api",
+        "queued-api"
+      ]
+    }
+  ],
+  "warmup_windows": 120,
+  "window_ms": 60000,
+  "windows": 360
+}

@@ -594,6 +594,7 @@ HEADLINE = (
     ("fleetright_reactive", ("static_peak_reserve", "naive_threshold", "hpa_like")),
     ("fleetright_predictive", ("static_peak_reserve", "naive_threshold", "hpa_like")),
     ("fleetright_predictive", ("fleetright_reactive", "fleetright_predictive_same_headroom")),
+    ("fleetright_predictive_same_headroom", ("fleetright_reactive",)),
 )
 
 
@@ -605,8 +606,7 @@ def render_headline(summary: dict, names: dict[str, str]) -> str:
         "Cell = `relative node-cost difference | mean SLO-violation-window difference | verdict` "
         "for FleetRight minus the column policy. Negative favours FleetRight. Verdicts use the "
         "paired 95% bootstrap CIs; see comparison.md for intervals and per-policy tables. "
-        "`FR-predictive vs FR-predictive_same_headroom` is not shown; that ablation is in "
-        "comparison.md.",
+        "The last table is the forecast ablation: predictive at the reactive policy's own knob.",
         "",
     ]
     for fr, others in HEADLINE:
