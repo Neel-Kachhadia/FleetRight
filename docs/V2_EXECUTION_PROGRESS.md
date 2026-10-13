@@ -1,13 +1,15 @@
 # V2 Execution Progress
 
-## 2026-10-13 Prompt 2B final qualification (Claude Code, Sonnet 5.5; one Opus Medium review)
+## 2026-10-13 Prompt 2B final qualification
 
-**Branch** `phase4/safe-execution-reconciliation`. **Start** `a92e032`; **end** `1d04282`
-(commits `ed38241`, `6c2b635`, `e9d396a`, `8aefa78`, `1d04282`). Tag
-`milestone-4-safe-control-plane` still identifies `a92e032` (unmoved, unpushed). The qualified
-build is `1d04282`; the tag predates the cordon-ownership, bounded-verification and review fixes.
-**Decision requested from the owner:** keep the tag on the original build, or authorize a new
-tag for `1d04282` (not done without permission). Prompt 3 not started; nothing pushed.
+**Branch** `phase4/safe-execution-reconciliation`. **Start** `5f83365`; qualified code `f4582b0`
+(commits `4e28e2e`, `d7b6681`, `e09accd`, `e1fc1e5`, `f4582b0`), followed by documentation-only
+commits. The annotated tag `milestone-4-safe-control-plane` identifies the final evidence commit
+that contains all of this work. An earlier, never-published local tag had pointed at the
+pre-fix build `5f83365`; it was replaced because that build predates the cordon-ownership,
+bounded-verification and review fixes. Before publication, the 35 unpublished local commits had
+their messages rewritten to drop automated co-author trailers; trees, authors and dates are
+unchanged (previous SHAs: `5f83365` was `a92e032`, `f4582b0` was `1d04282`). Prompt 3 not started.
 
 ### Fixes (each with a regression)
 | Gap | Change | Regression / evidence |
@@ -38,7 +40,7 @@ tag for `1d04282` (not done without permission). Prompt 3 not started; nothing p
 | Drain J retry budget exhausted | PASS - DETERMINISTIC | observation-error limit and deadlines |
 | Drain K Node UID changed | PASS - LIVE (cordon) + DETERMINISTIC | foreign UID refused with no write |
 | Forged/stale CREATE and Eviction, legacy workload refusal | PASS - LIVE | `test_prompt2b_live_admission_negatives` 3 passed |
-| Docker E2E | PASS | 3/3 on `1d04282` |
+| Docker E2E | PASS | 3/3 on `f4582b0` |
 | Python | 487 passed, 20 skipped (all skips are live/Docker-gated, run separately above) | |
 | C++ CTest | 51/51 | |
 | Ruff check/format, compile, shell syntax, `git diff --check`, secret scan | PASS | |
