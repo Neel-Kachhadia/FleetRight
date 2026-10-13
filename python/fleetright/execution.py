@@ -35,12 +35,7 @@ from .workload_controller import (
 _DNS_LABEL = re.compile(r"[a-z0-9](?:[-a-z0-9]*[a-z0-9])?\Z")
 NODE_CORDON_OWNED = "fleetright.io/cordon-owned"
 NODE_TRANSIENT_ANNOTATIONS = frozenset(
-    {
-        "fleetright.io/plan-id",
-        "fleetright.io/operation-id",
-        "fleetright.io/fencing-token",
-        NODE_CORDON_OWNED,
-    }
+    {"fleetright.io/plan-id", "fleetright.io/operation-id", NODE_CORDON_OWNED}
 )
 _DNS_SUBDOMAIN = re.compile(
     r"[a-z0-9](?:[-a-z0-9]*[a-z0-9])?(?:\.[a-z0-9](?:[-a-z0-9]*[a-z0-9])?)*\Z"
@@ -615,8 +610,8 @@ class FleetRightWorkloadTarget(KubernetesTarget):
         )
         if owner != (None, None) and owner != (plan_id, payload["operation_id"]):
             raise ActionBlocked("DRAIN_NODE_OPERATION_CONFLICT")
-        if int(token) and owner == (None, None):
-            raise ActionBlocked("DRAIN_NODE_FENCE_INVALID")
+        # A token without an owner is the released high-water mark: it stays so a stale
+        # controller can never re-claim the Node with an older token.
         return {
             "source_node_id": name,
             "source_node_uid": metadata["uid"],
@@ -646,6 +641,8 @@ class FleetRightWorkloadTarget(KubernetesTarget):
         if current["fencing_token"] > fencing_token:
             raise TargetPreconditionFailed("a newer controller fenced this Node drain")
         fresh = current["plan_id"] is None
+        if fresh and current["fencing_token"] >= fencing_token:
+            raise TargetPreconditionFailed("a newer controller fenced this Node drain")
         if not fresh and not current["unschedulable"]:
             # Never re-cordon over an administrator's uncordon; the drain cannot be trusted.
             raise ActionBlocked("DRAIN_NODE_UNCORDONED_EXTERNALLY")
@@ -707,6 +704,7 @@ class FleetRightWorkloadTarget(KubernetesTarget):
             return {"released": False}
         if current["fencing_token"] > fencing_token:
             raise TargetPreconditionFailed("a newer controller fenced this Node drain")
+        # The fencing token is deliberately retained as a monotonic high-water mark.
         kept = {
             key: value
             for key, value in current["annotations"].items()

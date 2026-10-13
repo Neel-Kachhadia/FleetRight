@@ -867,7 +867,6 @@ def _binding_admission(monkeypatch: pytest.MonkeyPatch):
     [
         {"fleetright.io/plan-id": "plan-1", "fleetright.io/operation-id": "drain-1"},
         {"fleetright.io/plan-id": "plan-1"},
-        {"fleetright.io/fencing-token": "3"},
     ],
 )
 def test_binding_to_fleetright_draining_node_is_denied(monkeypatch, annotations):
@@ -875,6 +874,12 @@ def test_binding_to_fleetright_draining_node_is_denied(monkeypatch, annotations)
     node["metadata"]["annotations"] = annotations
     assert admission.admit(request)[0] is False
     assert api.status_patches == 0
+
+
+def test_binding_ignores_released_fencing_token_high_water_mark(monkeypatch):
+    admission, node, request, api = _binding_admission(monkeypatch)
+    node["metadata"]["annotations"] = {"fleetright.io/fencing-token": "3"}
+    assert admission.admit(request) == (True, "")
 
 
 def test_binding_to_other_schedulable_destination_is_allowed(monkeypatch):

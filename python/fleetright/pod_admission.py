@@ -565,7 +565,6 @@ class PodCreateAdmission:
             for key in (
                 "fleetright.io/plan-id",
                 "fleetright.io/operation-id",
-                "fleetright.io/fencing-token",
             )
         ):
             return False, "Binding to a cordoned or FleetRight draining Node is denied"

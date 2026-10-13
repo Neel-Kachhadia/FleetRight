@@ -21,7 +21,6 @@ pytestmark = pytest.mark.skipif(
 TRANSIENT = (
     "fleetright.io/plan-id",
     "fleetright.io/operation-id",
-    "fleetright.io/fencing-token",
     "fleetright.io/cordon-owned",
 )
 
@@ -170,4 +169,10 @@ def test_live_cordon_ownership_release_and_external_uncordon(tmp_path: Path) -> 
     finally:
         for name in workers[:3]:
             kubectl("uncordon", name, check=False)
-            kubectl("annotate", "node", name, *(f"{key}-" for key in TRANSIENT), check=False)
+            kubectl(
+                "annotate",
+                "node",
+                name,
+                *(f"{key}-" for key in (*TRANSIENT, "fleetright.io/fencing-token")),
+                check=False,
+            )

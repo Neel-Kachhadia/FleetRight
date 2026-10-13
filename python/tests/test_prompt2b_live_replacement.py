@@ -899,6 +899,7 @@ def test_live_pod_binding_admission_blocks_fleetright_cordoned_node() -> None:
                     "fleetright.io/plan-id",
                     "fleetright.io/operation-id",
                     "fleetright.io/fencing-token",
+                    "fleetright.io/cordon-owned",
                 ):
                     if key in original_annotations:
                         restored_annotations[key] = original_annotations[key]

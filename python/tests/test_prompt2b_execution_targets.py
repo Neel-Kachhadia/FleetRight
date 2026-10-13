@@ -2794,7 +2794,7 @@ def test_cordon_of_administratively_cordoned_node_is_not_owned_and_never_release
         "cordon_owned": False,
     }
     assert state["node"]["spec"]["unschedulable"] is True  # administrator's cordon untouched
-    assert _fleetright_annotations(state) == {}
+    assert _fleetright_annotations(state) == {"fleetright.io/fencing-token": "4"}
 
 
 def test_cordon_crash_after_patch_keeps_ownership_across_takeover(monkeypatch):
@@ -2831,13 +2831,29 @@ def test_release_removes_only_fleetright_metadata_and_keeps_the_cordon(monkeypat
     target, payload, state, _ = _node_drain_target(monkeypatch)
     target.cordon_source_node("plan-1", payload, 3)
     assert target.release_source_node("plan-1", payload, 3)["released"] is True
-    assert state["node"]["metadata"]["annotations"] == {"other-controller.example/keep": "yes"}
+    assert state["node"]["metadata"]["annotations"] == {
+        "other-controller.example/keep": "yes",
+        "fleetright.io/fencing-token": "3",  # monotonic high-water mark survives the release
+    }
     assert state["node"]["spec"]["unschedulable"] is True
     patches = len(state["patches"])
     assert target.release_source_node("plan-1", payload, 3) == {"released": False}
     assert len(state["patches"]) == patches  # completed Node is never touched again
     # A later plan may now claim the Node.
     assert target.cordon_source_node("plan-2", payload, 9)["plan_id"] == "plan-2"
+
+
+def test_stale_controller_cannot_reclaim_a_released_node(monkeypatch):
+    target, payload, state, _ = _node_drain_target(monkeypatch)
+    target.cordon_source_node("plan-1", payload, 6)  # controller B (newer) holds the claim
+    target.release_source_node("plan-1", payload, 6)
+    state["node"]["spec"]["unschedulable"] = False  # an administrator then uncordons
+    patches = len(state["patches"])
+    for stale in (5, 6):  # controller A (token 5) wakes up late; an equal token is refused too
+        with pytest.raises(TargetPreconditionFailed, match="newer controller"):
+            target.cordon_source_node("plan-1", payload, stale)
+    assert len(state["patches"]) == patches and not state["node"]["spec"]["unschedulable"]
+    assert target.cordon_source_node("plan-2", payload, 7)["plan_id"] == "plan-2"
 
 
 def test_release_rejects_changed_node_uid_other_plan_and_newer_fence(monkeypatch):

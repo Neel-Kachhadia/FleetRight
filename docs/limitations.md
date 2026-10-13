@@ -107,3 +107,15 @@ domain. See
 [ADR-008](adr/008-staged-evacuation-execution.md) for the stage protocol and
 adapter requirements. The API runs as a loopback-bound local process and
 invokes the checked-out planner/verifier binaries.
+
+## Prompt 2B operational notes (2026-10-13)
+
+- FleetRight never uncordons a Node. A completed or failed drain leaves the Node cordoned for the
+  operator; only `plan-id`, `operation-id` and `cordon-owned` are released, and
+  `fleetright.io/fencing-token` remains as an inert monotonic high-water mark.
+- A PDB-blocked retirement waits without a deadline (it performs no destructive action) until the
+  budget opens or an operator cancels the plan.
+- Failed compensation (`FAILED_SAFE`) leaves the unplaceable recovery Pod `Pending` and the
+  workload's desired replica count raised; an operator must resolve capacity or delete the Pod.
+- Deadlines use controller wall-clock against PostgreSQL timestamps; clock skew shifts them.
+- Drain completion remains a point-in-time inventory read.

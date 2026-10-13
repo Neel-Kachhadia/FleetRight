@@ -417,3 +417,30 @@ fields and the scale-up protocol enum. The check is covered by unit tests and
 the checked-in manifest; API-server validation of these CEL rules remains
 unverified for the current checkpoint because the safety-lab certificate is
 not yet valid.
+
+## Addendum (2026-10-13): Node cordon ownership and bounded verification
+
+**Cordon ownership.** `CORDON_NODE` claims a Node by writing `fleetright.io/plan-id`,
+`operation-id`, `fencing-token` and `cordon-owned` in one UID/resourceVersion-guarded patch.
+`spec.unschedulable` is written only on a fresh claim of a schedulable Node, and
+`cordon-owned` is `true` only in that case; an administrator's pre-existing cordon is claimed for
+fencing but recorded `false`. The original `unschedulable` state and the ownership flag are
+journaled (`pre_observation.unschedulable_before`, `target_observation.cordon_owned`). A claimed
+Node later found schedulable is never silently re-cordoned: the drain fails safe with
+`DRAIN_NODE_UNCORDONED_EXTERNALLY`. FleetRight never uncordons a Node.
+
+**Release.** After a terminal PostgreSQL state (`COMMITTED`, `FAILED_SAFE`, `COMPENSATED`,
+`CANCELLED`) the controller removes `plan-id`, `operation-id` and `cordon-owned` (best effort,
+retried by a throttled sweep and at start-up for plans finished within a day). The
+`fencing-token` annotation is kept as a monotonic high-water mark: a stale controller that wakes
+after release cannot re-claim the Node because a fresh claim must exceed it. The Node
+`ValidatingAdmissionPolicy` is unchanged (the token can never decrease or be removed by the
+executor); Binding admission treats the token alone as inert.
+
+**Bounded verification.** `VERIFYING`, the `VERIFY_NODE_DRAIN` wait and the `COMPENSATING` final
+check each fail safe after `verification_deadline_seconds` (default `max(600, 4 x readiness
+timeout)`), anchored on durable action timestamps so a replacement controller inherits the
+remaining budget. Verification only observes; it never retries a destructive mutation.
+
+Known residuals: a PDB-blocked retirement waits (no destructive action) until the budget opens
+or an operator cancels; deadlines compare controller wall-clock with PostgreSQL timestamps.

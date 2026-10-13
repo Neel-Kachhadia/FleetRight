@@ -4673,3 +4673,64 @@ def test_node_uncordoned_after_drain_completion_blocks_commit(clean_database: Da
     controller.run_once()
     assert _plan_status(repo, plan_id) == "FAILED_SAFE"
     assert target.cordon_calls <= 3  # the cordon action and fence re-adoption; never a loop
+
+
+def test_release_sweep_recovers_a_crash_between_terminal_commit_and_node_release(
+    clean_database: Database,
+) -> None:
+    repo, target = clean_database.repository, _DrainTarget()
+    controller = _drain_plan_in_verifying(repo, "sweep-plan", target)
+    controller.run_once()
+    assert _plan_status(repo, "sweep-plan") == "COMMITTED"
+    target.released.clear()  # the original release was lost with the crashed controller
+    ExecutionController(repo, target, FakeHealth(), "controller-b")._sweep_node_metadata()
+    assert [plan for plan, _ in target.released] == ["sweep-plan"]
+
+
+def test_compensating_final_check_is_bounded_by_a_deadline(clean_database: Database) -> None:
+    repo = clean_database.repository
+    with repo.transaction() as conn:
+        _insert_plan(conn, "comp-deadline")
+        conn.execute(
+            "INSERT INTO action_intents (plan_id, intent_id, action_sequence, action_type, "
+            "workload_id, payload, status) VALUES ('comp-deadline', 'orig', 0, "
+            "'SET_REPLICA_COUNT', 'cpu-api', %s, 'APPROVED')",
+            (Jsonb({"proposed_replicas": 3}),),
+        )
+    token = _claim(repo, "comp-deadline")["execution"]["controller_fencing_token"]
+    with repo.transaction() as conn:
+        conn.execute(
+            "INSERT INTO action_intents (plan_id, intent_id, action_sequence, action_type, "
+            "workload_id, payload, status, compensates_intent_id, execution_state, "
+            "execution_started_at, execution_finished_at) VALUES ('comp-deadline', 'comp', 1, "
+            "'SET_REPLICA_COUNT', 'cpu-api', %s, 'APPROVED', 'orig', 'SUCCEEDED', "
+            "clock_timestamp() - interval '2 hours', clock_timestamp() - interval '2 hours')",
+            (Jsonb({"proposed_replicas": 2}),),
+        )
+        conn.execute(
+            "UPDATE action_intents SET execution_state='SUCCEEDED', "
+            "execution_started_at=clock_timestamp()-interval '3 hours', "
+            "execution_finished_at=clock_timestamp()-interval '3 hours' "
+            "WHERE plan_id='comp-deadline' AND intent_id='orig'"
+        )
+        conn.execute("UPDATE plans SET state='COMPENSATING' WHERE plan_id='comp-deadline'")
+        conn.execute(
+            "UPDATE plan_executions SET status='COMPENSATING' WHERE plan_id='comp-deadline'"
+        )
+
+    class Target:
+        supports_workload_execution = False
+
+        def observe_scale(self, _workload: str):
+            raise TargetError("API unavailable")  # recovery can never be observed
+
+    controller = ExecutionController(
+        repo, Target(), FakeHealth(), "controller-a", verification_deadline_seconds=60
+    )
+    controller._reconcile("comp-deadline", token, None)
+    assert _plan_status(repo, "comp-deadline") == "FAILED_SAFE"
+    with repo.transaction() as conn:
+        outcome = conn.execute(
+            "SELECT outcome FROM plan_executions WHERE plan_id = 'comp-deadline'"
+        ).fetchone()["outcome"]
+    assert "compensation-verification-deadline-exceeded" in str(outcome)

@@ -2069,6 +2069,13 @@ def test_live_v2_authenticated_node_drain_partial_crash_recovery(
     ready_workers.sort(key=lambda node: node["metadata"]["name"])
     worker_names = [node["metadata"]["name"] for node in ready_workers]
     assert len(ready_workers) == 4
+    quiet_deadline = time.monotonic() + 180
+    while any(  # Pods of earlier tests may still be terminating and hide drainable Nodes
+        pod["metadata"]["name"].startswith("frw-")
+        for pod in json.loads(kubectl("get", "pods", "-n", namespace, "-o", "json").stdout)["items"]
+    ):
+        assert time.monotonic() < quiet_deadline, "previous test Pods are still terminating"
+        time.sleep(2)
     existing_pods = json.loads(kubectl("get", "pods", "-A", "-o", "json").stdout)["items"]
 
     def can_be_drained(node_name: str) -> bool:
@@ -2846,11 +2853,11 @@ def test_live_v2_authenticated_node_drain_partial_crash_recovery(
             )
             assert cordon["execution_result"]["pre_observation"]["unschedulable_before"] is False
             assert cordon["execution_result"]["target_observation"]["cordon_owned"] is True
-            assert not [
+            assert [
                 key
                 for key in final_node["metadata"].get("annotations", {})
                 if key.startswith("fleetright.io/")
-            ]
+            ] == ["fleetright.io/fencing-token"]  # only the monotonic high-water mark remains
             remaining_names = [
                 pod["metadata"]["name"]
                 for pod in json.loads(kubectl("get", "pods", "-A", "-o", "json").stdout)["items"]

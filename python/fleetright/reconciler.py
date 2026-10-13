@@ -20,6 +20,7 @@ from fleetright.execution import (
 LOG = logging.getLogger("fleetright.execution")
 # shortcut: counts journaled failures, not wall time; upgrade to a deadline if polls get slower.
 NODE_DRAIN_OBSERVATION_ERROR_LIMIT = 60
+NODE_SWEEP_SECONDS = 60
 
 
 class ExecutionController:
@@ -50,6 +51,7 @@ class ExecutionController:
         self.poll_seconds = poll_seconds
         # Wall-clock bound on VERIFYING / drain-wait, anchored on durable journal timestamps so a
         # replacement controller inherits the remaining budget instead of restarting it.
+        self._last_node_sweep = time.monotonic()
         self.verification_deadline_seconds = (
             max(600.0, 4 * readiness_timeout_seconds)
             if verification_deadline_seconds is None
@@ -142,6 +144,7 @@ class ExecutionController:
         return False, None
 
     def run_forever(self, stop: threading.Event) -> None:
+        self._sweep_node_metadata()
         while not stop.is_set():
             try:
                 self.run_once(stop)
@@ -159,6 +162,25 @@ class ExecutionController:
             if token is None:
                 continue
             self._reconcile(row["plan_id"], token, stop)
+        if time.monotonic() - self._last_node_sweep > NODE_SWEEP_SECONDS:
+            self._sweep_node_metadata()
+
+    def _sweep_node_metadata(self) -> None:
+        """Retry releases lost to a crash between a terminal commit and the Node patch."""
+        self._last_node_sweep = time.monotonic()
+        try:
+            with self.repository.transaction() as conn:
+                recent = conn.execute(
+                    "SELECT plan_id, controller_fencing_token FROM plan_executions "
+                    "WHERE finished_at > clock_timestamp() - interval '1 day' AND EXISTS "
+                    "(SELECT 1 FROM action_intents a WHERE a.plan_id = plan_executions.plan_id "
+                    "AND a.action_type = 'CORDON_NODE') ORDER BY finished_at DESC LIMIT 5"
+                ).fetchall()
+        except Exception as error:  # noqa: BLE001 - housekeeping must never stop reconciliation
+            LOG.warning("node metadata sweep failed", extra={"error": str(error)[:200]})
+            return
+        for row in recent:
+            self._release_node_metadata(row["plan_id"], row["controller_fencing_token"])
 
     def _claim(self, execution: dict[str, Any]) -> int | None:
         plan_id = execution["plan_id"]
@@ -798,6 +820,18 @@ class ExecutionController:
                     return
                 self._transition(plan_id, token, "EXECUTING", "VERIFYING", {"actions": "observed"})
             elif phase == "COMPENSATING":
+                with self.repository.transaction() as conn:
+                    finished = conn.execute(
+                        "SELECT max(execution_finished_at) AS finished FROM action_intents "
+                        "WHERE plan_id = %s AND compensates_intent_id IS NOT NULL",
+                        (plan_id,),
+                    ).fetchone()["finished"]
+                if (
+                    finished is not None
+                    and time.time() - finished.timestamp() > self.verification_deadline_seconds
+                ):
+                    self._fail_safe(plan_id, token, "compensation-verification-deadline-exceeded")
+                    return
                 try:
                     recovery = self._observe_recovery(plan_id)
                 except TargetNotFound:
