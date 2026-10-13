@@ -1148,9 +1148,14 @@ def test_v2_plan_publishes_journaled_replacement_intent(
     reason="set FLEETRIGHT_RUN_KIND_E2E=1 for live API-to-workload execution",
 )
 @pytest.mark.parametrize(
-    ("takeover_after_eviction_acceptance", "health_regression"),
-    [(False, False), (True, False), (False, True)],
-    ids=["api-evacuation", "takeover-held-response", "health-compensation"],
+    ("takeover_after_eviction_acceptance", "health_regression", "unplaceable_recovery"),
+    [(False, False, False), (True, False, False), (False, True, False), (False, True, True)],
+    ids=[
+        "api-evacuation",
+        "takeover-held-response",
+        "health-compensation",
+        "health-compensation-unplaceable",
+    ],
 )
 def test_live_v2_api_journal_controller_prepares_replacement(
     clean_database: Database,
@@ -1158,6 +1163,7 @@ def test_live_v2_api_journal_controller_prepares_replacement(
     tmp_path: Path,
     takeover_after_eviction_acceptance: bool,
     health_regression: bool,
+    unplaceable_recovery: bool,
 ) -> None:
     from test_evacuation_v2 import _v2_snapshot
 
@@ -1205,6 +1211,10 @@ def test_live_v2_api_journal_controller_prepares_replacement(
         )
     ]
     assert len(workers) >= 4
+    if health_regression and unplaceable_recovery and len(workers) > 4:
+        pytest.skip("the capacity-exhaustion case requires exactly the four-worker lab")
+    if health_regression and not unplaceable_recovery and len(workers) < 5:
+        pytest.skip("successful compensation requires a free destination (five workers)")
     schedulable_workers = workers[:5]
     placement_nodes = list(schedulable_workers)
     # Keep two real destination domains available in the four-worker lab.
@@ -1531,7 +1541,8 @@ def test_live_v2_api_journal_controller_prepares_replacement(
                 }
 
         health_observer = HealthyObserver()
-        monkeypatch.setenv("FLEETRIGHT_READINESS_TIMEOUT_SECONDS", "300")
+        readiness_timeout = "60" if unplaceable_recovery else "300"
+        monkeypatch.setenv("FLEETRIGHT_READINESS_TIMEOUT_SECONDS", readiness_timeout)
         app = create_app(
             clean_database.repository,
             tokens=tokens,
@@ -1541,7 +1552,7 @@ def test_live_v2_api_journal_controller_prepares_replacement(
             health_observer=health_observer,
             start_execution_worker=False,
         )
-        assert app.state.execution_controller.readiness_timeout_seconds == 300
+        assert app.state.execution_controller.readiness_timeout_seconds == int(readiness_timeout)
         with TestClient(app) as client:
             optimized = client.post(
                 "/v1/optimize",
@@ -1669,7 +1680,13 @@ def test_live_v2_api_journal_controller_prepares_replacement(
                     json.dumps({"metadata": {"finalizers": []}}),
                     check=False,
                 )
-            expected_status = "COMPENSATED" if health_regression else "COMMITTED"
+            expected_status = (
+                "FAILED_SAFE"
+                if unplaceable_recovery
+                else "COMPENSATED"
+                if health_regression
+                else "COMMITTED"
+            )
             deadline = time.monotonic() + 300
             while time.monotonic() < deadline:
                 (takeover_controller or app.state.execution_controller).run_once()
@@ -1682,9 +1699,10 @@ def test_live_v2_api_journal_controller_prepares_replacement(
                 latest = progress[-1].get("result", {}) if progress else {}
                 if detail["execution"]["status"] == expected_status:
                     break
-                if detail["execution"]["status"] == "FAILED_SAFE" or (
-                    detail["execution"]["status"] == "COMPENSATING" and not health_regression
-                ):
+                if (
+                    detail["execution"]["status"] == "FAILED_SAFE"
+                    and expected_status != "FAILED_SAFE"
+                ) or (detail["execution"]["status"] == "COMPENSATING" and not health_regression):
                     progress_stages = [
                         item["result"].get("stage")
                         for item in progress[-10:]
@@ -1749,6 +1767,20 @@ def test_live_v2_api_journal_controller_prepares_replacement(
                     f"target={target_state}, commands={target_commands[-15:]}"
                 )
             assert detail["execution"]["status"] == expected_status, detail
+            if unplaceable_recovery:
+                _assert_unplaceable_recovery_failed_safe(
+                    clean_database,
+                    target,
+                    kubectl,
+                    client,
+                    raw_tokens,
+                    health_observer,
+                    plan["plan_id"],
+                    workload_id,
+                    action["intent_id"],
+                    len(eviction_attempts),
+                )
+                return
             if not health_regression:
                 assert action.get("execution_state") == "SUCCEEDED"
             stages = [
@@ -1885,6 +1917,99 @@ def test_live_v2_api_journal_controller_prepares_replacement(
             check=False,
             timeout=60,
         )
+
+
+def _assert_unplaceable_recovery_failed_safe(
+    database: Database,
+    target: FleetRightWorkloadTarget,
+    kubectl: object,
+    client: TestClient,
+    raw_tokens: dict[str, str],
+    health_observer: object,
+    plan_id: str,
+    workload_id: str,
+    retirement_intent: str,
+    evictions_before: int,
+) -> None:
+    """Live: with no free destination the recovery Pod stays Pending and the plan fails safe."""
+
+    def snapshot() -> dict[str, object]:
+        uid = target.observe_scale(workload_id)["uid"]
+        pods = json.loads(
+            kubectl(  # type: ignore[operator]
+                "get", "pods", "-n", "fleetright-v2", "-l", f"fleetright.io/workload-uid={uid}",
+                "-o", "json",
+            ).stdout
+        )["items"]  # fmt: skip
+        with database.repository.transaction() as conn:
+            execution = conn.execute(
+                "SELECT status, outcome FROM plan_executions WHERE plan_id = %s", (plan_id,)
+            ).fetchone()
+            plan_state = conn.execute(
+                "SELECT state FROM plans WHERE plan_id = %s", (plan_id,)
+            ).fetchone()["state"]
+            recovery = conn.execute(
+                "SELECT intent_id, execution_state, execution_error FROM action_intents "
+                "WHERE plan_id = %s AND compensates_intent_id = %s",
+                (plan_id, retirement_intent),
+            ).fetchall()
+        return {
+            "uids": sorted(p["metadata"]["uid"] for p in pods),
+            "pending": [p for p in pods if p["status"].get("phase") == "Pending"],
+            "ready": sum(
+                any(
+                    c["type"] == "Ready" and c["status"] == "True"
+                    for c in p["status"]["conditions"]
+                )
+                for p in pods
+                if p["status"].get("phase") == "Running"
+            ),
+            "execution": execution,
+            "plan_state": plan_state,
+            "recovery": recovery,
+        }
+
+    before = snapshot()
+    assert before["execution"]["status"] == "FAILED_SAFE"  # type: ignore[index]
+    assert before["plan_state"] == "FAILED_SAFE"
+    # Durable, specific reason; never a false COMPENSATED.
+    outcome = before["execution"]["outcome"]  # type: ignore[index]
+    assert outcome["COMPENSATING"] == {"observed_health": "regressed"}, outcome
+    assert outcome["FAILED_SAFE"]["reason"] in {
+        "readiness-timeout",
+        "compensation-readiness-timeout",
+    }
+    assert health_observer.regression_sent is True  # type: ignore[attr-defined]
+    assert len(before["recovery"]) == 1 and before["recovery"][0]["execution_state"] == "FAILED"  # type: ignore[arg-type]
+    assert before["recovery"][0]["execution_error"] == "readiness-timeout"  # type: ignore[index]
+    # Exactly one recovery Pod was requested; it could not be scheduled; 3 serving Pods remain.
+    assert len(before["uids"]) == 4 and before["ready"] == 3  # type: ignore[arg-type]
+    pending = before["pending"]
+    assert len(pending) == 1 and not pending[0]["spec"].get("nodeName")  # type: ignore[index,arg-type]
+    assert any(
+        c.get("reason") == "Unschedulable"
+        for c in pending[0]["status"]["conditions"]  # type: ignore[index]
+    )
+    assert evictions_before == 1  # no additional eviction was ever dispatched
+    # A replacement controller finds nothing to do: no new Pods, no retries, no eviction.
+    restart = ExecutionController(
+        database.repository,
+        target,
+        health_observer,
+        f"unplaceable-restart-{uuid.uuid4().hex[:8]}",
+        readiness_timeout_seconds=60,
+    )
+    for _ in range(6):
+        restart.run_once()
+        time.sleep(0.5)
+    after = snapshot()
+    assert after["uids"] == before["uids"]
+    assert after["execution"]["status"] == "FAILED_SAFE"  # type: ignore[index]
+    assert after["recovery"] == before["recovery"]
+    detail = client.get(
+        f"/v1/plans/{plan_id}", headers={"Authorization": f"Bearer {raw_tokens['viewer']}"}
+    ).json()
+    assert detail["execution"]["status"] == "FAILED_SAFE"
 
 
 @pytest.mark.skipif(
@@ -2715,6 +2840,17 @@ def test_live_v2_authenticated_node_drain_partial_crash_recovery(
             final_node = json.loads(kubectl("get", "node", source_node_id, "-o", "json").stdout)
             assert final_node["metadata"]["uid"] == source_node_uid
             assert final_node["spec"].get("unschedulable") is True
+            # Ownership is durable in the journal; transient Node metadata is gone, cordon stays.
+            cordon = next(
+                x for x in detail["candidate_actions"] if x["action_type"] == "CORDON_NODE"
+            )
+            assert cordon["execution_result"]["pre_observation"]["unschedulable_before"] is False
+            assert cordon["execution_result"]["target_observation"]["cordon_owned"] is True
+            assert not [
+                key
+                for key in final_node["metadata"].get("annotations", {})
+                if key.startswith("fleetright.io/")
+            ]
             remaining_names = [
                 pod["metadata"]["name"]
                 for pod in json.loads(kubectl("get", "pods", "-A", "-o", "json").stdout)["items"]
