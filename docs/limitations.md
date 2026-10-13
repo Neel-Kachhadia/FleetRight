@@ -1,5 +1,60 @@
 # Current limitations
 
+## v1.0.0 limitations (authoritative; supersedes any contradictory milestone text below)
+
+Evidence and claims
+- Policy-comparison results are **simulated**: synthetic traces, the declared convex latency model
+  (never calibrated against Docker latency), and a synthetic cost model (`cost-model-v1`). They say
+  nothing about real traffic or cloud bills. No production deployment exists.
+- The tuning set shares trace *families* with four evaluation scenarios (disjoint seeds and load);
+  hold-out is seed-level, not family-level. A first evaluation run was inspected before two fairness
+  additions (see `docs/benchmark-methodology.md`).
+- n = 20 paired seeds per scenario supports large effects only; steady and flash-crowd families are
+  nearly deterministic across seeds, so their intervals say little about sampling variability.
+- Latency is the simulator's per-window p99; there is no per-request latency distribution.
+
+Where FleetRight loses or misses a target (see `docs/RELEASE_REPORT.md`)
+- Versus the tuned HPA-like baseline FleetRight was more expensive in S05, S09, S13, S14 and traded
+  extra SLO-violation windows for lower cost in most other scenarios. It is not shown to dominate.
+- Predictive FleetRight was never better than reactive (ablation: 0 better, 5 worse, 8 trade-offs, 2 no
+  difference). With the bundled models the 95% bound is wide (mean overhead 0.7-1.1) and the seasonal model
+  cannot activate at a 60 s cadence (needs 48 distinct hours).
+- All online policies, FleetRight included, take hard-SLO violations on a 5x single-window flash crowd;
+  FleetRight reactive also on slow-start (S08), bursty multi-tenant (S09) and correlated surges (S11);
+  predictive also on S05 and S15. FleetRight has no online recalibration for silent capacity drift
+  (S15: 71 soft violation windows/seed for reactive versus 1.4 for HPA-like).
+- The C++ planner sizes replicas at 100% of profile-effective capacity. The published FleetRight numbers
+  use a tuned 60-70% utilization target that the planner does not expose; the shipped sizing alone had
+  154 hard + 3,611 soft violation windows of 14,400 on the tuning set. Operators obtain headroom only via
+  the effective-capacity factors.
+- With an unhealthy in-use node (S16) the planner returns infeasible instead of an emergency repair plan.
+- Optimizer: the greedy + bounded local search is not globally optimal. After the Prompt 3 staging rule
+  (no move onto a node that currently hosts a sibling replica) it was optimal in 23/30 small oracle
+  instances with a non-binding move budget (mean gap +7.6%, max +40%). The exact oracle covers one
+  workload, no N-1, at most 12 nodes. The planner and verifier are single-threaded; TSan is not applicable.
+- Verifier latency margin is 17% (20.7 ms p95 vs 25 ms); a loaded host measured 26.0 ms. The planner
+  margin is 21% (196.9 vs 250 ms).
+
+Execution (Kubernetes) - scope and unproven areas
+- Supported: `SCALE_UP`, `MOVE_REPLICA`, `EVICT_SOURCE`, `DRAIN_NODE` (2-4 Pods), `COMPENSATE` on the
+  `FleetRightWorkload` target, one Kind lab. Disabled: `SCALE_DOWN`. Unsupported: `DEACTIVATE_NODE`,
+  resource resizing, Deployments.
+- Not proven live: a real Kubernetes API outage; the three verification-deadline outcomes (10-minute
+  waits); an unsupported Pod owner during a live drain; the `get secrets` denial probe (needs an executor
+  kubeconfig); the 6-node compensation-with-capacity case in this phase. PostgreSQL connection loss is
+  proven deterministically only.
+- Compensation needs a free destination; otherwise `FAILED_SAFE` leaves a Pending recovery Pod and a raised
+  desired count for an operator. A PDB-blocked retirement waits without a deadline. FleetRight never
+  uncordons a Node. Deadlines mix controller wall-clock with PostgreSQL timestamps.
+- The control API is a loopback-bound local process with static bearer tokens, no TLS, no rate limiting.
+  It is not hardened for network exposure.
+- The live suites share one lab and drained Nodes stay cordoned; reset the lab between modules.
+
+## Historical limitations by milestone (kept for the record)
+
+Statements below were true when written. Where they say eviction, drain, compensation or staged
+replacement is unimplemented, Milestone 4 superseded them (`docs/V2_EXECUTION_PROGRESS.md`, 2026-10-13).
+
 - Current-host Docker calibration generated three hashed profiles at one resource allocation and
   one concurrency-two load point per service, with three 60-second repeats. This provides a narrow
   measured envelope; it does not locate a saturation boundary or establish behavior at other
