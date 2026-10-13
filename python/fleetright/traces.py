@@ -65,6 +65,7 @@ def generate_trace(
     window_ms: int = 60_000,
     workload_ids: tuple[str, ...] = ("cpu-api", "memory-api", "queued-api"),
     base_qps_milli: int = 400_000,
+    jitter_permille: int = 0,
 ) -> Trace:
     known = {
         "steady",
@@ -106,6 +107,8 @@ def generate_trace(
             elif family == "slow_start":
                 factor = 1_000
             jitter = rng.randint(-20, 20) if family in {"bursty", "noisy_tenant"} else 0
+            if jitter_permille:  # seeded multiplicative noise for every family
+                jitter += rng.randint(-jitter_permille, jitter_permille)
             qps = max(0, base_qps_milli * max(0, factor + jitter) // 1_000)
             concurrency = max(1, qps * (25 + workload_index * 10) // 1_000_000)
             points.append(DemandPoint(index * window_ms, qps, concurrency, memory))
@@ -116,6 +119,16 @@ def generate_trace(
     )
     trace = Trace(TRACE_SCHEMA_VERSION, family, seed, window_ms, tuple(result), metadata, "")
     return Trace(**{**trace.__dict__, "content_sha256": _content_hash(trace.as_dict(False))})
+
+
+def transform_trace(trace: Trace, family: str, change) -> Trace:
+    """Rebuild a hashed trace with change(index, point) -> DemandPoint applied to every point."""
+    workloads = tuple(
+        WorkloadTrace(item.workload_id, tuple(change(i, p) for i, p in enumerate(item.points)))
+        for item in trace.workloads
+    )
+    result = Trace(**{**trace.__dict__, "family": family, "workloads": workloads})
+    return Trace(**{**result.__dict__, "content_sha256": _content_hash(result.as_dict(False))})
 
 
 def validate_trace(trace: Trace) -> bool:

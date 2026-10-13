@@ -25,6 +25,10 @@ class SimulationConfig:
     queue_limit_milli_requests: int = 50_000
     replica_cost_micros_per_hour: int = 1_000
     injected_error_ppm: int = 0
+    # (from_time_ms, scale_ppm): true capacity silently drifts from the profiled value.
+    capacity_drift: tuple[int, int] | None = None
+    # (at_time_ms, replicas_lost): a node failure removes ready replicas; they restart normally.
+    replica_loss: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -122,8 +126,27 @@ def simulate(
             continue
 
         index, point = payload  # type: ignore[misc]
+        if config.replica_loss and point.time_ms == config.replica_loss[0]:
+            lost = min(ready, config.replica_loss[1])
+            ready -= lost
+            heapq.heappush(
+                events,
+                (
+                    time_ms
+                    + config.actuation_delay_ms
+                    + config.node_activation_ms
+                    + config.startup_ms
+                    + config.readiness_stabilization_ms,
+                    sequence,
+                    "ready",
+                    lost,
+                ),
+            )
+            sequence += 1
         arrivals = point.qps_milli * trace.window_ms // 1_000
         capacity = config.safe_qps_per_replica_milli * ready
+        if config.capacity_drift and point.time_ms >= config.capacity_drift[0]:
+            capacity = capacity * config.capacity_drift[1] // 1_000_000
         served = min(queue + arrivals, capacity * trace.window_ms // 1_000)
         next_queue = max(0, queue + arrivals - served)
         growth = (next_queue - queue) * 1_000 // max(1, trace.window_ms)
