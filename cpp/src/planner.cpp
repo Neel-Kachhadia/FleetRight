@@ -1391,7 +1391,8 @@ static v1::OptimizationPlan PlanWithProfileOverride(const OptimizationSnapshot &
     const auto workload = workload_by_id.find(replica.workload_id);
     if (workload == workload_by_id.end())
       continue;
-    std::vector<std::tuple<bool, std::uint64_t, std::string>> choices;
+    // Only the minimum is used; pointers avoid copying node ids and a full sort per replica.
+    std::vector<std::tuple<bool, std::uint64_t, const std::string *>> choices;
     for (auto &[node_id, use] : uses) {
       if (!TaintsAllowed(*use.node, *workload->second) ||
           use.workloads.contains(replica.workload_id))
@@ -1406,7 +1407,7 @@ static v1::OptimizationPlan PlanWithProfileOverride(const OptimizationSnapshot &
       if (!topology_ok)
         continue;
       const bool movement = !replica.current_node.empty() && replica.current_node != node_id;
-      choices.emplace_back(movement, FragmentationScore(sum, use.capacity), node_id);
+      choices.emplace_back(movement, FragmentationScore(sum, use.capacity), &node_id);
     }
     if (choices.empty()) {
       plan.set_feasible(false);
@@ -1416,8 +1417,12 @@ static v1::OptimizationPlan PlanWithProfileOverride(const OptimizationSnapshot &
       plan.set_plan_id(MessageSha256(plan));
       return plan;
     }
-    std::sort(choices.begin(), choices.end());
-    const auto &destination = std::get<2>(choices.front());
+    // Same (movement, score, node id) order the previous full sort used; node ids are unique.
+    const auto &destination = *std::get<2>(*std::min_element(
+        choices.begin(), choices.end(), [](const auto &left, const auto &right) {
+          return std::tie(std::get<0>(left), std::get<1>(left), *std::get<2>(left)) <
+                 std::tie(std::get<0>(right), std::get<1>(right), *std::get<2>(right));
+        }));
     auto &use = uses.at(destination);
     ProtoResourceVector sum;
     if (!AddResource(use.used, replica.resources, &sum)) {
