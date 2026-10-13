@@ -451,6 +451,34 @@ def _describe(values: list[float]) -> dict:
     }
 
 
+PAIRED_METRICS = (
+    "node_cost_micros",
+    "soft_violation_windows",
+    "hard_violation_windows",
+    "slo_violation_windows",
+)
+
+
+def _metric(row: dict, name: str) -> float:
+    if name == "slo_violation_windows":
+        return float(row["soft_violation_windows"] + row["hard_violation_windows"])
+    return float(row[name])
+
+
+def verdict(pair: dict) -> str:
+    """Deterministic label from the paired 95% CIs: cost and total SLO-violation windows."""
+    cost, slo = pair["node_cost_micros"]["ci95"], pair["slo_violation_windows"]["ci95"]
+    cheaper, costlier = cost[1] < 0, cost[0] > 0
+    safer, riskier = slo[1] < 0, slo[0] > 0
+    if (cheaper and not riskier) or (safer and not costlier):
+        return "FR better" if not (cheaper and safer) else "FR better (cost and SLO)"
+    if (costlier and not safer) or (riskier and not cheaper):
+        return "FR worse"
+    if (cheaper and riskier) or (costlier and safer):
+        return "trade-off"
+    return "no significant difference"
+
+
 def summarize(rows: list[dict]) -> dict:
     rng = random.Random(20261013)
     out: dict = {"scenarios": {}}
@@ -478,19 +506,21 @@ def summarize(rows: list[dict]) -> dict:
         pairs.append(("fleetright_predictive_same_headroom", "fleetright_reactive"))
         for fr, other in pairs:
             pair = {}
-            for metric in ("node_cost_micros", "soft_violation_windows", "hard_violation_windows"):
-                diffs = [
-                    float(by_key[(sid, s, fr)][metric]) - float(by_key[(sid, s, other)][metric])
-                    for s in seeds
-                ]  # fmt: skip
+            for metric in PAIRED_METRICS:
+                mine = [_metric(by_key[(sid, x, fr)], metric) for x in seeds]
+                theirs = [_metric(by_key[(sid, x, other)], metric) for x in seeds]
+                diffs = [a - b for a, b in zip(mine, theirs, strict=True)]
                 low, high = bootstrap_ci(diffs, rng)
-                base_mean = statistics.fmean(float(by_key[(sid, s, other)][metric]) for s in seeds)
+                base_mean = statistics.fmean(
+                    _metric(by_key[(sid, x, other)], metric) for x in seeds
+                )
                 pair[metric] = {
                     "mean_diff_fr_minus_other": statistics.fmean(diffs),
                     "ci95": [low, high],
                     "relative_diff": statistics.fmean(diffs) / base_mean if base_mean else None,
                     "significant": low > 0 or high < 0,
                 }
+            pair["verdict"] = verdict(pair)
             scenario["paired"][f"{fr}__vs__{other}"] = pair
         out["scenarios"][sid] = scenario
     return out
@@ -520,7 +550,8 @@ def render_report(summary: dict, names: dict[str, str], tuned: dict, manifest: d
         "| scale acts | idle CPU |"
     )
     pair_head = (
-        "| FleetRight vs | cost diff [95% CI] | rel. | soft diff [95% CI] | hard diff [95% CI] |"
+        "| FleetRight vs | cost diff [95% CI] | rel. | SLO-violation windows diff [95% CI] "
+        "| hard diff [95% CI] | verdict |"
     )
     for sid, scenario in summary["scenarios"].items():
         lines += [f"## {sid} {names[sid]}", "", head, "|---|---:|---:|---:|---:|---:|---:|"]
@@ -532,11 +563,11 @@ def render_report(summary: dict, names: dict[str, str], tuned: dict, manifest: d
                 f"{_fmt(m['latency_p99_window_max_ms']['mean'], 0)} | "
                 f"{_fmt(m['scale_actions']['mean'])} | {m['idle_cpu_fraction']['mean']:.2f} |"
             )
-        lines += ["", pair_head, "|---|---:|---:|---:|---:|"]
+        lines += ["", pair_head, "|---|---:|---:|---:|---:|---|"]
         for key, pair in scenario["paired"].items():
             fr, other = key.split("__vs__")
             cells = []
-            for metric in ("node_cost_micros", "soft_violation_windows", "hard_violation_windows"):
+            for metric in ("node_cost_micros", "slo_violation_windows", "hard_violation_windows"):
                 p = pair[metric]
                 low, high = p["ci95"]
                 star = "*" if p["significant"] else ""
@@ -547,13 +578,61 @@ def render_report(summary: dict, names: dict[str, str], tuned: dict, manifest: d
             rel_text = "" if rel is None else f"{rel:+.1%}"
             label = fr.replace("fleetright_", "FR-")
             lines.append(
-                f"| {label} vs {other} | {cells[0]} | {rel_text} | {cells[1]} | {cells[2]} |"
+                f"| {label} vs {other} | {cells[0]} | {rel_text} | {cells[1]} | {cells[2]} "
+                f"| {pair['verdict']} |"
             )
         lines.append("")
     lines.append(
         "`*` = 95% paired-bootstrap CI (10,000 resamples over seeds) excludes 0. "
         "Diff = FleetRight minus other; a negative cost/violation diff favours FleetRight."
     )
+    return "\n".join(lines) + "\n"
+
+
+HEADLINE = (
+    ("fleetright_reactive", ("static_peak_reserve", "naive_threshold", "hpa_like")),
+    ("fleetright_predictive", ("static_peak_reserve", "naive_threshold", "hpa_like")),
+    ("fleetright_predictive", ("fleetright_reactive", "fleetright_predictive_same_headroom")),
+)
+
+
+def render_headline(summary: dict, names: dict[str, str]) -> str:
+    """One row per scenario; cell = relative node-cost diff, SLO-violation-window diff, verdict."""
+    lines = [
+        "# Headline comparison (SIMULATED, paired by seed)",
+        "",
+        "Cell = `relative node-cost difference | mean SLO-violation-window difference | verdict` "
+        "for FleetRight minus the column policy. Negative favours FleetRight. Verdicts use the "
+        "paired 95% bootstrap CIs; see comparison.md for intervals and per-policy tables. "
+        "`FR-predictive vs FR-predictive_same_headroom` is not shown; that ablation is in "
+        "comparison.md.",
+        "",
+    ]
+    for fr, others in HEADLINE:
+        lines += [
+            f"## {fr}",
+            "",
+            "| scenario | " + " | ".join(others) + " |",
+            "|---|" + "---|" * len(others),
+        ]
+        tally = {other: {} for other in others}
+        for sid, scenario in summary["scenarios"].items():
+            cells = []
+            for other in others:
+                pair = scenario["paired"][f"{fr}__vs__{other}"]
+                rel = pair["node_cost_micros"]["relative_diff"]
+                slo = pair["slo_violation_windows"]["mean_diff_fr_minus_other"]
+                cells.append(f"{rel:+.0%} \| {slo:+.1f} \| {pair['verdict']}")
+                tally[other][pair["verdict"]] = tally[other].get(pair["verdict"], 0) + 1
+            lines.append(f"| {sid} {names[sid]} | " + " | ".join(cells) + " |")
+        lines.append(
+            "| **tally** | "
+            + " | ".join(
+                "; ".join(f"{v}: {n}" for v, n in sorted(tally[o].items())) for o in others
+            )
+            + " |"
+        )
+        lines.append("")
     return "\n".join(lines) + "\n"
 
 
@@ -603,6 +682,7 @@ def run_all(output: Path, workers: int, tuned_path: Path | None) -> Path:
     (run_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
     (run_dir / "comparison.md").write_text(render_report(summary, names, tuned, manifest))
+    (run_dir / "headline.md").write_text(render_headline(summary, names))
     write_csv(run_dir / "summary.csv", summary, names)
     return run_dir
 
@@ -636,7 +716,7 @@ def write_csv(path: Path, summary: dict, names: dict[str, str]) -> None:
 def publish(run_dir: Path, destination: Path) -> None:
     """Copy the compact, reviewable artifacts; raw results are gzipped with a recorded checksum."""
     destination.mkdir(parents=True, exist_ok=True)
-    for name in ("manifest.json", "tuning.json", "comparison.md", "summary.csv"):
+    for name in ("manifest.json", "tuning.json", "comparison.md", "headline.md", "summary.csv"):
         shutil.copy2(run_dir / name, destination / name)
     with (
         (run_dir / "results.jsonl").open("rb") as source,

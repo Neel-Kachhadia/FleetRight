@@ -43,3 +43,92 @@ metric-ratio targeting, deadband, scale-up/down velocity, downscale stabilizatio
 scale-in exclusion, and conservative missing metrics. It is representative reactive behavior, not a
 claim of byte-for-byte Kubernetes HPA equivalence. The lookahead schedule is offline and not
 deployable policy.
+
+## Prompt 3 qualification protocol (v1.0.0)
+
+Everything in this section is **simulated or deterministic-fixture evidence**. None of it is production
+or cloud-billing evidence, and none of it replaces the live Kubernetes qualification in
+`docs/V2_EXECUTION_PROGRESS.md`. Reproduce with `scripts/run_qualification.sh`; the committed
+artifacts are in `docs/benchmarks/v1.0.0/`.
+
+### Evidence categories
+
+| Category | What it is | Where |
+|---|---|---|
+| SIM-PAIRED | Seeded synthetic traces through the declared convex simulator, all policies on the identical trace | `fleetright.qualify`, scenarios S01-S06, S08-S16 |
+| PLANNER-REAL | The real C++ planner and independent verifier on deterministic snapshots (no simulator) | `fleetright.qualify_placement` (S07, S16 placement, S17, S18, E01-E05), `fleetright.optimizer_quality` |
+| FORECAST | Causal evaluation of the existing forecast models on the same synthetic series | `fleetright.qualify_forecast` |
+| LIVE-K8S | Real Kind API server operations | `python/tests/test_prompt2b_live_*.py` (S19 controller restart, S20 node-drain interruption) |
+
+No scenario uses captured production traces or real load generation; the Docker calibration profiles
+from Phase 1 are narrow (see `docs/limitations.md`) and are not used by the paired runs.
+
+### Fair-comparison controls
+
+* Same trace object (content hash recorded per case), machine catalog, per-workload effective capacity
+  (`safe point x profile-confidence x model-accuracy x degraded-cluster factors`, floored once), SLOs,
+  min/max replicas, startup/actuation delays, warm-up and evaluation window for every policy.
+* Every policy observes the same metric window (cpu ratio, qps, concurrency, ready and starting
+  replicas). FleetRight receives no information the baselines lack. The offline lookahead policy sees
+  future demand and is labelled **offline oracle (upper bound), not a deployable competitor**.
+* Warm-up: windows 0-119 run for all policies but are not scored; windows 120-359 (240 x 60 s) are scored.
+  120 windows are the minimum history the production forecast gate needs, so predictive FleetRight is
+  not handicapped by cold start.
+* Seeds: evaluation seeds 100-119 (n = 20 paired traces per scenario); tuning seeds 1-5. Every trace has
+  +-3% seeded multiplicative jitter so deterministic families still vary across seeds.
+
+### Policies
+
+| Policy | Definition |
+|---|---|
+| `static_peak_reserve` | Replicas for the trace's planned peak plus a reserve (tuned, see below) |
+| `naive_threshold` | +1/-1 replica on CPU-ratio thresholds with consecutive-window hysteresis (existing `ThresholdBaseline`) |
+| `hpa_like` | Target tracking on cpu, qps and concurrency with tolerance, stabilization window, bounded velocity (existing `HpaLikeBaseline`) |
+| `fleetright_reactive` | The planner sizing rule (`RequiredReplicas`, availability floor, +1 for N-1) on observed demand; scale-in gated by the production `scale_in_eligibility` rule. `tests/test_qualify.py` checks the rule against the C++ planner on random demands |
+| `fleetright_predictive` | Reactive, plus the 95% upper bound from `forecast_decision` (EWMA-trend model, horizon = actuation + startup lead). Falls back to reactive on insufficient history, stale, low-confidence or uncalibrated forecasts. The forecast can only add capacity |
+| `fleetright_predictive_same_headroom` | Ablation: predictive at the reactive policy's tuned knob, isolating the forecast effect |
+| `offline_lookahead_oracle` | Existing offline lookahead at 55% target utilization (upper bound) |
+
+### Tuning and hold-out
+
+Each policy has exactly one tunable knob (static reserve, threshold, HPA target, FleetRight target
+utilization). Knobs are chosen **once** on separate tuning runs (different seeds, lower base load, four
+trace families: steady, ramp, diurnal, bursty) with one rule applied to every policy: the cheapest knob
+whose hard+soft violation windows are at most 3% of scored workload-windows (otherwise fewest
+violations). The evaluation scenarios then use the frozen knobs. The tuning *families* overlap
+evaluation families S01-S03/S05; seeds and load level are disjoint. This is a documented weakness:
+it is seed-level, not family-level, hold-out. The first tuning rule (zero hard-violation windows) was
+unattainable for every reactive policy and was replaced before any evaluation data was generated.
+
+### Metrics
+
+* Cost: `cost-model-v1`, **synthetic** prices (demo catalog, `small` node = 50,000 micro-USD/h). Replicas are
+  packed first-fit-decreasing onto `small` nodes with the planner's one-replica-per-workload-per-node
+  rule and 5% headroom; node-hours and cost follow from the packed node count per window. Also reported:
+  replica-hours, idle CPU/memory fraction, provisioned/required replicas, cost per million successful
+  requests, scaling actions, replicas added, node-release events (a proxy for drained nodes), longest
+  capacity gap.
+* SLO: per workload-window. **Hard** violation = error rate above the workload error SLO (overload or
+  queue overflow) or ready replicas below the availability floor. **Soft** violation = window p99 above
+  the latency SLO. Latency percentiles are percentiles of the simulator's per-window p99 series; the
+  simulator has no per-request latency. Individual violation windows are retained in `results.jsonl`.
+* Statistics: per-seed paired differences (FleetRight minus other); percentile bootstrap, 10,000
+  resamples over seeds, fixed RNG seed, 95% CI. Verdict rule (`qualify.verdict`): cost and total
+  violation windows; "better/worse" requires a CI excluding 0 on one axis and not significantly worse on
+  the other; opposite significant signs are a "trade-off". No p-values are reported. n = 20 supports
+  large effects only; scenarios whose traces are identical across seeds (steady, flash crowd) have
+  near-zero between-seed variance and their CIs are correspondingly tight but reflect little sampling
+  variability.
+* A lower cost is not an improvement when it comes with significantly more violations (verdict rule).
+
+### Optimizer performance contract
+
+Direct C++ API timings (protobuf loaded once), Release build, 1,000 workloads / 500 nodes / 1 extra
+profile alternative; planner target 250 ms p95, verifier target 25 ms p95, 100 measured iterations
+(`scripts/run_benchmarks.sh --iterations 100`). The first iteration is not discarded separately;
+the p50/p95/p99/max are over all iterations. Peak RSS is a single CLI run under GNU `time`.
+
+### Not covered
+
+Real traffic, real cloud prices, multi-cluster behaviour, per-request latency, noisy-neighbour
+interference at the kernel level (S10 is demand-side only), and long-running soak behaviour.
