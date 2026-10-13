@@ -24,16 +24,19 @@ reproduce: `scripts/run_qualification.sh`.
 * **Cost and SLO are a trade-off map, not a win.** Against tuned baselines on 15 paired simulated
   scenarios (n = 20 seeds each), reactive FleetRight had a median node-cost difference of
   **-8.6% vs HPA-like, -18.8% vs naive threshold, -12.1% vs static peak** but with *more* SLO-violation
-  windows in the scenarios where it was cheaper (the "trade-off" verdicts). Verdict tallies (cost and total violation windows, 95% paired-bootstrap):
-  vs HPA-like 6 better / 2 worse / 7 trade-off; vs threshold 6 / 1 / 8; vs static peak 4 / 1 / 7 (+3 no
-  significant difference). Predictive FleetRight did **not** improve on reactive: 3 worse, 12 trade-offs,
-  0 better. Part of FleetRight's cost advantage comes from a tuned 60-70% utilization target that the C++
+  windows in the scenarios where it was cheaper (the "trade-off" verdicts). Verdict tallies (cost, total violation windows and hard violations, 95% paired-bootstrap; a significantly
+  higher hard-violation count always counts against FleetRight): vs HPA-like 6 better / 3 worse /
+  6 trade-off; vs threshold 6 / 2 / 7; vs static peak 2 better / 1 worse / 3 no significant difference /
+  9 trade-off (4 of them because FleetRight takes hard violations that static peak never does).
+  Predictive FleetRight did **not** improve on reactive: 5 worse, 10 trade-offs, 0 better. Part of FleetRight's cost advantage comes from a tuned 60-70% utilization target that the C++
   planner does not expose (Section 4).
 * **Hard constraints.** Over all scenarios, static peak and the offline oracle had zero hard-violation
   windows; reactive FleetRight had hard violations in S04, S08, S09, S11, predictive also in S05 and S15,
   HPA-like in five scenarios. A policy with any hard-violating seed is **not classified successful** in that
-  scenario, whatever its cost.
-* **Execution safety (live).** Kind qualification re-run in this phase: 15 live tests passed (admission
+  scenario, whatever its cost. Scenarios free of hard violations: static peak 15/15, offline oracle 15/15,
+  naive threshold 11/15, **FleetRight reactive 11/15**, HPA-like 10/15, FleetRight predictive 9/15.
+* **Execution safety (live).** Kind qualification re-run in this phase (at c88f24b, the first commit of the phase; the execution path is
+  unchanged since, see `PROMPT3_QUALIFICATION.md`): 15 live tests passed (admission
   negatives, node ownership, replacement + PDB permit/deny, lost/held CREATE across takeover, drain
   variants including PDB-blocked, 4-Pod drain with controller kill and takeover, API evacuation, held
   Eviction, unplaceable compensation) plus 3 Docker E2E. Two gaps remain unproven live: PostgreSQL
@@ -116,7 +119,7 @@ the production gate returns the reactive fallback with `FORECAST_INSUFFICIENT_HI
 observations and `FORECAST_STALE` for old data (checked).
 
 Decision impact (ablation = predictive at reactive's knob; `headline.md`): predictive cost +0% to +42% and
-fewer violation windows in 8 scenarios (trade-off), worse on both axes in 5, no significant difference in
+fewer violation windows in 8 scenarios (trade-off), costlier with no SLO benefit in 5, no significant difference in
 2, **better in none**. Forecasting bought SLO protection at a cost premium; it never dominated reactive in
 this synthetic model, and with its own tuned (less conservative) knob it did worse than reactive in S04,
 S11 and S12.

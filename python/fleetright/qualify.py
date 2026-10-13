@@ -467,17 +467,27 @@ def _metric(row: dict, name: str) -> float:
 
 
 def verdict(pair: dict) -> str:
-    """Deterministic label from the paired 95% CIs: cost and total SLO-violation windows."""
+    """Label from the paired 95% CIs on cost and SLO-violation windows; hard violations dominate.
+
+    A significantly higher hard-violation count (or any hard violation against a policy with none)
+    always counts as riskier, so a lower cost can never be reported as an improvement.
+    """
     cost, slo = pair["node_cost_micros"]["ci95"], pair["slo_violation_windows"]["ci95"]
+    hard = pair["hard_violation_windows"]
+    hard_worse = hard["ci95"][0] > 0
+    hard_better = hard["ci95"][1] < 0
     cheaper, costlier = cost[1] < 0, cost[0] > 0
-    safer, riskier = slo[1] < 0, slo[0] > 0
+    riskier = hard_worse or (slo[0] > 0 and not hard_better)
+    safer = (hard_better or slo[1] < 0) and not hard_worse
     if (cheaper and not riskier) or (safer and not costlier):
-        return "FR better" if not (cheaper and safer) else "FR better (cost and SLO)"
-    if (costlier and not safer) or (riskier and not cheaper):
-        return "FR worse"
-    if (cheaper and riskier) or (costlier and safer):
-        return "trade-off"
-    return "no significant difference"
+        label = "FR better (cost and SLO)" if cheaper and safer else "FR better"
+    elif (costlier and not safer) or (riskier and not cheaper):
+        label = "FR worse"
+    elif (cheaper and riskier) or (costlier and safer):
+        label = "trade-off"
+    else:
+        label = "no significant difference"
+    return label + (" (hard SLO worse)" if hard_worse else "")
 
 
 def summarize(rows: list[dict]) -> dict:
@@ -609,6 +619,26 @@ def render_headline(summary: dict, names: dict[str, str]) -> str:
         "The last table is the forecast ablation: predictive at the reactive policy's own knob.",
         "",
     ]
+    policies = next(iter(summary["scenarios"].values()))["policies"]
+    lines += [
+        "## Success classification (hard SLO)",
+        "",
+        "A policy is *successful* in a scenario only if no seed has a hard-violation window "
+        "(error rate above the error SLO, or ready replicas below the availability floor), "
+        "whatever its cost. Relative verdicts below compare policies, they do not make a "
+        "hard-violating policy successful.",
+        "",
+        "| policy | successful scenarios | scenarios with hard violations |",
+        "|---|---:|---|",
+    ]
+    for policy in policies:
+        bad = [
+            sid for sid, sc in summary["scenarios"].items()
+            if sc["policies"][policy]["hard_violation_seeds"] > 0
+        ]  # fmt: skip
+        total = len(summary["scenarios"])
+        lines.append(f"| {policy} | {total - len(bad)}/{total} | {', '.join(bad) or '-'} |")
+    lines.append("")
     for fr, others in HEADLINE:
         lines += [
             f"## {fr}",
@@ -635,6 +665,19 @@ def render_headline(summary: dict, names: dict[str, str]) -> str:
         )
         lines.append("")
     return "\n".join(lines) + "\n"
+
+
+def render(run_dir: Path) -> None:
+    """Recompute summary, tables and CSV from an existing results.jsonl (no simulation)."""
+    rows = [json.loads(line) for line in (run_dir / "results.jsonl").read_text().splitlines()]
+    tuned = json.loads((run_dir / "tuning.json").read_text())
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    names = {s.sid: s.name for s in SCENARIOS}
+    summary = summarize(rows)
+    (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    (run_dir / "comparison.md").write_text(render_report(summary, names, tuned, manifest))
+    (run_dir / "headline.md").write_text(render_headline(summary, names))
+    write_csv(run_dir / "summary.csv", summary, names)
 
 
 def _git(*args: str) -> str:
@@ -762,6 +805,14 @@ def publish(run_dir: Path, destination: Path) -> None:
     )
     for name in ("manifest.json", "tuning.json", "comparison.md", "headline.md", "summary.csv"):
         shutil.copy2(run_dir / name, destination / name)
+    phase2 = sorted(run_dir.parent.parent.glob("phase2/*1000w-500n"))
+    if phase2:  # newest planner/verifier scale benchmark (scripts/run_benchmarks.sh)
+        (destination / "planner").mkdir(exist_ok=True)
+        for name in ("summary.json", "core_timings.json", "manifest.json", "report.md"):
+            shutil.copy2(phase2[-1] / name, destination / "planner" / name)
+    for extra in ("forecast.json", "placement.json", "optimizer-quality.json"):
+        if (run_dir.parent / extra).is_file():
+            shutil.copy2(run_dir.parent / extra, destination / extra)
     with (
         (run_dir / "results.jsonl").open("rb") as source,
         gzip.GzipFile(destination / "results.jsonl.gz", "wb", mtime=0) as target,
@@ -777,10 +828,14 @@ def main() -> int:
         cmd.add_argument("--output", type=Path, default=ROOT / "results/phase3")
         cmd.add_argument("--workers", type=int, default=12)
         cmd.add_argument("--tuned", type=Path, default=None, help="reuse a tuning.json")
+    sub.add_parser("render").add_argument("run_dir", type=Path)
     pub = sub.add_parser("publish")
     pub.add_argument("run_dir", type=Path)
     pub.add_argument("destination", type=Path)
     args = parser.parse_args()
+    if args.command == "render":
+        render(args.run_dir)
+        return 0
     if args.command == "publish":
         publish(args.run_dir, args.destination)
         return 0

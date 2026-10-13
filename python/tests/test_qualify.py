@@ -131,3 +131,58 @@ def test_forecast_evaluation_reports_calibrated_coverage_on_a_steady_series() ->
     )
     assert metrics["n"] > 100 and metrics["wape"] < 0.05
     assert 0.85 <= metrics["upper_bound_coverage_95"] <= 1.0
+
+
+def _pair(cost, slo, hard):
+    def entry(ci):
+        return {"ci95": list(ci), "mean_diff_fr_minus_other": sum(ci) / 2}
+
+    return {
+        "node_cost_micros": entry(cost),
+        "slo_violation_windows": entry(slo),
+        "hard_violation_windows": entry(hard),
+    }
+
+
+def test_verdict_never_reports_a_cheaper_policy_with_more_hard_violations_as_better() -> None:
+    # cheaper, SLO totals equal (hard windows merely replace soft ones), hard strictly worse
+    assert qualify.verdict(_pair((-9, -5), (-1, 1), (2, 4))) == "trade-off (hard SLO worse)"
+    assert qualify.verdict(_pair((5, 9), (-1, 1), (2, 4))) == "FR worse (hard SLO worse)"
+    assert qualify.verdict(_pair((-9, -5), (-1, 1), (-1, 1))) == "FR better"
+    assert qualify.verdict(_pair((-9, -5), (-8, -2), (-3, -1))) == "FR better (cost and SLO)"
+    assert qualify.verdict(_pair((-1, 1), (-1, 1), (-1, 1))) == "no significant difference"
+    assert qualify.verdict(_pair((-9, -5), (2, 6), (-1, 1))) == "trade-off"
+
+
+def test_simulator_hooks_drift_and_replica_loss_change_outcomes_only_after_the_event() -> None:
+    from fleetright.baselines import FixedTarget
+    from fleetright.simulator import simulate
+
+    scenario = qualify.SCENARIOS[0]
+    ctx = qualify._contexts()["cpu-api"]
+    trace = qualify.build_trace(scenario, 100, qualify.EVAL_BASE_QPS_MILLI)
+    base = qualify._config(ctx, scenario)
+    plain = simulate(trace, base, FixedTarget(4)).windows
+    drift = simulate(
+        trace, replace_cfg(base, capacity_drift=(200 * 60_000, 500_000)), FixedTarget(4)
+    )
+    lost = simulate(trace, replace_cfg(base, replica_loss=(200 * 60_000, 2)), FixedTarget(4))
+    assert [w.ready_replicas for w in drift.windows[:200]] == [
+        w.ready_replicas for w in plain[:200]
+    ]
+    assert drift.windows[250].cpu_ppm > plain[250].cpu_ppm  # halved capacity doubles utilization
+    assert lost.windows[200].ready_replicas == 2 and lost.windows[199].ready_replicas == 4
+    assert lost.windows[-1].ready_replicas == 4  # replaced after the startup lead
+
+
+def replace_cfg(config, **changes):
+    from dataclasses import replace
+
+    return replace(config, **changes)
+
+
+def test_node_packing_respects_one_replica_per_workload_per_node() -> None:
+    order = ("cpu-api", "memory-api", "queued-api")
+    assert qualify._nodes_needed((1, 1, 1), order) == 1
+    assert qualify._nodes_needed((4, 1, 1), order) == 4  # four cpu-api replicas need four nodes
+    assert qualify._nodes_needed((0, 0, 0), order) == 0

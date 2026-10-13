@@ -117,11 +117,15 @@ added. Neither changed a FleetRight parameter, and the published run is a fresh 
   simulator has no per-request latency. Individual violation windows are retained in `results.jsonl`.
 * Statistics: per-seed paired differences (FleetRight minus other); percentile bootstrap, 10,000
   resamples over seeds, fixed RNG seed, 95% CI. Verdict rule (`qualify.verdict`): cost and total
-  violation windows; "better/worse" requires a CI excluding 0 on one axis and not significantly worse on
-  the other; opposite significant signs are a "trade-off". No p-values are reported. n = 20 supports
-  large effects only; scenarios whose traces are identical across seeds (steady, flash crowd) have
-  near-zero between-seed variance and their CIs are correspondingly tight but reflect little sampling
-  variability.
+  violation windows, with hard violations dominant (a significantly higher hard-violation count, or hard
+  windows against a policy with none, makes FleetRight "riskier" however low the cost); "better/worse"
+  requires a CI excluding 0 on one axis and not significantly worse on the other; opposite significant
+  signs are a "trade-off". A first version of the rule summed hard and soft windows and mislabelled S04/S11
+  as improvements; the independent review caught it and the published tables are recomputed (`qualify render`). No p-values are reported. n = 20 supports
+  large effects only; for steady and flash crowd every seed has a distinct trace (distinct hashes) but the outcome is
+  identical across seeds (one distinct cost value), so those intervals have an effective n of about 1 and
+  say nothing about sampling variability. S09 differs from the other scenarios only in trace family
+  (bursty); every scenario has three tenants with different SLOs (80/120/150 ms).
 * A lower cost is not an improvement when it comes with significantly more violations (verdict rule).
 
 ### Optimizer performance contract

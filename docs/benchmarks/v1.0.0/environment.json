@@ -3,7 +3,7 @@
   "cmake": "cmake version 3.28.3",
   "compiler": "c++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
   "cpu_model": "13th Gen Intel(R) Core(TM) i9-13980HX",
-  "git_commit": "93ae19557cf428bfa222d5f50b47b3a9c1e828ff",
+  "git_commit": "7d4f0c4accafd083c6a28f9dcf3983c992c97d57",
   "kernel": "Linux 7.0.0-38-generic",
   "logical_cpus": 32,
   "memory_total": "MemTotal:       15968848 kB",

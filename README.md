@@ -89,8 +89,8 @@ Where things are written: `results/phase1|2|3/` (git-ignored run output), compac
 | Verifier API p95 | **20.7 ms** (target 25 ms) | measured, Release |
 | Planner/verifier agreement on 60 random instances | 60/60 (was 49/60 before fixes) | real planner |
 | Mutated plans rejected by the verifier | 360/360 | real planner |
-| Reactive FleetRight vs HPA-like (15 simulated scenarios) | median cost -8.6%; 6 better / 2 worse / 7 trade-off | **simulated** |
-| Predictive vs reactive FleetRight | 0 better, 3 worse, 12 trade-off | **simulated** |
+| Reactive FleetRight vs HPA-like (15 simulated scenarios) | median cost -8.6%; 6 better / 3 worse / 6 trade-off; hard-violation-free in 11/15 scenarios (HPA-like 10/15, static peak 15/15) | **simulated** |
+| Predictive vs reactive FleetRight | 0 better, 5 worse, 10 trade-off | **simulated** |
 | Live Kind qualification | 15 live tests + 3 Docker E2E passed | live, one lab |
 | Tests | C++ 52/52, Python 496 passed / 20 live-gated skips (live suites run separately), ASan+UBSan clean | |
 

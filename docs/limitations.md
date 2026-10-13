@@ -16,8 +16,8 @@ Evidence and claims
 Where FleetRight loses or misses a target (see `docs/RELEASE_REPORT.md`)
 - Versus the tuned HPA-like baseline FleetRight was more expensive in S05, S09, S13, S14 and traded
   extra SLO-violation windows for lower cost in most other scenarios. It is not shown to dominate.
-- Predictive FleetRight was never better than reactive (ablation: 0 better, 5 worse, 8 trade-offs, 2 no
-  difference). With the bundled models the 95% bound is wide (mean overhead 0.7-1.1) and the seasonal model
+- Predictive FleetRight was never better than reactive (ablation at the reactive policy's knob: 0 better, 5 costlier with no SLO benefit, 8 trade-offs,
+  2 no difference; with its own tuned knob: 0 better, 5 worse, 10 trade-offs). With the bundled models the 95% bound is wide (mean overhead 0.7-1.1) and the seasonal model
   cannot activate at a 60 s cadence (needs 48 distinct hours).
 - All online policies, FleetRight included, take hard-SLO violations on a 5x single-window flash crowd;
   FleetRight reactive also on slow-start (S08), bursty multi-tenant (S09) and correlated surges (S11);

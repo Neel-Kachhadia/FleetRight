@@ -102,18 +102,18 @@ Tuned knobs (chosen on separate tuning seeds/load): fleetright_predictive=700000
 
 | FleetRight vs | cost diff [95% CI] | rel. | SLO-violation windows diff [95% CI] | hard diff [95% CI] | verdict |
 |---|---:|---:|---:|---:|---|
-| FR-reactive vs static_peak_reserve | -1,549,167.0 [-1,549,167.0, -1,549,167.0]* | -64.5% | +0.0 [+0.0, +0.0] | +3.0 [+3.0, +3.0]* | FR better |
+| FR-reactive vs static_peak_reserve | -1,549,167.0 [-1,549,167.0, -1,549,167.0]* | -64.5% | +0.0 [+0.0, +0.0] | +3.0 [+3.0, +3.0]* | trade-off (hard SLO worse) |
 | FR-reactive vs naive_threshold | -149,167.0 [-149,167.0, -149,167.0]* | -14.9% | -4.5 [-4.7, -4.2]* | -4.5 [-4.7, -4.2]* | FR better (cost and SLO) |
 | FR-reactive vs hpa_like | -155,000.0 [-155,000.0, -155,000.0]* | -15.4% | +0.0 [+0.0, +0.0] | +0.0 [+0.0, +0.0] | FR better |
 | FR-reactive vs fleetright_predictive | -169,125.3 [-170,375.4, -167,833.6]* | -16.6% | -10.1 [-11.7, -8.6]* | +0.0 [+0.0, +0.0] | FR better (cost and SLO) |
 | FR-reactive vs fleetright_predictive_same_headroom | -177,500.0 [-177,500.0, -177,500.0]* | -17.3% | +0.0 [+0.0, +0.0] | +0.0 [+0.0, +0.0] | FR better |
-| FR-reactive vs offline_lookahead_oracle | +30,666.2 [+29,249.6, +32,041.2]* | +3.7% | +2.0 [+2.0, +2.0]* | +3.0 [+3.0, +3.0]* | FR worse |
-| FR-predictive vs static_peak_reserve | -1,380,041.7 [-1,381,333.5, -1,378,833.3]* | -57.5% | +10.1 [+8.6, +11.6]* | +3.0 [+3.0, +3.0]* | trade-off |
-| FR-predictive vs naive_threshold | +19,958.3 [+18,625.0, +21,166.7]* | +2.0% | +5.6 [+4.2, +7.1]* | -4.5 [-4.7, -4.2]* | FR worse |
+| FR-reactive vs offline_lookahead_oracle | +30,666.2 [+29,249.6, +32,041.2]* | +3.7% | +2.0 [+2.0, +2.0]* | +3.0 [+3.0, +3.0]* | FR worse (hard SLO worse) |
+| FR-predictive vs static_peak_reserve | -1,380,041.7 [-1,381,333.5, -1,378,833.3]* | -57.5% | +10.1 [+8.6, +11.6]* | +3.0 [+3.0, +3.0]* | trade-off (hard SLO worse) |
+| FR-predictive vs naive_threshold | +19,958.3 [+18,625.0, +21,166.7]* | +2.0% | +5.6 [+4.2, +7.1]* | -4.5 [-4.7, -4.2]* | trade-off |
 | FR-predictive vs hpa_like | +14,125.3 [+12,833.6, +15,375.2]* | +1.4% | +10.1 [+8.6, +11.6]* | +0.0 [+0.0, +0.0] | FR worse |
 | FR-predictive vs fleetright_reactive | +169,125.3 [+167,833.6, +170,333.6]* | +19.9% | +10.1 [+8.6, +11.7]* | +0.0 [+0.0, +0.0] | FR worse |
 | FR-predictive vs fleetright_predictive_same_headroom | -8,374.7 [-9,708.0, -7,166.3]* | -0.8% | +10.1 [+8.6, +11.7]* | +0.0 [+0.0, +0.0] | trade-off |
-| FR-predictive vs offline_lookahead_oracle | +199,791.5 [+197,916.6, +201,583.2]* | +24.4% | +12.1 [+10.6, +13.6]* | +3.0 [+3.0, +3.0]* | FR worse |
+| FR-predictive vs offline_lookahead_oracle | +199,791.5 [+197,916.6, +201,583.2]* | +24.4% | +12.1 [+10.6, +13.6]* | +3.0 [+3.0, +3.0]* | FR worse (hard SLO worse) |
 | FR-predictive_same_headroom vs fleetright_reactive | +177,500.0 [+177,500.0, +177,500.0]* | +20.9% | +0.0 [+0.0, +0.0] | +0.0 [+0.0, +0.0] | FR worse |
 
 ## S05 CPU-intensive workload
@@ -133,15 +133,15 @@ Tuned knobs (chosen on separate tuning seeds/load): fleetright_predictive=700000
 | FR-reactive vs static_peak_reserve | -121,458.4 [-125,791.6, -116,916.6]* | -12.1% | +12.3 [+11.2, +13.4]* | +0.0 [+0.0, +0.0] | trade-off |
 | FR-reactive vs naive_threshold | +278,541.7 [+274,291.6, +282,958.3]* | +46.4% | -17.6 [-19.1, -16.1]* | -5.8 [-6.7, -5.0]* | trade-off |
 | FR-reactive vs hpa_like | +179,583.2 [+177,916.4, +181,333.2]* | +25.7% | -17.6 [-19.1, -16.1]* | -5.8 [-6.7, -5.0]* | trade-off |
-| FR-reactive vs fleetright_predictive | -220,375.0 [-236,375.0, -204,875.0]* | -20.1% | +8.8 [+7.7, +10.2]* | -0.6 [-0.9, -0.3]* | trade-off |
+| FR-reactive vs fleetright_predictive | -220,375.0 [-236,375.0, -204,875.0]* | -20.1% | +8.8 [+7.7, +10.2]* | -0.6 [-0.9, -0.3]* | FR better (cost and SLO) |
 | FR-reactive vs fleetright_predictive_same_headroom | -369,166.7 [-387,333.3, -351,666.5]* | -29.6% | +10.4 [+9.3, +11.4]* | +0.0 [+0.0, +0.0] | trade-off |
 | FR-reactive vs offline_lookahead_oracle | +215,208.3 [+212,208.2, +218,208.4]* | +32.4% | +12.3 [+11.2, +13.4]* | +0.0 [+0.0, +0.0] | FR worse |
-| FR-predictive vs static_peak_reserve | +98,916.7 [+83,625.1, +114,833.3]* | +9.9% | +3.5 [+2.6, +4.4]* | +0.6 [+0.3, +0.9]* | FR worse |
+| FR-predictive vs static_peak_reserve | +98,916.7 [+83,625.1, +114,833.3]* | +9.9% | +3.5 [+2.6, +4.4]* | +0.6 [+0.3, +0.9]* | FR worse (hard SLO worse) |
 | FR-predictive vs naive_threshold | +498,916.7 [+484,125.0, +514,666.7]* | +83.2% | -26.4 [-28.1, -24.8]* | -5.2 [-6.0, -4.5]* | trade-off |
 | FR-predictive vs hpa_like | +399,958.3 [+384,625.0, +416,083.3]* | +57.2% | -26.4 [-28.1, -24.8]* | -5.2 [-6.0, -4.5]* | trade-off |
-| FR-predictive vs fleetright_reactive | +220,375.0 [+204,833.4, +237,000.0]* | +25.1% | -8.8 [-10.2, -7.7]* | +0.6 [+0.3, +0.9]* | trade-off |
-| FR-predictive vs fleetright_predictive_same_headroom | -148,791.6 [-153,874.9, -143,208.1]* | -11.9% | +1.6 [+1.1, +2.0]* | +0.6 [+0.3, +0.9]* | trade-off |
-| FR-predictive vs offline_lookahead_oracle | +435,583.3 [+420,500.0, +451,499.9]* | +65.7% | +3.5 [+2.5, +4.4]* | +0.6 [+0.3, +0.9]* | FR worse |
+| FR-predictive vs fleetright_reactive | +220,375.0 [+204,833.4, +237,000.0]* | +25.1% | -8.8 [-10.2, -7.7]* | +0.6 [+0.3, +0.9]* | FR worse (hard SLO worse) |
+| FR-predictive vs fleetright_predictive_same_headroom | -148,791.6 [-153,874.9, -143,208.1]* | -11.9% | +1.6 [+1.1, +2.0]* | +0.6 [+0.3, +0.9]* | trade-off (hard SLO worse) |
+| FR-predictive vs offline_lookahead_oracle | +435,583.3 [+420,500.0, +451,499.9]* | +65.7% | +3.5 [+2.5, +4.4]* | +0.6 [+0.3, +0.9]* | FR worse (hard SLO worse) |
 | FR-predictive_same_headroom vs fleetright_reactive | +369,166.7 [+350,958.5, +387,208.2]* | +42.0% | -10.4 [-11.4, -9.4]* | +0.0 [+0.0, +0.0] | trade-off |
 
 ## S06 memory-intensive workload
@@ -186,18 +186,18 @@ Tuned knobs (chosen on separate tuning seeds/load): fleetright_predictive=700000
 
 | FleetRight vs | cost diff [95% CI] | rel. | SLO-violation windows diff [95% CI] | hard diff [95% CI] | verdict |
 |---|---:|---:|---:|---:|---|
-| FR-reactive vs static_peak_reserve | -122,916.7 [-124,083.4, -121,750.1]* | -15.4% | +115.0 [+114.2, +115.7]* | +15.4 [+14.7, +16.1]* | trade-off |
-| FR-reactive vs naive_threshold | -287,166.7 [-292,250.2, -282,125.0]* | -29.8% | +80.2 [+79.3, +81.2]* | +15.4 [+14.7, +16.1]* | trade-off |
-| FR-reactive vs hpa_like | -107,500.1 [-109,166.8, -105,791.6]* | -13.7% | +43.2 [+42.0, +44.5]* | +14.8 [+14.1, +15.7]* | trade-off |
-| FR-reactive vs fleetright_predictive | -106,958.4 [-112,250.1, -101,708.3]* | -13.6% | +62.5 [+58.4, +66.0]* | +7.3 [+6.3, +8.3]* | trade-off |
-| FR-reactive vs fleetright_predictive_same_headroom | -179,625.0 [-185,791.6, -173,333.4]* | -21.0% | +76.0 [+72.0, +79.3]* | +10.6 [+9.6, +11.4]* | trade-off |
-| FR-reactive vs offline_lookahead_oracle | +82,958.4 [+80,958.4, +84,958.3]* | +14.0% | +59.1 [+58.0, +60.1]* | +15.4 [+14.8, +16.1]* | FR worse |
-| FR-predictive vs static_peak_reserve | -15,958.4 [-21,625.0, -10,708.3]* | -2.0% | +52.5 [+48.9, +56.6]* | +8.1 [+7.0, +9.1]* | trade-off |
-| FR-predictive vs naive_threshold | -180,208.3 [-188,208.2, -172,083.3]* | -18.7% | +17.8 [+13.9, +22.1]* | +8.1 [+7.0, +9.1]* | trade-off |
-| FR-predictive vs hpa_like | -541.7 [-6,000.1, +4,916.6] | -0.1% | -19.2 [-22.7, -15.3]* | +7.5 [+6.3, +8.7]* | FR better |
+| FR-reactive vs static_peak_reserve | -122,916.7 [-124,083.4, -121,750.1]* | -15.4% | +115.0 [+114.2, +115.7]* | +15.4 [+14.7, +16.1]* | trade-off (hard SLO worse) |
+| FR-reactive vs naive_threshold | -287,166.7 [-292,250.2, -282,125.0]* | -29.8% | +80.2 [+79.3, +81.2]* | +15.4 [+14.7, +16.1]* | trade-off (hard SLO worse) |
+| FR-reactive vs hpa_like | -107,500.1 [-109,166.8, -105,791.6]* | -13.7% | +43.2 [+42.0, +44.5]* | +14.8 [+14.1, +15.7]* | trade-off (hard SLO worse) |
+| FR-reactive vs fleetright_predictive | -106,958.4 [-112,250.1, -101,708.3]* | -13.6% | +62.5 [+58.4, +66.0]* | +7.3 [+6.3, +8.3]* | trade-off (hard SLO worse) |
+| FR-reactive vs fleetright_predictive_same_headroom | -179,625.0 [-185,791.6, -173,333.4]* | -21.0% | +76.0 [+72.0, +79.3]* | +10.6 [+9.6, +11.4]* | trade-off (hard SLO worse) |
+| FR-reactive vs offline_lookahead_oracle | +82,958.4 [+80,958.4, +84,958.3]* | +14.0% | +59.1 [+58.0, +60.1]* | +15.4 [+14.8, +16.1]* | FR worse (hard SLO worse) |
+| FR-predictive vs static_peak_reserve | -15,958.4 [-21,625.0, -10,708.3]* | -2.0% | +52.5 [+48.9, +56.6]* | +8.1 [+7.0, +9.1]* | trade-off (hard SLO worse) |
+| FR-predictive vs naive_threshold | -180,208.3 [-188,208.2, -172,083.3]* | -18.7% | +17.8 [+13.9, +22.1]* | +8.1 [+7.0, +9.1]* | trade-off (hard SLO worse) |
+| FR-predictive vs hpa_like | -541.7 [-6,000.1, +4,916.6] | -0.1% | -19.2 [-22.7, -15.3]* | +7.5 [+6.3, +8.7]* | FR worse (hard SLO worse) |
 | FR-predictive vs fleetright_reactive | +106,958.4 [+101,416.8, +112,208.4]* | +15.8% | -62.5 [-66.1, -58.2]* | -7.3 [-8.3, -6.3]* | trade-off |
-| FR-predictive vs fleetright_predictive_same_headroom | -72,666.6 [-75,499.9, -69,749.9]* | -8.5% | +13.5 [+12.2, +14.8]* | +3.2 [+2.5, +4.0]* | trade-off |
-| FR-predictive vs offline_lookahead_oracle | +189,916.7 [+184,333.5, +195,333.3]* | +32.0% | -3.4 [-7.2, +1.1] | +8.1 [+7.0, +9.1]* | FR worse |
+| FR-predictive vs fleetright_predictive_same_headroom | -72,666.6 [-75,499.9, -69,749.9]* | -8.5% | +13.5 [+12.2, +14.8]* | +3.2 [+2.5, +4.0]* | trade-off (hard SLO worse) |
+| FR-predictive vs offline_lookahead_oracle | +189,916.7 [+184,333.5, +195,333.3]* | +32.0% | -3.4 [-7.2, +1.1] | +8.1 [+7.0, +9.1]* | FR worse (hard SLO worse) |
 | FR-predictive_same_headroom vs fleetright_reactive | +179,625.0 [+173,249.9, +185,833.4]* | +26.5% | -76.0 [-79.3, -72.1]* | -10.6 [-11.4, -9.6]* | trade-off |
 
 ## S09 multiple tenants, different SLOs
@@ -214,18 +214,18 @@ Tuned knobs (chosen on separate tuning seeds/load): fleetright_predictive=700000
 
 | FleetRight vs | cost diff [95% CI] | rel. | SLO-violation windows diff [95% CI] | hard diff [95% CI] | verdict |
 |---|---:|---:|---:|---:|---|
-| FR-reactive vs static_peak_reserve | -137,916.6 [-156,833.4, -119,375.0]* | -9.9% | +51.6 [+48.1, +55.0]* | +18.8 [+17.9, +19.8]* | trade-off |
-| FR-reactive vs naive_threshold | +262,083.4 [+243,625.0, +280,791.7]* | +26.2% | -20.8 [-24.1, -17.8]* | +6.6 [+5.5, +7.8]* | trade-off |
-| FR-reactive vs hpa_like | +94,041.8 [+80,458.4, +107,541.8]* | +8.1% | -20.8 [-24.1, -17.8]* | +6.6 [+5.5, +7.8]* | trade-off |
-| FR-reactive vs fleetright_predictive | -252,000.0 [-266,208.3, -237,916.7]* | -16.6% | +48.0 [+45.9, +50.0]* | +16.9 [+15.9, +17.9]* | trade-off |
-| FR-reactive vs fleetright_predictive_same_headroom | -480,958.2 [-495,666.5, -465,916.7]* | -27.6% | +54.9 [+53.2, +56.7]* | +17.6 [+16.7, +18.6]* | trade-off |
-| FR-reactive vs offline_lookahead_oracle | +296,083.3 [+280,291.8, +312,041.6]* | +30.7% | +64.4 [+62.9, +66.0]* | +18.8 [+17.9, +19.8]* | FR worse |
-| FR-predictive vs static_peak_reserve | +114,083.4 [+94,708.4, +132,583.5]* | +8.1% | +3.6 [+0.1, +6.8]* | +1.9 [+1.4, +2.5]* | FR worse |
+| FR-reactive vs static_peak_reserve | -137,916.6 [-156,833.4, -119,375.0]* | -9.9% | +51.6 [+48.1, +55.0]* | +18.8 [+17.9, +19.8]* | trade-off (hard SLO worse) |
+| FR-reactive vs naive_threshold | +262,083.4 [+243,625.0, +280,791.7]* | +26.2% | -20.8 [-24.1, -17.8]* | +6.6 [+5.5, +7.8]* | FR worse (hard SLO worse) |
+| FR-reactive vs hpa_like | +94,041.8 [+80,458.4, +107,541.8]* | +8.1% | -20.8 [-24.1, -17.8]* | +6.6 [+5.5, +7.8]* | FR worse (hard SLO worse) |
+| FR-reactive vs fleetright_predictive | -252,000.0 [-266,208.3, -237,916.7]* | -16.6% | +48.0 [+45.9, +50.0]* | +16.9 [+15.9, +17.9]* | trade-off (hard SLO worse) |
+| FR-reactive vs fleetright_predictive_same_headroom | -480,958.2 [-495,666.5, -465,916.7]* | -27.6% | +54.9 [+53.2, +56.7]* | +17.6 [+16.7, +18.6]* | trade-off (hard SLO worse) |
+| FR-reactive vs offline_lookahead_oracle | +296,083.3 [+280,291.8, +312,041.6]* | +30.7% | +64.4 [+62.9, +66.0]* | +18.8 [+17.9, +19.8]* | FR worse (hard SLO worse) |
+| FR-predictive vs static_peak_reserve | +114,083.4 [+94,708.4, +132,583.5]* | +8.1% | +3.6 [+0.1, +6.8]* | +1.9 [+1.4, +2.5]* | FR worse (hard SLO worse) |
 | FR-predictive vs naive_threshold | +514,083.3 [+494,791.8, +532,750.1]* | +51.4% | -68.8 [-72.1, -65.3]* | -10.2 [-11.3, -9.2]* | trade-off |
 | FR-predictive vs hpa_like | +346,041.8 [+329,666.8, +361,583.3]* | +29.6% | -68.8 [-72.0, -65.3]* | -10.2 [-11.3, -9.2]* | trade-off |
 | FR-predictive vs fleetright_reactive | +252,000.0 [+237,833.4, +265,583.3]* | +20.0% | -48.0 [-50.0, -45.9]* | -16.9 [-17.9, -15.9]* | trade-off |
-| FR-predictive vs fleetright_predictive_same_headroom | -228,958.2 [-233,374.9, -224,583.1]* | -13.1% | +7.0 [+6.0, +7.9]* | +0.8 [+0.4, +1.1]* | trade-off |
-| FR-predictive vs offline_lookahead_oracle | +548,083.3 [+530,874.9, +564,958.3]* | +56.7% | +16.4 [+15.1, +17.9]* | +1.9 [+1.4, +2.5]* | FR worse |
+| FR-predictive vs fleetright_predictive_same_headroom | -228,958.2 [-233,374.9, -224,583.1]* | -13.1% | +7.0 [+6.0, +7.9]* | +0.8 [+0.4, +1.1]* | trade-off (hard SLO worse) |
+| FR-predictive vs offline_lookahead_oracle | +548,083.3 [+530,874.9, +564,958.3]* | +56.7% | +16.4 [+15.1, +17.9]* | +1.9 [+1.4, +2.5]* | FR worse (hard SLO worse) |
 | FR-predictive_same_headroom vs fleetright_reactive | +480,958.2 [+465,708.3, +495,624.8]* | +38.1% | -54.9 [-56.7, -53.2]* | -17.6 [-18.6, -16.7]* | trade-off |
 
 ## S10 noisy-neighbour demand
@@ -270,18 +270,18 @@ Tuned knobs (chosen on separate tuning seeds/load): fleetright_predictive=700000
 
 | FleetRight vs | cost diff [95% CI] | rel. | SLO-violation windows diff [95% CI] | hard diff [95% CI] | verdict |
 |---|---:|---:|---:|---:|---|
-| FR-reactive vs static_peak_reserve | -754,167.0 [-754,167.0, -754,167.0]* | -47.1% | -6.0 [-6.0, -6.0]* | +2.0 [+2.0, +2.0]* | FR better (cost and SLO) |
+| FR-reactive vs static_peak_reserve | -754,167.0 [-754,167.0, -754,167.0]* | -47.1% | -6.0 [-6.0, -6.0]* | +2.0 [+2.0, +2.0]* | trade-off (hard SLO worse) |
 | FR-reactive vs naive_threshold | -551,667.0 [-551,667.0, -551,667.0]* | -39.5% | -6.0 [-6.0, -6.0]* | -7.0 [-7.0, -7.0]* | FR better (cost and SLO) |
-| FR-reactive vs hpa_like | -174,167.0 [-174,167.0, -174,167.0]* | -17.1% | +0.0 [+0.0, +0.0] | -1.0 [-1.0, -1.0]* | FR better |
+| FR-reactive vs hpa_like | -174,167.0 [-174,167.0, -174,167.0]* | -17.1% | +0.0 [+0.0, +0.0] | -1.0 [-1.0, -1.0]* | FR better (cost and SLO) |
 | FR-reactive vs fleetright_predictive | -119,083.6 [-120,375.2, -117,625.2]* | -12.3% | -12.4 [-14.2, -10.8]* | -1.0 [-1.0, -1.0]* | FR better (cost and SLO) |
 | FR-reactive vs fleetright_predictive_same_headroom | -152,500.0 [-152,500.0, -152,500.0]* | -15.3% | +0.0 [+0.0, +0.0] | +0.0 [+0.0, +0.0] | FR better |
-| FR-reactive vs offline_lookahead_oracle | +12,541.4 [+11,124.8, +13,916.4]* | +1.5% | +3.0 [+3.0, +3.0]* | +2.0 [+2.0, +2.0]* | FR worse |
-| FR-predictive vs static_peak_reserve | -635,083.4 [-636,541.8, -633,791.7]* | -39.7% | +6.4 [+4.8, +8.2]* | +3.0 [+3.0, +3.0]* | trade-off |
-| FR-predictive vs naive_threshold | -432,583.4 [-434,041.7, -431,291.8]* | -31.0% | +6.4 [+4.8, +8.2]* | -6.0 [-6.0, -6.0]* | trade-off |
+| FR-reactive vs offline_lookahead_oracle | +12,541.4 [+11,124.8, +13,916.4]* | +1.5% | +3.0 [+3.0, +3.0]* | +2.0 [+2.0, +2.0]* | FR worse (hard SLO worse) |
+| FR-predictive vs static_peak_reserve | -635,083.4 [-636,541.8, -633,791.7]* | -39.7% | +6.4 [+4.8, +8.2]* | +3.0 [+3.0, +3.0]* | trade-off (hard SLO worse) |
+| FR-predictive vs naive_threshold | -432,583.4 [-434,041.7, -431,291.8]* | -31.0% | +6.4 [+4.8, +8.2]* | -6.0 [-6.0, -6.0]* | FR better (cost and SLO) |
 | FR-predictive vs hpa_like | -55,083.4 [-56,541.8, -53,791.7]* | -5.4% | +12.4 [+10.8, +14.2]* | +0.0 [+0.0, +0.0] | trade-off |
-| FR-predictive vs fleetright_reactive | +119,083.6 [+117,583.6, +120,333.7]* | +14.1% | +12.4 [+10.8, +14.2]* | +1.0 [+1.0, +1.0]* | FR worse |
-| FR-predictive vs fleetright_predictive_same_headroom | -33,416.4 [-34,916.4, -32,124.8]* | -3.3% | +12.4 [+10.8, +14.2]* | +1.0 [+1.0, +1.0]* | trade-off |
-| FR-predictive vs offline_lookahead_oracle | +131,625.0 [+129,791.5, +133,458.4]* | +15.8% | +15.4 [+13.8, +17.2]* | +3.0 [+3.0, +3.0]* | FR worse |
+| FR-predictive vs fleetright_reactive | +119,083.6 [+117,583.6, +120,333.7]* | +14.1% | +12.4 [+10.8, +14.2]* | +1.0 [+1.0, +1.0]* | FR worse (hard SLO worse) |
+| FR-predictive vs fleetright_predictive_same_headroom | -33,416.4 [-34,916.4, -32,124.8]* | -3.3% | +12.4 [+10.8, +14.2]* | +1.0 [+1.0, +1.0]* | trade-off (hard SLO worse) |
+| FR-predictive vs offline_lookahead_oracle | +131,625.0 [+129,791.5, +133,458.4]* | +15.8% | +15.4 [+13.8, +17.2]* | +3.0 [+3.0, +3.0]* | FR worse (hard SLO worse) |
 | FR-predictive_same_headroom vs fleetright_reactive | +152,500.0 [+152,500.0, +152,500.0]* | +18.0% | +0.0 [+0.0, +0.0] | +0.0 [+0.0, +0.0] | FR worse |
 
 ## S12 forecast underprediction (+80% level shift)
@@ -385,15 +385,15 @@ Tuned knobs (chosen on separate tuning seeds/load): fleetright_predictive=700000
 | FR-reactive vs static_peak_reserve | -150,000.0 [-150,000.0, -150,000.0]* | -18.8% | +66.0 [+65.0, +66.8]* | +0.0 [+0.0, +0.0] | trade-off |
 | FR-reactive vs naive_threshold | -345,833.0 [-345,833.0, -345,833.0]* | -34.7% | +67.5 [+66.3, +68.6]* | +0.0 [+0.0, +0.0] | trade-off |
 | FR-reactive vs hpa_like | -156,000.0 [-159,666.6, -152,249.9]* | -19.4% | +69.9 [+68.8, +71.0]* | +0.0 [+0.0, +0.0] | trade-off |
-| FR-reactive vs fleetright_predictive | -44,291.8 [-46,208.2, -42,375.2]* | -6.4% | +21.9 [+19.3, +24.4]* | -1.4 [-1.8, -1.0]* | trade-off |
+| FR-reactive vs fleetright_predictive | -44,291.8 [-46,208.2, -42,375.2]* | -6.4% | +21.9 [+19.3, +24.4]* | -1.4 [-1.8, -1.0]* | FR better (cost and SLO) |
 | FR-reactive vs fleetright_predictive_same_headroom | -156,041.6 [-160,291.6, -151,875.0]* | -19.4% | +52.5 [+50.5, +54.6]* | +0.0 [+0.0, +0.0] | trade-off |
 | FR-reactive vs offline_lookahead_oracle | +55,541.7 [+54,041.7, +56,875.1]* | +9.3% | +66.0 [+64.6, +67.3]* | +0.0 [+0.0, +0.0] | FR worse |
-| FR-predictive vs static_peak_reserve | -105,708.2 [-107,624.9, -103,791.6]* | -13.2% | +44.1 [+41.4, +47.0]* | +1.4 [+1.0, +1.8]* | trade-off |
-| FR-predictive vs naive_threshold | -301,541.2 [-303,457.9, -299,624.5]* | -30.3% | +45.6 [+42.6, +48.7]* | +1.4 [+1.0, +1.8]* | trade-off |
-| FR-predictive vs hpa_like | -111,708.2 [-115,499.8, -107,916.5]* | -13.9% | +48.0 [+45.2, +51.0]* | +1.4 [+1.0, +1.8]* | trade-off |
-| FR-predictive vs fleetright_reactive | +44,291.8 [+42,375.1, +46,208.3]* | +6.8% | -21.9 [-24.4, -19.2]* | +1.4 [+1.0, +1.8]* | trade-off |
-| FR-predictive vs fleetright_predictive_same_headroom | -111,749.9 [-114,541.6, -108,916.6]* | -13.9% | +30.7 [+29.2, +32.2]* | +1.4 [+1.0, +1.8]* | trade-off |
-| FR-predictive vs offline_lookahead_oracle | +99,833.4 [+97,166.7, +102,541.7]* | +16.8% | +44.2 [+41.4, +47.2]* | +1.4 [+1.0, +1.8]* | FR worse |
+| FR-predictive vs static_peak_reserve | -105,708.2 [-107,624.9, -103,791.6]* | -13.2% | +44.1 [+41.4, +47.0]* | +1.4 [+1.0, +1.8]* | trade-off (hard SLO worse) |
+| FR-predictive vs naive_threshold | -301,541.2 [-303,457.9, -299,624.5]* | -30.3% | +45.6 [+42.6, +48.7]* | +1.4 [+1.0, +1.8]* | trade-off (hard SLO worse) |
+| FR-predictive vs hpa_like | -111,708.2 [-115,499.8, -107,916.5]* | -13.9% | +48.0 [+45.2, +51.0]* | +1.4 [+1.0, +1.8]* | trade-off (hard SLO worse) |
+| FR-predictive vs fleetright_reactive | +44,291.8 [+42,375.1, +46,208.3]* | +6.8% | -21.9 [-24.4, -19.2]* | +1.4 [+1.0, +1.8]* | FR worse (hard SLO worse) |
+| FR-predictive vs fleetright_predictive_same_headroom | -111,749.9 [-114,541.6, -108,916.6]* | -13.9% | +30.7 [+29.2, +32.2]* | +1.4 [+1.0, +1.8]* | trade-off (hard SLO worse) |
+| FR-predictive vs offline_lookahead_oracle | +99,833.4 [+97,166.7, +102,541.7]* | +16.8% | +44.2 [+41.4, +47.2]* | +1.4 [+1.0, +1.8]* | FR worse (hard SLO worse) |
 | FR-predictive_same_headroom vs fleetright_reactive | +156,041.6 [+151,958.4, +160,291.7]* | +24.0% | -52.5 [-54.6, -50.5]* | +0.0 [+0.0, +0.0] | trade-off |
 
 ## S16 one node lost (1 replica per tenant)
