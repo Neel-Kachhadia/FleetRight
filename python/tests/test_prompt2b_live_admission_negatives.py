@@ -208,7 +208,8 @@ def test_live_stale_or_forged_pod_create_is_denied_without_reservation() -> None
 
 def test_live_legacy_workload_is_refused_before_any_mutation() -> None:
     kubeconfig = os.getenv(
-        "FLEETRIGHT_LEGACY_LAB_KUBECONFIG", "/home/neel/.cache/fleetright/safety-lab.kubeconfig"
+        "FLEETRIGHT_LEGACY_LAB_KUBECONFIG",
+        os.path.expanduser("~/.cache/fleetright/safety-lab.kubeconfig"),
     )
     context = os.getenv("FLEETRIGHT_LEGACY_LAB_CONTEXT", "kind-fleetright-safety-lab")
 

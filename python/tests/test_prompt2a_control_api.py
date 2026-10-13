@@ -1169,7 +1169,7 @@ def test_live_v2_api_journal_controller_prepares_replacement(
 
     kubeconfig = os.getenv(
         "FLEETRIGHT_LAB_ADMIN_KUBECONFIG",
-        "/home/neel/.cache/fleetright/safety-lab.kubeconfig",
+        os.path.expanduser("~/.cache/fleetright/safety-lab.kubeconfig"),
     )
     context = os.getenv("FLEETRIGHT_LAB_CONTEXT", "kind-fleetright-safety-lab")
 
@@ -3619,7 +3619,7 @@ def test_kubernetes_workload_api_recovers_after_ready_scale_up_crash(
     health_url = os.getenv("FLEETRIGHT_KIND_HEALTH_URL")
     assert kubeconfig and admin_kubeconfig and health_url, "Kubeconfigs and health URL are required"
     assert Path(admin_kubeconfig).resolve() == Path(
-        "/home/neel/.cache/fleetright/safety-lab.kubeconfig"
+        os.path.expanduser("~/.cache/fleetright/safety-lab.kubeconfig")
     )
     assert Path(kubeconfig).resolve() != Path(admin_kubeconfig).resolve()
     assert health_url.startswith("http://127.0.0.1:")

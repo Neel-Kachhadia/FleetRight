@@ -30,7 +30,7 @@ def test_live_workload_prepares_and_evacuates_source_with_real_pod_identity(
 ) -> None:
     kubeconfig = os.getenv(
         "FLEETRIGHT_LAB_ADMIN_KUBECONFIG",
-        "/home/neel/.cache/fleetright/safety-lab.kubeconfig",
+        os.path.expanduser("~/.cache/fleetright/safety-lab.kubeconfig"),
     )
     context = os.getenv("FLEETRIGHT_LAB_CONTEXT", "kind-fleetright-safety-lab")
 

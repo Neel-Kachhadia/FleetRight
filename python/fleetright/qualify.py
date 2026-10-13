@@ -8,9 +8,12 @@ docs/benchmark-methodology.md for the protocol; run `python -m fleetright.qualif
 from __future__ import annotations
 
 import argparse
+import csv
+import gzip
 import hashlib
 import json
 import random
+import shutil
 import statistics
 import subprocess
 import sys
@@ -600,7 +603,46 @@ def run_all(output: Path, workers: int, tuned_path: Path | None) -> Path:
     (run_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
     (run_dir / "comparison.md").write_text(render_report(summary, names, tuned, manifest))
+    write_csv(run_dir / "summary.csv", summary, names)
     return run_dir
+
+
+def write_csv(path: Path, summary: dict, names: dict[str, str]) -> None:
+    metrics = (
+        "node_cost_micros", "node_hours", "replica_hours", "idle_cpu_fraction",
+        "idle_memory_fraction", "provisioned_over_required", "success_rate",
+        "cost_per_million_successful_micros", "soft_violation_windows", "hard_violation_windows",
+        "latency_p99_window_p95_ms", "latency_p99_window_max_ms", "overload_windows",
+        "scale_actions", "replicas_added", "node_release_events", "longest_capacity_gap_windows",
+    )  # fmt: skip
+    stats = ("mean", "median", "stdev")
+    header = ["scenario", "name", "policy", "n_seeds", "hard_violation_seeds"]
+    header += [f"{m}_{stat}" for m in metrics for stat in stats]
+    with path.open("w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(header)
+        for sid, scenario in summary["scenarios"].items():
+            for policy, m in scenario["policies"].items():
+                row = [
+                    sid,
+                    names[sid],
+                    policy,
+                    m["node_cost_micros"]["n"],
+                    m["hard_violation_seeds"],
+                ]
+                writer.writerow(row + [m[x][stat] for x in metrics for stat in stats])
+
+
+def publish(run_dir: Path, destination: Path) -> None:
+    """Copy the compact, reviewable artifacts; raw results are gzipped with a recorded checksum."""
+    destination.mkdir(parents=True, exist_ok=True)
+    for name in ("manifest.json", "tuning.json", "comparison.md", "summary.csv"):
+        shutil.copy2(run_dir / name, destination / name)
+    with (
+        (run_dir / "results.jsonl").open("rb") as source,
+        gzip.GzipFile(destination / "results.jsonl.gz", "wb", mtime=0) as target,
+    ):
+        shutil.copyfileobj(source, target)
 
 
 def main() -> int:
@@ -611,7 +653,13 @@ def main() -> int:
         cmd.add_argument("--output", type=Path, default=ROOT / "results/phase3")
         cmd.add_argument("--workers", type=int, default=12)
         cmd.add_argument("--tuned", type=Path, default=None, help="reuse a tuning.json")
+    pub = sub.add_parser("publish")
+    pub.add_argument("run_dir", type=Path)
+    pub.add_argument("destination", type=Path)
     args = parser.parse_args()
+    if args.command == "publish":
+        publish(args.run_dir, args.destination)
+        return 0
     args.output.mkdir(parents=True, exist_ok=True)
     if args.command == "tune":
         path = args.output / "tuning.json"

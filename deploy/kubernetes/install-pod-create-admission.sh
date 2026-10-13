@@ -3,7 +3,7 @@ set -euo pipefail
 
 context=${FLEETRIGHT_LAB_CONTEXT:-kind-fleetright-safety-lab}
 namespace=${FLEETRIGHT_LAB_NAMESPACE:-fleetright-v2}
-kubeconfig=${FLEETRIGHT_LAB_ADMIN_KUBECONFIG:-/home/neel/.cache/fleetright/safety-lab.kubeconfig}
+kubeconfig=${FLEETRIGHT_LAB_ADMIN_KUBECONFIG:-$HOME/.cache/fleetright/safety-lab.kubeconfig}
 kind_cluster=${FLEETRIGHT_KIND_CLUSTER:-fleetright-safety-lab}
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/fleetright-pod-admission.XXXXXX")"
