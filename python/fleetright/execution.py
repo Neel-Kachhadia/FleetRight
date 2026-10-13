@@ -33,6 +33,15 @@ from .workload_controller import (
 )
 
 _DNS_LABEL = re.compile(r"[a-z0-9](?:[-a-z0-9]*[a-z0-9])?\Z")
+NODE_CORDON_OWNED = "fleetright.io/cordon-owned"
+NODE_TRANSIENT_ANNOTATIONS = frozenset(
+    {
+        "fleetright.io/plan-id",
+        "fleetright.io/operation-id",
+        "fleetright.io/fencing-token",
+        NODE_CORDON_OWNED,
+    }
+)
 _DNS_SUBDOMAIN = re.compile(
     r"[a-z0-9](?:[-a-z0-9]*[a-z0-9])?(?:\.[a-z0-9](?:[-a-z0-9]*[a-z0-9])?)*\Z"
 )
@@ -615,6 +624,7 @@ class FleetRightWorkloadTarget(KubernetesTarget):
             "fencing_token": int(token),
             "plan_id": owner[0],
             "operation_id": owner[1],
+            "cordon_owned": annotations.get(NODE_CORDON_OWNED) == "true",
             "unschedulable": spec.get("unschedulable") is True,
             "annotations": annotations,
             "annotations_present": "annotations" in metadata,
@@ -635,6 +645,10 @@ class FleetRightWorkloadTarget(KubernetesTarget):
         current = self._observe_source_node(plan_id, payload)
         if current["fencing_token"] > fencing_token:
             raise TargetPreconditionFailed("a newer controller fenced this Node drain")
+        fresh = current["plan_id"] is None
+        if not fresh and not current["unschedulable"]:
+            # Never re-cordon over an administrator's uncordon; the drain cannot be trusted.
+            raise ActionBlocked("DRAIN_NODE_UNCORDONED_EXTERNALLY")
         if current["fencing_token"] == fencing_token and current["unschedulable"]:
             return {**current, "stage": "NODE_CORDONED", "already_applied": True}
         annotations = {
@@ -642,6 +656,11 @@ class FleetRightWorkloadTarget(KubernetesTarget):
             "fleetright.io/plan-id": plan_id,
             "fleetright.io/operation-id": payload["operation_id"],
             "fleetright.io/fencing-token": str(fencing_token),
+            # Only a cordon FleetRight itself applied is FleetRight-owned; a pre-existing
+            # administrative cordon is recorded as such and never released.
+            NODE_CORDON_OWNED: "true"
+            if (current["cordon_owned"] if not fresh else not current["unschedulable"])
+            else "false",
         }
         patch = [
             {"op": "test", "path": "/metadata/uid", "value": current["source_node_uid"]},
@@ -655,7 +674,11 @@ class FleetRightWorkloadTarget(KubernetesTarget):
                 "path": "/metadata/annotations",
                 "value": annotations,
             },
-            {"op": "add", "path": "/spec/unschedulable", "value": True},
+            *(
+                [{"op": "add", "path": "/spec/unschedulable", "value": True}]
+                if fresh and not current["unschedulable"]
+                else []
+            ),
         ]
         self._json(
             "patch",
@@ -671,6 +694,44 @@ class FleetRightWorkloadTarget(KubernetesTarget):
         if not observed["unschedulable"] or observed["fencing_token"] != fencing_token:
             raise TargetPreconditionFailed("Node drain authority changed after cordon")
         return {**observed, "stage": "NODE_CORDONED", "already_applied": False}
+
+    def release_source_node(
+        self, plan_id: str, payload: dict[str, Any], fencing_token: int
+    ) -> dict[str, Any]:
+        """Drop FleetRight's transient Node metadata once the plan is terminal.
+
+        The cordon itself is never reverted: the Node stays out of service for the operator.
+        """
+        current = self._observe_source_node(plan_id, payload)
+        if current["plan_id"] is None:
+            return {"released": False}
+        if current["fencing_token"] > fencing_token:
+            raise TargetPreconditionFailed("a newer controller fenced this Node drain")
+        kept = {
+            key: value
+            for key, value in current["annotations"].items()
+            if key not in NODE_TRANSIENT_ANNOTATIONS
+        }
+        patch = [
+            {"op": "test", "path": "/metadata/uid", "value": current["source_node_uid"]},
+            {
+                "op": "test",
+                "path": "/metadata/resourceVersion",
+                "value": current["resource_version"],
+            },
+            {"op": "replace", "path": "/metadata/annotations", "value": kept},
+        ]
+        self._json(
+            "patch",
+            "node",
+            current["source_node_id"],
+            "-o",
+            "json",
+            "--type=json",
+            "-p",
+            json.dumps(patch),
+        )
+        return {"released": True, "cordon_owned": current["cordon_owned"]}
 
     def observe_source_node_drain(
         self, plan_id: str, payload: dict[str, Any], fencing_token: int

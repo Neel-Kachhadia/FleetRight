@@ -2741,9 +2741,13 @@ def _node_drain_target(monkeypatch: pytest.MonkeyPatch):
         assert patch[0] == {"op": "test", "path": "/metadata/uid", "value": metadata["uid"]}
         if patch[1]["value"] != metadata["resourceVersion"]:
             raise TargetPreconditionFailed("target resource version changed")
-        metadata["annotations"] = patch[2]["value"]
+        for op in patch[2:]:
+            if op["path"] == "/metadata/annotations":
+                metadata["annotations"] = op["value"]
+            else:
+                assert op["path"] == "/spec/unschedulable"
+                state["node"]["spec"]["unschedulable"] = op["value"]
         metadata["resourceVersion"] = str(int(metadata["resourceVersion"]) + 1)
-        state["node"]["spec"]["unschedulable"] = patch[3]["value"]
         return deepcopy(state["node"])
 
     monkeypatch.setattr(target, "_json", command)
@@ -2762,6 +2766,92 @@ def test_node_cordon_preserves_annotations_and_monotonically_adopts_takeover(mon
     with pytest.raises(ActionBlocked, match="OPERATION_CONFLICT"):
         target.cordon_source_node("another-plan", payload, 5)
     assert len(state["patches"]) == 2
+
+
+def _fleetright_annotations(state):
+    annotations = state["node"]["metadata"].get("annotations", {})
+    return {k: v for k, v in annotations.items() if k.startswith("fleetright.io/")}
+
+
+def test_cordon_of_schedulable_node_records_fleetright_ownership(monkeypatch):
+    target, payload, state, _ = _node_drain_target(monkeypatch)
+    result = target.cordon_source_node("plan-1", payload, 3)
+    assert state["node"]["spec"]["unschedulable"] is True
+    assert result["cordon_owned"] is True
+    assert _fleetright_annotations(state)["fleetright.io/cordon-owned"] == "true"
+
+
+def test_cordon_of_administratively_cordoned_node_is_not_owned_and_never_released(monkeypatch):
+    target, payload, state, _ = _node_drain_target(monkeypatch)
+    state["node"]["spec"]["unschedulable"] = True
+    result = target.cordon_source_node("plan-1", payload, 3)
+    assert result["cordon_owned"] is False
+    assert not any(op["path"] == "/spec/unschedulable" for op in state["patches"][0])
+    # Ownership survives a takeover re-adoption.
+    assert target.cordon_source_node("plan-1", payload, 4)["cordon_owned"] is False
+    assert target.release_source_node("plan-1", payload, 4) == {
+        "released": True,
+        "cordon_owned": False,
+    }
+    assert state["node"]["spec"]["unschedulable"] is True  # administrator's cordon untouched
+    assert _fleetright_annotations(state) == {}
+
+
+def test_cordon_crash_after_patch_keeps_ownership_across_takeover(monkeypatch):
+    target, payload, state, command = _node_drain_target(monkeypatch)
+
+    def lose_response(*args):
+        result = command(*args)
+        if args[:2] == ("patch", "node"):
+            raise OutcomeUnknown("controller died after cordon")
+        return result
+
+    monkeypatch.setattr(target, "_json", lose_response)
+    with pytest.raises(OutcomeUnknown):
+        target.cordon_source_node("plan-1", payload, 3)
+    monkeypatch.setattr(target, "_json", command)
+    adopted = target.cordon_source_node("plan-1", payload, 4)
+    assert adopted["cordon_owned"] is True and adopted["fencing_token"] == 4
+    assert not any(op["path"] == "/spec/unschedulable" for op in state["patches"][1])
+
+
+def test_cordon_never_recordons_a_node_an_administrator_uncordoned(monkeypatch):
+    target, payload, state, _ = _node_drain_target(monkeypatch)
+    target.cordon_source_node("plan-1", payload, 3)
+    state["node"]["spec"]["unschedulable"] = False
+    patches = len(state["patches"])
+    with pytest.raises(ActionBlocked, match="UNCORDONED_EXTERNALLY"):
+        target.cordon_source_node("plan-1", payload, 3)
+    with pytest.raises(ActionBlocked, match="UNCORDONED_EXTERNALLY"):
+        target.cordon_source_node("plan-1", payload, 4)
+    assert len(state["patches"]) == patches and state["node"]["spec"]["unschedulable"] is False
+
+
+def test_release_removes_only_fleetright_metadata_and_keeps_the_cordon(monkeypatch):
+    target, payload, state, _ = _node_drain_target(monkeypatch)
+    target.cordon_source_node("plan-1", payload, 3)
+    assert target.release_source_node("plan-1", payload, 3)["released"] is True
+    assert state["node"]["metadata"]["annotations"] == {"other-controller.example/keep": "yes"}
+    assert state["node"]["spec"]["unschedulable"] is True
+    patches = len(state["patches"])
+    assert target.release_source_node("plan-1", payload, 3) == {"released": False}
+    assert len(state["patches"]) == patches  # completed Node is never touched again
+    # A later plan may now claim the Node.
+    assert target.cordon_source_node("plan-2", payload, 9)["plan_id"] == "plan-2"
+
+
+def test_release_rejects_changed_node_uid_other_plan_and_newer_fence(monkeypatch):
+    target, payload, state, _ = _node_drain_target(monkeypatch)
+    target.cordon_source_node("plan-1", payload, 5)
+    with pytest.raises(TargetPreconditionFailed, match="newer controller"):
+        target.release_source_node("plan-1", payload, 4)
+    with pytest.raises(ActionBlocked, match="OPERATION_CONFLICT"):
+        target.release_source_node("plan-2", payload, 6)
+    state["node"]["metadata"]["uid"] = "replacement-node-uid"
+    with pytest.raises(ActionBlocked, match="UID_CHANGED"):
+        target.release_source_node("plan-1", payload, 5)
+    assert len(state["patches"]) == 1
+    assert "fleetright.io/plan-id" in _fleetright_annotations(state)
 
 
 def test_node_cordon_rejects_changed_node_uid_before_any_mutation(monkeypatch):

@@ -36,6 +36,7 @@ class ExecutionController:
         max_attempts: int = 2,
         readiness_timeout_seconds: float = 30,
         poll_seconds: float = 1,
+        verification_deadline_seconds: float | None = None,
     ) -> None:
         if not controller_id or lease_ttl_ms < 1_000 or max_attempts < 1:
             raise ValueError("controller ID, lease TTL and attempt limit are invalid")
@@ -47,6 +48,13 @@ class ExecutionController:
         self.max_attempts = max_attempts
         self.readiness_timeout_seconds = readiness_timeout_seconds
         self.poll_seconds = poll_seconds
+        # Wall-clock bound on VERIFYING / drain-wait, anchored on durable journal timestamps so a
+        # replacement controller inherits the remaining budget instead of restarting it.
+        self.verification_deadline_seconds = (
+            max(600.0, 4 * readiness_timeout_seconds)
+            if verification_deadline_seconds is None
+            else verification_deadline_seconds
+        )
 
     @staticmethod
     def _retirement_may_have_dispatched_eviction(action: dict[str, Any]) -> bool:
@@ -840,6 +848,13 @@ class ExecutionController:
         if any(action["execution_state"] != "SUCCEEDED" for action in actions):
             self._fail_safe(plan_id, token, "verification-found-incomplete-action")
             return
+        finished = [a["execution_finished_at"] for a in actions if a["execution_finished_at"]]
+        if (
+            finished
+            and time.time() - max(finished).timestamp() > self.verification_deadline_seconds
+        ):
+            self._fail_safe(plan_id, token, "final-verification-deadline-exceeded")
+            return
         evidence = []
         for action in actions:
             payload = action["payload"]
@@ -1080,6 +1095,8 @@ class ExecutionController:
             )
             if new in {"COMMITTED", "CANCELLED", "COMPENSATED", "FAILED_SAFE"}:
                 Repository.release_plan_leases(conn, plan_id)
+        if new in {"COMMITTED", "CANCELLED", "COMPENSATED", "FAILED_SAFE"}:
+            self._release_node_metadata(plan_id, token)
         LOG.info(
             "execution state changed",
             extra={
@@ -1089,6 +1106,26 @@ class ExecutionController:
                 "fencing_token": token,
             },
         )
+
+    def _release_node_metadata(self, plan_id: str, token: int) -> None:
+        """Best-effort: failure leaves inert metadata that blocks only a later plan on the Node."""
+        release = getattr(self.target, "release_source_node", None)
+        if not callable(release):
+            return
+        try:
+            with self.repository.transaction() as conn:
+                cordons = conn.execute(
+                    "SELECT payload FROM action_intents WHERE plan_id = %s "
+                    "AND action_type = 'CORDON_NODE'",
+                    (plan_id,),
+                ).fetchall()
+            for cordon in cordons:
+                release(plan_id, cordon["payload"], token)
+        except Exception as error:  # noqa: BLE001 - terminal state is already durable
+            LOG.warning(
+                "node metadata release failed",
+                extra={"plan_id": plan_id, "error": str(error)[:200]},
+            )
 
     def _workload_creates_resolved(self, plan_id: str) -> bool:
         if not getattr(self.target, "supports_workload_execution", False):
@@ -1215,6 +1252,12 @@ class ExecutionController:
                 raise ActionBlocked("DRAIN_NODE_CORDON_POSTCONDITION_FAILED")
             observation = method(plan_id, payload, token)
             if observation.get("stage") == "NODE_DRAIN_WAITING":
+                started = action.get("execution_started_at")
+                if (
+                    started is not None
+                    and time.time() - started.timestamp() > self.verification_deadline_seconds
+                ):
+                    raise ActionBlocked("node-drain-wait-deadline-exceeded")
                 if state == "RUNNING":
                     with self.repository.transaction() as conn:
                         Repository.record_action_progress(
@@ -3093,6 +3136,7 @@ class ExecutionController:
                 outcome={"reason": reason},
             )
             Repository.release_plan_leases(conn, plan_id)
+        self._release_node_metadata(plan_id, token)
         LOG.error("execution stopped safely", extra={"plan_id": plan_id, "reason": reason})
 
     def _observe_recovery(self, plan_id: str) -> dict[str, Any]:

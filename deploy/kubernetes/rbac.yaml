@@ -122,9 +122,9 @@ spec:
         oldObject.metadata.?annotations.orValue({}).all(k,
           k.startsWith('fleetright.io/') || k in object.metadata.?annotations.orValue({})) &&
         (!('fleetright.io/fencing-token' in oldObject.metadata.?annotations.orValue({})) ||
-          ('fleetright.io/fencing-token' in object.metadata.?annotations.orValue({}) &&
-           int(object.metadata.annotations['fleetright.io/fencing-token']) >=
-           int(oldObject.metadata.annotations['fleetright.io/fencing-token'])))
+          !('fleetright.io/fencing-token' in object.metadata.?annotations.orValue({})) ||
+          int(object.metadata.annotations['fleetright.io/fencing-token']) >=
+          int(oldObject.metadata.annotations['fleetright.io/fencing-token']))
       message: FleetRight executor may only cordon a Node and write fleetright.io/ annotations.
 ---
 apiVersion: admissionregistration.k8s.io/v1

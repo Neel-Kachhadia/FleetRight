@@ -4462,3 +4462,214 @@ def test_destructive_action_waits_for_fresh_health_sample(
     assert execution["status"] == "FAILED_SAFE"
     assert action["execution_state"] == "NOT_STARTED"
     assert target.mutations == []
+
+
+_NODE = {"source_node_id": "worker-1", "source_node_uid": "worker-uid"}
+
+
+class _DrainTarget:
+    """Signature-faithful Node target; `verify_error` fires only once the plan is VERIFYING."""
+
+    supports_workload_execution = True
+
+    def __init__(self) -> None:
+        self.node_token = 0
+        self.verify_error: Exception | None = None
+        self.verify_failures: int | None = None  # None: fail forever once verifying
+        self.verifying = False
+        self.cordon_calls = 0
+        self.released: list[tuple[str, int]] = []
+
+    def _view(self, plan_id: str, operation_id: object) -> dict[str, object]:
+        return {
+            **_NODE,
+            "plan_id": plan_id,
+            "operation_id": operation_id,
+            "fencing_token": self.node_token,
+            "unschedulable": True,
+        }
+
+    def observe_source_node_state(self, _plan_id: str, _payload: dict[str, object]):
+        return {**_NODE, "unschedulable": False}
+
+    def cordon_source_node(self, plan_id: str, payload: dict[str, object], token: int):
+        self.cordon_calls += 1
+        self.node_token = max(self.node_token, token)
+        return {**self._view(plan_id, payload["operation_id"]), "stage": "NODE_CORDONED"}
+
+    def observe_source_node_drain(self, plan_id: str, payload: dict[str, object], token: int):
+        if self.verifying and self.verify_error is not None:
+            if self.verify_failures is None:
+                raise self.verify_error
+            if self.verify_failures > 0:
+                self.verify_failures -= 1
+                raise self.verify_error
+        return {
+            **self._view(plan_id, payload["cordon_operation_id"]),
+            "stage": "NODE_DRAIN_COMPLETE",
+            "remaining_source_pod_uids": [],
+            "exempt_pods": [],
+            "inventory_pod_count": 1,
+        }
+
+    def release_source_node(self, plan_id: str, _payload: dict[str, object], token: int):
+        self.released.append((plan_id, token))
+        return {"released": True}
+
+
+def _drain_plan_in_verifying(
+    repo: Repository, plan_id: str, target: _DrainTarget, **controller_options: float
+) -> ExecutionController:
+    with repo.transaction() as conn:
+        _insert_plan(conn, plan_id)
+        for sequence, (intent, action_type, payload) in enumerate(
+            [
+                ("cordon", "CORDON_NODE", {**_NODE, "operation_id": "cordon-operation"}),
+                (
+                    "verify",
+                    "VERIFY_NODE_DRAIN",
+                    {
+                        **_NODE,
+                        "operation_id": "verify-operation",
+                        "cordon_operation_id": "cordon-operation",
+                        "source_pods": [
+                            {"workload_id": "api", "pod_name": "api-0", "pod_uid": "pod-uid"}
+                        ],
+                    },
+                ),
+            ]
+        ):
+            conn.execute(
+                "INSERT INTO action_intents (plan_id, intent_id, action_sequence, action_type, "
+                "payload, status) VALUES (%s, %s, %s, %s, %s, 'APPROVED')",
+                (plan_id, intent, sequence, action_type, Jsonb(payload)),
+            )
+    _claim(repo, plan_id)
+    controller = ExecutionController(
+        repo, target, FakeHealth(), "controller-a", **controller_options
+    )
+    for _ in range(10):
+        if _plan_status(repo, plan_id) == "VERIFYING":
+            break
+        controller.run_once()
+    assert _plan_status(repo, plan_id) == "VERIFYING"
+    target.verifying = True
+    return controller
+
+
+def _plan_status(repo: Repository, plan_id: str) -> str:
+    with repo.transaction() as conn:
+        return conn.execute(
+            "SELECT status FROM plan_executions WHERE plan_id = %s", (plan_id,)
+        ).fetchone()["status"]
+
+
+def _age_actions(repo: Repository, plan_id: str, seconds: int) -> None:
+    with repo.transaction() as conn:
+        conn.execute(
+            "UPDATE action_intents SET execution_finished_at = execution_finished_at "
+            "- make_interval(secs => %s) WHERE plan_id = %s",
+            (seconds, plan_id),
+        )
+
+
+def test_final_verification_succeeds_immediately_and_releases_node_metadata(
+    clean_database: Database,
+) -> None:
+    repo, target = clean_database.repository, _DrainTarget()
+    controller = _drain_plan_in_verifying(repo, "verify-immediate", target)
+    controller.run_once()
+    assert _plan_status(repo, "verify-immediate") == "COMMITTED"
+    # Transient Node metadata is released exactly once, after the terminal state is durable.
+    assert [plan for plan, _ in target.released] == ["verify-immediate"]
+
+
+def test_final_verification_succeeds_after_bounded_retry(clean_database: Database) -> None:
+    repo, target = clean_database.repository, _DrainTarget()
+    controller = _drain_plan_in_verifying(repo, "verify-retry", target)
+    target.verify_error, target.verify_failures = TargetError("API unavailable"), 3
+    for _ in range(3):
+        controller.run_once()
+        assert _plan_status(repo, "verify-retry") == "VERIFYING"
+        assert target.released == []
+    controller.run_once()
+    assert _plan_status(repo, "verify-retry") == "COMMITTED"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        TargetError("Kubernetes API unavailable"),
+        TargetPreconditionFailed("Node drain authority is not held"),
+    ],
+)
+def test_final_verification_that_never_succeeds_fails_safe_at_the_deadline(
+    clean_database: Database, error: Exception
+) -> None:
+    repo, target = clean_database.repository, _DrainTarget()
+    plan_id = f"verify-never-{type(error).__name__.lower()}"
+    controller = _drain_plan_in_verifying(repo, plan_id, target, verification_deadline_seconds=60)
+    target.verify_error = error  # fails forever
+    controller.run_once()
+    assert _plan_status(repo, plan_id) == "VERIFYING"
+    _age_actions(repo, plan_id, 120)
+    controller.run_once()
+    assert _plan_status(repo, plan_id) == "FAILED_SAFE"
+    with repo.transaction() as conn:
+        outcome = conn.execute(
+            "SELECT outcome FROM plan_executions WHERE plan_id = %s", (plan_id,)
+        ).fetchone()["outcome"]
+    assert "final-verification-deadline-exceeded" in str(outcome)
+    assert len(target.released) == 1  # no destructive retry; only metadata release
+
+
+def test_verification_deadline_survives_controller_takeover(clean_database: Database) -> None:
+    repo, target = clean_database.repository, _DrainTarget()
+    plan_id = "verify-takeover-deadline"
+    first = _drain_plan_in_verifying(repo, plan_id, target, verification_deadline_seconds=60)
+    target.verify_error = TargetError("API unavailable")
+    first.run_once()
+    _age_actions(repo, plan_id, 120)
+    with repo.transaction() as conn:
+        conn.execute(
+            "UPDATE plan_executions SET controller_lease_expires_at = clock_timestamp() "
+            "WHERE plan_id = %s",
+            (plan_id,),
+        )
+    second = ExecutionController(
+        repo, target, FakeHealth(), "controller-b", verification_deadline_seconds=60
+    )
+    for _ in range(4):
+        second.run_once()
+    # The replacement inherits the elapsed budget; it does not restart it.
+    assert _plan_status(repo, plan_id) == "FAILED_SAFE"
+
+
+def test_stale_controller_cannot_extend_or_finish_verification(clean_database: Database) -> None:
+    repo, target = clean_database.repository, _DrainTarget()
+    plan_id = "verify-stale"
+    first = _drain_plan_in_verifying(repo, plan_id, target, verification_deadline_seconds=60)
+    with repo.transaction() as conn:
+        conn.execute(
+            "UPDATE plan_executions SET controller_lease_expires_at = clock_timestamp() "
+            "WHERE plan_id = %s",
+            (plan_id,),
+        )
+    second = ExecutionController(repo, target, FakeHealth(), "controller-b")
+    for _ in range(3):
+        second.run_once()
+    assert _plan_status(repo, plan_id) == "COMMITTED"
+    released = len(target.released)
+    first.run_once()  # stale: the execution is terminal / fenced to controller-b
+    assert _plan_status(repo, plan_id) == "COMMITTED"
+    assert len(target.released) == released
+
+
+def test_node_uncordoned_after_drain_completion_blocks_commit(clean_database: Database) -> None:
+    repo, target = clean_database.repository, _DrainTarget()
+    plan_id = "verify-uncordoned"
+    controller = _drain_plan_in_verifying(repo, plan_id, target)
+    target.verify_error = ActionBlocked("DRAIN_NODE_UNCORDONED_EXTERNALLY")
+    controller.run_once()
+    assert _plan_status(repo, plan_id) == "FAILED_SAFE"
+    assert target.cordon_calls <= 3  # the cordon action and fence re-adoption; never a loop
